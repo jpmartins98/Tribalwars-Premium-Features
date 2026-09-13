@@ -293,7 +293,7 @@ async function runFarmAssistantReportDeletion(pageCount, totalPages, formData) {
 }
 
 function registerFarmAssistantSidebarIcon() {
-    if (typeof isPremiumAccount === 'function' && isPremiumAccount()) return;
+    if (getSetting('show__local_farm_assistant') !== true) return;
     if (!window.SidebarIcons) return;
 
     SidebarIcons.register('farm-assistant', {

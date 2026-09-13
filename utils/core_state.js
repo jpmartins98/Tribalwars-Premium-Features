@@ -1,10 +1,6 @@
 // Global settings/state: settings_cookies schema, getters/setters, and localStorage bootstrap.
 // Depends on utils/core_storage.js (safeLocalStorageSet).
 
-function isPremiumAccount() {
-    return typeof game_data !== 'undefined' && Boolean(game_data?.features?.Premium?.active);
-}
-
 //GLOBAL VARIABLES
 var RIGHT_COLUMN = "rightcolumn";
 var CENTER_COLUMN = "leftcolumn";

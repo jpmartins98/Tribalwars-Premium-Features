@@ -562,6 +562,35 @@ var customCSS = `
 }
 
 `;
-if (!isPremiumAccount()) {
-    GM_addStyle(customCSS);
+GM_addStyle(customCSS);
+
+// Diagnostic UI marker: deliberately loud so native UI and Premium Features UI are easy to distinguish.
+if (typeof getSetting !== 'function' || getSetting('show__mod_ui_outline') !== false) {
+    GM_addStyle(`
+        #script_column,
+        #script_column .script_widget,
+        #settings_popup,
+        .script-settings-popup-wrapper,
+        .script-settings-btn,
+        #overview-villages-topbar-menu,
+        #map_popup_extra,
+        .custom-map-ctx-button,
+        .reservation-ctx-button,
+        [class*="map-group"],
+        [id^="map_groups_"],
+        [id^="extra_memo_"],
+        .extra-memo-type-tabs,
+        .train-section-toggle,
+        .sidebar-farm-assistant-icon,
+        [class*="twpf-"],
+        [id^="twpf_"] {
+            outline: 2px solid #ff00ff !important;
+            outline-offset: 1px !important;
+            box-shadow: 0 0 0 2px #39ff14 !important;
+        }
+
+        #script_column .script_widget > * {
+            border-color: #39ff14 !important;
+        }
+    `);
 }

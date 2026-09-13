@@ -1364,7 +1364,7 @@ function initializeTroopTemplates(targetID, isBarbarian = false, renderToken = _
     });
 }
 
-if (typeof TWMap !== 'undefined' && !isPremiumAccount()) {
+if (typeof TWMap !== 'undefined') {
     // Hide native Farm Assistant context buttons if the feature is not active for this account
     if (!game_data.features?.FarmAssistent?.active) {
         const style = document.createElement('style');

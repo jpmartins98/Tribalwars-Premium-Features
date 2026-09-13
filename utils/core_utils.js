@@ -107,8 +107,7 @@ function start() {
     var urlPage = document.location.href;
     // Check for expired session and auto-redirect to the last active world if so
     if (!urlPage.includes('?session_expired') && typeof game_data != 'undefined') {
-        // If user has Premium, we don't run the script because it will conflict with the real Premium features
-        if (isPremiumAccount()) return;
+        // Premium Compat: active Premium accounts are allowed; conflicts are controlled per feature in Settings.
         serverTimezoneOffsetMs = detectServerTimezoneOffsetMs();
         fetchAndCacheWorldSettings().then(function () {
             if (typeof registerWidgetPopupSidebarShortcuts === 'function') {

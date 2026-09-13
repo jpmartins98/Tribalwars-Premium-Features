@@ -488,7 +488,7 @@ function handleExternalReservationCtxAction(context, element) {
     }
 }
 
-if (!isPremiumAccount() && typeof registerCtxCustomAction === 'function') {
+if (isMapContextButtonEnabled('reservation') && typeof registerCtxCustomAction === 'function') {
     registerCtxCustomAction({
         id: 'reservations',
         slot: 1,
@@ -526,7 +526,7 @@ function startReservationContextWatcher() {
     };
 }
 
-if (typeof TWMap !== 'undefined' && !isPremiumAccount() && isMapContextButtonEnabled('reservation')) {
+if (typeof TWMap !== 'undefined' && isMapContextButtonEnabled('reservation')) {
     syncAllyReservations();
     startReservationContextWatcher();
 }
