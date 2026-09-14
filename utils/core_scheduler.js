@@ -201,15 +201,22 @@ function createCooperativeScheduler(options = {}) {
             else value = await invoke(null);
 
             activeTasks.delete(task.key);
-            removePersistedDescriptor(task.key);
+            if (tasks.has(task.key)) persistDescriptor(tasks.get(task.key));
+            else removePersistedDescriptor(task.key);
             task.resolve({ status: 'COMPLETED', key: task.key, value });
         } catch (error) {
             if (error?.code === 'LEASE_UNAVAILABLE' || error?.code === 'LEASE_LOST') {
                 activeTasks.delete(task.key);
-                rescheduleAfterLeaseContention(task, error);
+                if (tasks.has(task.key) && tasks.get(task.key) !== task) {
+                    persistDescriptor(tasks.get(task.key));
+                    task.resolve({ status: 'SUPERSEDED', key: task.key });
+                } else {
+                    rescheduleAfterLeaseContention(task, error);
+                }
             } else {
                 activeTasks.delete(task.key);
-                removePersistedDescriptor(task.key);
+                if (tasks.has(task.key)) persistDescriptor(tasks.get(task.key));
+                else removePersistedDescriptor(task.key);
                 task.resolve({ status: 'FAILED', key: task.key, error });
                 console.error('[TW Scheduler] Task failed:', task.key, error);
             }

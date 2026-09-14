@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         Tribalwars: Premium Features [Premium Compat]
-// @version      5.1.0
+// @version      5.2.0
 // @description  Feature-rich enhancement suite for TribalWars. Widgets: Village List, Notepad, Extra Build Queue, Recruit Troops. Map: hover details, outgoing command overlay, attack heat-map, custom CTX attack template buttons, large map view. Automation: Auto Daily Bonus collection. UI: Custom Navigation Bar, Navigation Arrows, Visual Building Overview. Settings: full import/export support.
 // @author       killwilll
 // @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/i18n/i18n_utils.js
@@ -23,6 +23,7 @@
 // @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/utils/attackLauncher.js
 // @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/utils/nativeMemo.js
 // @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/utils/core_indexeddb.js
+// @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/utils/buildStateStore.js
 // @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/utils/resourcesManager.js
 // @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/utils/buildingsManager.js
 // @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/utils/marketTransports.js

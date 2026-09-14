@@ -123,13 +123,21 @@ async function fetchAndExecuteBuildInstantFree(expectedCompletionMs, villageId) 
     const vId = villageId || game_data?.village?.id;
     let doc;
     try {
-        const url = (typeof getVillageLinkBase === 'function' ? getVillageLinkBase(vId) : game_data.link_base_pure) + 'main';
-        const resp = await fetch(url, { credentials: 'include' });
-        if (!resp.ok) {
-            console.error('[BuildInstantFree] Fetch failed:', resp.status, resp.statusText);
-            return;
+        if (typeof fetchVillageMainPage === 'function') {
+            const result = await fetchVillageMainPage(vId);
+            doc = result.doc;
+            if (typeof observeBuildQueueDocument === 'function') {
+                observeBuildQueueDocument(doc, vId, 'build-instant-inspection');
+            }
+        } else {
+            const url = (typeof getVillageLinkBase === 'function' ? getVillageLinkBase(vId) : game_data.link_base_pure) + 'main';
+            const resp = await fetch(url, { credentials: 'include' });
+            if (!resp.ok) {
+                console.error('[BuildInstantFree] Fetch failed:', resp.status, resp.statusText);
+                return;
+            }
+            doc = new DOMParser().parseFromString(await resp.text(), 'text/html');
         }
-        doc = new DOMParser().parseFromString(await resp.text(), 'text/html');
     } catch (e) {
         console.error('[BuildInstantFree] Fetch exception:', e);
         return;
@@ -214,14 +222,44 @@ async function buildInstantFreeApiCall(orderId, villageId) {
         }
 
         await resp.json();
+        const buildState = window.PremiumFeaturesBuildState;
+        if (buildState?.get && buildState?.updateOfficial) {
+            const official = buildState.get(vId).official || {};
+            const queue = (official.queue || []).slice();
+            const levels = (official.levels || []).slice();
+            const slots = (official.slots || []).slice();
+            const cancelIds = (official.cancelIds || []).slice();
+            let completedIndex = cancelIds.findIndex(id => String(id) === String(orderId));
+            if (completedIndex < 0) completedIndex = 0;
+            queue.splice(completedIndex, 1);
+            levels.splice(completedIndex, 1);
+            slots.splice(completedIndex, 1);
+            cancelIds.splice(completedIndex, 1);
+            buildState.updateOfficial(vId, Object.assign({}, official, {
+                queue,
+                levels,
+                slots,
+                cancelIds,
+                nextSlotAt: slots[0] || null,
+                lastSlotAt: slots.length > 1 ? slots[slots.length - 1] : null,
+                full: false,
+                fetchedAt: Date.now(),
+                source: 'build-instant-response'
+            }));
+            buildState.publishObservation?.(vId);
+            checkAndScheduleBuildInstantFree(vId);
+        }
         const isCurrent = vId == game_data?.village?.id;
         const villageName = typeof getVillageName === 'function' ? getVillageName(vId) : vId;
         const completedMsg = '[' + villageName + '] ' + t('buildQueue.instantFreeCompleted');
         showAutoHideBox(completedMsg, false);
 
-        // Refresh the queue widget/state and re-arm for the next queued build
+        // The official queue changed.  Queue v2 performs one fenced reconciliation; it can share
+        // an in-flight screen=main read and never creates the old immediate duplicate refresh.
         setTimeout(() => {
-            if (isCurrent && typeof fetchBuildQueueWidget === 'function') {
+            if (typeof requestBuildQueueReconcile === 'function') {
+                requestBuildQueueReconcile(vId, { reason: 'build-instant-completed' });
+            } else if (isCurrent && typeof fetchBuildQueueWidget === 'function') {
                 fetchBuildQueueWidget(true);
             } else if (!isCurrent && typeof refreshBackgroundVillageQueue === 'function') {
                 refreshBackgroundVillageQueue(vId);

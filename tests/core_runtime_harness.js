@@ -445,7 +445,7 @@ test('same-origin 429 performs zero retries and hard-stops', async () => {
     assert.equal(hardStops, 2);
 });
 
-test('403/429 hard-stop policy is restricted to same-origin Tribal Wars', () => {
+test('403/429 hard-stop policy is restricted to same-origin Tribal Wars', async () => {
     const env = createContext();
     load(env.context, 'utils/core_async.js');
     const classify = env.context.PremiumFeaturesAsync.classifyRequestFailure;
@@ -454,6 +454,20 @@ test('403/429 hard-stop policy is restricted to same-origin Tribal Wars', () => 
     const transient = classify({ status: 503 }, { url: '/game.php' });
     assert.equal(transient.transient, true);
     assert.equal(transient.hardStop, false);
+
+    let explicitStops = 0;
+    env.context.PremiumFeaturesBackgroundScheduler = { hardStop() { explicitStops++; } };
+    env.context.PremiumFeaturesCoordination = { broadcast() {}, stop() { explicitStops++; } };
+    env.context.PremiumFeaturesBotProtection = { block() { explicitStops++; } };
+    const explicit = new Error('detector active');
+    explicit.code = 'HARD_STOP';
+    const result = await env.context.runResilientTask({
+        key: 'explicit-hard-stop',
+        snapshot: { generation: 1 },
+        run: async () => { throw explicit; }
+    });
+    assert.equal(result.status, 'HARD_STOP');
+    assert.equal(explicitStops, 3);
 });
 
 test('resume processes overdue work one task per deterministic turn', async () => {
@@ -486,6 +500,57 @@ test('resume processes overdue work one task per deterministic turn', async () =
     await drainTimers(env.clock);
     assert.equal(starts.length, 6);
     for (let i = 1; i < starts.length; i++) assert.ok(starts[i] - starts[i - 1] >= 100);
+});
+
+test('an active task cannot erase or overwrite its newer same-key rerun', async () => {
+    const env = createContext();
+    loadCore(env.context);
+    const events = [];
+    let releaseFirst;
+    const firstGate = new Promise(resolve => { releaseFirst = resolve; });
+    const scheduler = env.context.createCooperativeScheduler({
+        host: env.context,
+        clock: env.clock,
+        now: () => env.clock.now,
+        autoStart: false,
+        turnGapMs: 10,
+        concurrency: 1
+    });
+    scheduler.registerHandler('same-key-handler', function () {});
+    scheduler.start();
+
+    const first = scheduler.enqueue({
+        key: 'same-key',
+        handlerName: 'same-key-handler',
+        args: ['old'],
+        persist: true,
+        rerunWhileActive: true,
+        run: async () => {
+            events.push('old');
+            await firstGate;
+        }
+    });
+    env.clock.tick(0);
+    await flushMicrotasks();
+
+    scheduler.enqueue({
+        key: 'same-key',
+        handlerName: 'same-key-handler',
+        args: ['new'],
+        persist: true,
+        rerunWhileActive: true,
+        dueAt: 100,
+        run: () => events.push('new')
+    });
+    releaseFirst();
+    await first;
+    await flushMicrotasks();
+
+    const persisted = JSON.parse(env.context.PremiumFeaturesWriteBehind.get('twpf_background_task_v1:same-key'));
+    assert.deepEqual(Array.from(persisted.args), ['new']);
+    await drainTimers(env.clock);
+    assert.deepEqual(events, ['old', 'new']);
+    assert.equal(env.context.PremiumFeaturesWriteBehind.get('twpf_background_task_v1:same-key'), null);
 });
 
 test('manual and reconciliation work outrank automatic background work', async () => {

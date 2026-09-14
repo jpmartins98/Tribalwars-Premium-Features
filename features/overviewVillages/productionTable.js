@@ -69,7 +69,8 @@ function renderFakeQueueIcons(cell, villageId, allBuildingsImgs, doc) {
     if (!queueBuildIds.length) return;
 
     // Scheduled time (ms epoch) when addToBuildQueue() will next fire for this village
-    const scheduledEndTime = parseInt(localStorage.getItem('endTime_' + getBuildQueueTimeoutId(villageId))) || 0;
+    const scheduledEndTime = Number(window.PremiumFeaturesBuildState?.get?.(villageId)?.execution?.nextDueAt) ||
+        parseInt(localStorage.getItem('endTime_' + getBuildQueueTimeoutId(villageId))) || 0;
 
     queueBuildIds.forEach(function (id, fakeIndex) {
         const buildingName = doc.querySelector('.visual-label-' + id)?.getAttribute('data-title') || id;
@@ -204,10 +205,9 @@ function applyBuildQueueOverviewCollapse(cell) {
 /**
  * Adds a "Build Queue" column to the multi-village table (#production_table) on the
  * screen=overview_villages page, showing each village's active build queue at a glance.
- * Only runs when the account has more than one village (that page/table is meaningless
- * otherwise). For every village row, fetches its main-building page in the background to
- * get fresh queue state (persisted via parseAndStoreQueueState, same mechanism used by the
- * per-village widget and the background sweep), then renders the summary cell.
+ * Only runs when the account has more than one village. Cached local/official state renders
+ * immediately; a village with no snapshot is loaded only when its cell receives pointer or
+ * keyboard interest, avoiding an all-village request burst on every overview visit.
  */
 function injectOverviewVillagesBuildQueueColumn() {
     if (!settings_cookies.general['show__overview_villages_queue']) return;
@@ -241,39 +241,48 @@ function injectOverviewVillagesBuildQueueColumn() {
     th.appendChild(toggleIcon);
     headerRow.appendChild(th);
 
-    const rowsToFetch = [];
     table.querySelectorAll('tbody tr').forEach(function (row) {
         const villageId = row.querySelector('.quickedit-vn[data-id]')?.getAttribute('data-id');
         if (!villageId) return;
 
         const cell = document.createElement('td');
         cell.className = 'build-queue-overview-cell';
-        cell.appendChild(createWidgetLoadingElement('30px'));
-        cell.setAttribute('aria-busy', 'true');
         cell.style.textAlign = 'center';
         row.appendChild(cell);
 
-        rowsToFetch.push({ villageId, cell });
-    });
+        const cached = window.PremiumFeaturesBuildState?.get?.(villageId);
+        const cachedImages = cached?.official?.catalog?.allBuildingsImgs || [];
+        if (cached?.official?.fetchedAt || cached?.queue?.length) {
+            renderBuildQueueOverviewCell(cell, villageId, document, cachedImages);
+            cell.dataset.twpfFreshness = 'stale';
+            return;
+        }
 
-    // Throttled (max 2 concurrent, staggered) so accounts with many villages don't burst one
-    // request per village at once and trip the server's rate limiter (HTTP 429).
-    runWithConcurrencyLimit(rowsToFetch, function ({ villageId, cell }) {
-        return fetchVillageMainPage(villageId)
-            .then(({ doc }) => {
-                parseAndStoreQueueState(doc, villageId);
-                // Re-arm the instant-free timer too, not just the fake/waiting queue state
-                if (typeof scheduleCompletionNotification === 'function') scheduleCompletionNotification(villageId);
+        // An unseen village has no useful local snapshot yet.  Load it on explicit interest,
+        // rather than turning every overview visit (and every tab) into an all-village burst.
+        cell.textContent = '…';
+        cell.tabIndex = 0;
+        const load = function () {
+            if (cell.dataset.buildQueueLoadStarted) return;
+            cell.dataset.buildQueueLoadStarted = '1';
+            cell.replaceChildren(createWidgetLoadingElement('30px'));
+            cell.setAttribute('aria-busy', 'true');
+            fetchVillageMainPage(villageId).then(({ doc }) => {
+                if (typeof observeBuildQueueDocument === 'function') observeBuildQueueDocument(doc, villageId, 'overview-interest');
+                else parseAndStoreQueueState(doc, villageId);
                 const { allBuildingsImgs } = getAllBuildingsImages(doc);
                 renderBuildQueueOverviewCell(cell, villageId, doc, allBuildingsImgs);
-            })
-            .catch(() => {
-                cell.innerHTML = '?';
+                cell.dataset.twpfFreshness = 'fresh';
+            }).catch(() => {
+                cell.textContent = '?';
                 cell.removeAttribute('aria-busy');
-                cell.style.textAlign = 'center';
                 cell.style.color = '#c33';
+                delete cell.dataset.buildQueueLoadStarted;
             });
-    }, { concurrency: 2, minDelay: 100, maxDelay: 250 });
+        };
+        cell.addEventListener('mouseenter', load, { once: true });
+        cell.addEventListener('focus', load, { once: true });
+    });
 }
 
 // Fixed column order for the per-unit troop columns (screen=overview_villages), matches the
@@ -405,4 +414,3 @@ function injectOverviewVillagesStorageHover() {
         attachStorageOverviewHover(cell, villageId);
     });
 }
-

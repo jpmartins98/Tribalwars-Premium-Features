@@ -322,7 +322,8 @@ async function runResilientTask(options) {
         return { status: TASK_RESULT.SUCCESS, value };
     } catch (error) {
         const failure = classifyRequestFailure(error, options);
-        if (failure.hardStop) {
+        if (failure.hardStop || error?.code === 'HARD_STOP') {
+            failure.hardStop = true;
             triggerPremiumFeaturesHardStop(failure);
             return { status: TASK_RESULT.HARD_STOP, failure };
         }
