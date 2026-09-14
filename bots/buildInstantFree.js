@@ -6,8 +6,8 @@
 //   1. checkAndScheduleBuildInstantFree(villageId) — called on page load (current village) and
 //      after every queue refresh (current or background village). Reads building_queue_next_slot
 //      (real epoch ms, no jitter) via bqGet, derives the free-window start time, and
-//      arms a persistent (reload-surviving) timer via setHandlerOnTimeOut, with a narrow 15-60s
-//      jitter (not the default 3-min bot-jitter) so it can't fire past the 3-min window's close.
+//      arms a persistent (reload-surviving) timer via setHandlerOnTimeOut, with a narrow,
+//      deterministic 15-60s spread so simultaneous internal work is avoided.
 //   2. When the timer fires: fetchAndExecuteBuildInstantFree(_, villageId) fetches that village's
 //      screen=main, finds .btn-instant-free, extracts the orderId, and calls the API.
 //   3. buildInstantFreeApiCall(orderId, villageId) — performs the free-complete GET request.
@@ -30,7 +30,7 @@
 /** Seconds the free-complete window is open before the build would finish naturally. */
 const BUILD_INSTANT_FREE_WINDOW_SEC = 180; // 3 minutes
 
-// Deliberately narrower than the default 0-3min bot-jitter, since the window above is also 3 min.
+// Deliberately narrower than the default deterministic spread, since the window is also 3 min.
 const BUILD_INSTANT_FREE_JITTER_MIN_MS = 15000;
 const BUILD_INSTANT_FREE_JITTER_MAX_MS = 60000;
 
@@ -243,13 +243,7 @@ async function buildInstantFreeApiCall(orderId, villageId) {
 function _clearBuildInstantFreeTimeout(villageId) {
     const vId = villageId || game_data?.village?.id;
     const id = 'build_instant_free_' + vId;
-    localStorage.removeItem('function_' + id);
-    localStorage.removeItem('handler_' + id);
-    localStorage.removeItem('endTime_' + id);
-    if (typeof activeTimeouts !== 'undefined' && activeTimeouts[id]) {
-        clearTimeout(activeTimeouts[id]);
-        delete activeTimeouts[id];
-    }
+    if (typeof clearPersistedTimeout === 'function') clearPersistedTimeout(id);
 }
 
 // Registered so setHandlerOnTimeOut/restoreTimeouts (core_utils.user.js) can call these by name
@@ -258,4 +252,3 @@ if (typeof registerTimeoutHandler === 'function') {
     registerTimeoutHandler('instantFreeCheck', fetchAndExecuteBuildInstantFree);
     registerTimeoutHandler('instantFreeApiCall', buildInstantFreeApiCall);
 }
-

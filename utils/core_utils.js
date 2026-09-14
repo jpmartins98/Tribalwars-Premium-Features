@@ -104,17 +104,29 @@ function injectAttackCalculations() {
  * settings, runs page-specific feature injection, and restores persisted timeouts.
  */
 function start() {
+    const runtime = window.PremiumFeaturesRuntimeRegistry;
+    const startGeneration = runtime?.currentGeneration?.() || 1;
+    if (runtime && !runtime.claimFeature('core:start', startGeneration)) return;
+
     var urlPage = document.location.href;
     // Check for expired session and auto-redirect to the last active world if so
     if (!urlPage.includes('?session_expired') && typeof game_data != 'undefined') {
         // Premium Compat: active Premium accounts are allowed; conflicts are controlled per feature in Settings.
         serverTimezoneOffsetMs = detectServerTimezoneOffsetMs();
-        fetchAndCacheWorldSettings().then(function () {
-            if (typeof registerWidgetPopupSidebarShortcuts === 'function') {
-                registerWidgetPopupSidebarShortcuts();
+        const coordinator = window.PremiumFeaturesCoordination;
+        const registerBackground = function (key, run, options) {
+            if (coordinator?.registerBackgroundTask) {
+                coordinator.registerBackgroundTask(key, run, Object.assign({ reconcile: true }, options));
+            } else {
+                Promise.resolve().then(run).catch(error => console.error('[TW] Background task failed:', key, error));
             }
-        }); // async, caches for future use; no-op if already cached
-        updateAllMapData(); // async, hourly-gated; keeps village/player/ally.txt caches fresh on every page
+        };
+        registerBackground('world-settings-and-map-data', async function (guard) {
+            guard?.assertActive?.();
+            await fetchAndCacheWorldSettings();
+            guard?.assertActive?.();
+            await updateAllMapData();
+        }, { priority: BACKGROUND_TASK_PRIORITY.REFRESH, leaseKey: 'world-data-refresh' });
         prepareVillageList();
         villageList = localStorage.getItem('villages_info') ? JSON.parse(localStorage.getItem('villages_info')) : [];
         settings_cookies = localStorage.getItem('settings_cookies') ? JSON.parse(localStorage.getItem('settings_cookies')) : settings_cookies;
@@ -125,17 +137,20 @@ function start() {
         // Arms every known village's instant-free timer, not just the current one — re-arming is
         // idempotent (each call clears its own previous timeout first), so this is safe to run even
         // on screens where the widget will also call checkAndScheduleBuildInstantFree() moments later.
-        if (typeof initInstantFreeForAllVillages === 'function') {
-            initInstantFreeForAllVillages();
-        } else if (typeof checkAndScheduleBuildInstantFree === 'function') {
-            checkAndScheduleBuildInstantFree();
-        }
+        registerBackground('build-instant-timers', function (guard) {
+            guard?.assertActive?.();
+            if (typeof initInstantFreeForAllVillages === 'function') initInstantFreeForAllVillages();
+            else if (typeof checkAndScheduleBuildInstantFree === 'function') checkAndScheduleBuildInstantFree();
+        }, { priority: BACKGROUND_TASK_PRIORITY.AUTOMATIC, leaseKey: 'build-instant-timers' });
         if (typeof injectOverviewVillagesTopbarMenu === 'function') {
             injectOverviewVillagesTopbarMenu();
         }
         // Periodic safety-net sweep so other villages' build queues keep progressing while this
         // tab has a different village displayed.
-        if (typeof initBackgroundVillageQueueSweep === 'function') initBackgroundVillageQueueSweep();
+        registerBackground('build-queue-sweep', function (guard) {
+            guard?.assertActive?.();
+            if (typeof initBackgroundVillageQueueSweep === 'function') initBackgroundVillageQueueSweep();
+        }, { priority: BACKGROUND_TASK_PRIORITY.AUTOMATIC, leaseKey: 'build-queue-sweep' });
         addRessourcesHover(localStorage.getItem('full_storage_times') ? JSON.parse(localStorage.getItem('full_storage_times')) : null);
         if (urlPage.includes("screen=overview") && !urlPage.includes("screen=overview_villages")) {
             injectScriptColumn();
@@ -229,13 +244,17 @@ function start() {
         if (typeof registerWidgetPopupSidebarShortcuts === 'function') registerWidgetPopupSidebarShortcuts();
 
         if (settings_cookies.general['keep_awake']) {
-            var maxInactiveMin = Math.floor(Math.random() * (10 - 5 + 1)) + 5;
-            setInterval(() => checkInactivity(maxInactiveMin), 30000);
+            const maxInactiveMin = 8;
+            if (runtime) runtime.setInterval('keep-awake:check', () => checkInactivity(maxInactiveMin), 30000);
+            else if (!window.__twpfKeepAwakeInterval) window.__twpfKeepAwakeInterval = setInterval(() => checkInactivity(maxInactiveMin), 30000);
+        } else if (runtime) {
+            runtime.clearInterval('keep-awake:check');
         }
 
         const table = $("#overviewtable");
 
-        if (table.length && table.data("ui-sortable")) {
+        if (table.length && table.data("ui-sortable") && !table.data('twpf-sortable-wrapped')) {
+            table.data('twpf-sortable-wrapped', true);
             const originalSortableUpdate = table.sortable("option", "update");
             const originalSortableStart = table.sortable("option", "start");
             table.sortable("option", "start", function () {
@@ -292,16 +311,24 @@ function start() {
             }
         }
 
-        storeUnitsInfo();
-        fetchAndCacheBuildingsData();
+        registerBackground('static-game-data', async function (guard) {
+            guard?.assertActive?.();
+            await storeUnitsInfo();
+            guard?.assertActive?.();
+            await fetchAndCacheBuildingsData();
+        }, { priority: BACKGROUND_TASK_PRIORITY.REFRESH, leaseKey: 'static-game-data' });
 
-        if (settings_cookies.general['show__auto_daily_bonus']) {
-            checkAndScheduleDailyBonus();
-        }
+        registerBackground('daily-bonus', function (guard) {
+            guard?.assertActive?.();
+            if (settings_cookies.general['show__auto_daily_bonus']) return checkAndScheduleDailyBonus();
+        }, { priority: BACKGROUND_TASK_PRIORITY.AUTOMATIC, leaseKey: 'daily-bonus' });
 
-        if (window.PremiumFeaturesPrivateAutomations && settings_cookies.general['show__auto_paladin_train']?.enabled) {
-            checkAndSchedulePaladinTrainer();
-        }
+        registerBackground('paladin', function (guard) {
+            guard?.assertActive?.();
+            if (window.PremiumFeaturesPrivateAutomations && settings_cookies.general['show__auto_paladin_train']?.enabled) {
+                return checkAndSchedulePaladinTrainer();
+            }
+        }, { priority: BACKGROUND_TASK_PRIORITY.AUTOMATIC, leaseKey: 'paladin' });
 
     } else {
         //TODO: fix this

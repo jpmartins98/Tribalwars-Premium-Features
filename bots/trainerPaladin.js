@@ -9,12 +9,20 @@
 //      embedded as JS, not static HTML). Then either re-schedules (training in
 //      progress) or starts a new session.
 //   3. _startPaladinTraining(knightId, regimenId, durationSec) — POSTs the training
-//      request and schedules the next check via setFunctionOnTimeOut.
+//      request and schedules the next check via a registered persisted handler.
 
 // ─── Public entry point ────────────────────────────────────────────────────────
 
+function schedulePaladinTrainerCheck(waitMs) {
+    setHandlerOnTimeOut('auto_trainer_paladin', 'paladinTrainerCheck', [], waitMs);
+}
+
+if (typeof registerTimeoutHandler === 'function') {
+    registerTimeoutHandler('paladinTrainerCheck', checkAndSchedulePaladinTrainer);
+}
+
 /**
- * Called on every page load (from start()) and from the setFunctionOnTimeOut
+ * Called on every page load (from start()) and from the persisted timeout
  * callback after training finishes. Guards against double-scheduling.
  */
 async function checkAndSchedulePaladinTrainer() {
@@ -24,8 +32,7 @@ async function checkAndSchedulePaladinTrainer() {
     // Clear any legacy redirect-based stored function from the old bot version
     const storedFn = localStorage.getItem('function_auto_trainer_paladin') || '';
     if (storedFn.includes('location.href')) {
-        localStorage.removeItem('function_auto_trainer_paladin');
-        localStorage.removeItem('endTime_auto_trainer_paladin');
+        if (typeof clearPersistedTimeout === 'function') clearPersistedTimeout('auto_trainer_paladin');
     }
 
     // If a timer is still active and in the future, nothing to do
@@ -42,7 +49,7 @@ async function checkAndSchedulePaladinTrainer() {
  * Decides next action:
  *   - No paladin yet           → stop (nothing to train).
  *   - Max level reached        → stop.
- *   - Training in progress     → re-arm setFunctionOnTimeOut for when it finishes.
+ *   - Training in progress     → re-arm the registered timeout for when it finishes.
  *   - Training slot free       → start cheapest regimen.
  */
 async function fetchAndStartPaladinTraining() {
@@ -80,7 +87,7 @@ async function fetchAndStartPaladinTraining() {
         if (finishTimeSec) {
             const waitMs = Math.max(0, finishTimeSec * 1000 - Timing.getCurrentServerTime());
             if (waitMs > 0) {
-                setFunctionOnTimeOut('auto_trainer_paladin', function () { checkAndSchedulePaladinTrainer(); }, waitMs);
+                schedulePaladinTrainerCheck(waitMs);
                 return;
             }
         }
@@ -211,14 +218,14 @@ async function _startPaladinTraining(knightId, regimenId, durationSec) {
             : new Date(String(endtimeRaw).replace(' ', 'T')).getTime();
         const waitMs = Math.max(0, epoch - Timing.getCurrentServerTime());
         if (waitMs > 0) {
-            setFunctionOnTimeOut('auto_trainer_paladin', function () { checkAndSchedulePaladinTrainer(); }, waitMs);
+            schedulePaladinTrainerCheck(waitMs);
             return;
         }
     }
 
     // Fallback: use regimen duration from the parsed page data
     if (durationSec > 0) {
-        setFunctionOnTimeOut('auto_trainer_paladin', function () { checkAndSchedulePaladinTrainer(); }, durationSec * 1000);
+        schedulePaladinTrainerCheck(durationSec * 1000);
         return;
     }
 
@@ -247,7 +254,7 @@ async function _reschedulePaladinFromPage() {
     localStorage.setItem('statue_knight_endtime', String(knight.activity.finish_time));
     const waitMs = Math.max(0, knight.activity.finish_time * 1000 - Timing.getCurrentServerTime());
     if (waitMs > 0) {
-        setFunctionOnTimeOut('auto_trainer_paladin', function () { checkAndSchedulePaladinTrainer(); }, waitMs);
+        schedulePaladinTrainerCheck(waitMs);
     }
 }
 
@@ -269,11 +276,6 @@ function injectScriptAutoTrainerPaladin() {
     }
 
     if (!settings_cookies.general['show__auto_paladin_train']?.enabled) {
-        localStorage.removeItem('function_auto_trainer_paladin');
-        localStorage.removeItem('endTime_auto_trainer_paladin');
-        if (activeTimeouts?.['auto_trainer_paladin']) {
-            clearTimeout(activeTimeouts['auto_trainer_paladin']);
-            delete activeTimeouts['auto_trainer_paladin'];
-        }
+        if (typeof clearPersistedTimeout === 'function') clearPersistedTimeout('auto_trainer_paladin');
     }
 }

@@ -1,6 +1,6 @@
 /**
  * Checks if the daily bonus has been collected today (by server date) and attempts
- * collection if not. Schedules the next run at server midnight plus a random delay.
+ * collection if not. Schedules the next run at server midnight with deterministic spreading.
  */
 async function checkAndScheduleDailyBonus() {
     if (!settings_cookies.general['show__auto_daily_bonus']) return;
@@ -20,17 +20,19 @@ async function checkAndScheduleDailyBonus() {
             localStorage.setItem('daily_bonus_last_date', todayKey);
         }
 
-        // Schedule next run at next server midnight + random delay (up to 2 min).
+        // Schedule next run at next server midnight, deterministically spread by timer id.
         // twWallClockToEpochMs(0,0,0,1) returns the UTC epoch of tomorrow's 00:00:00 server time.
         const nextServerMidnightMs = twWallClockToEpochMs(0, 0, 0, 1);
         const msUntilMidnight = nextServerMidnightMs - Timing.getCurrentServerTime();
-        const randomDelay = Math.random() * 120000; // up to 2 minutes
-
-        setTimeout(() => checkAndScheduleDailyBonus(), msUntilMidnight + randomDelay);
+        setHandlerOnTimeOut('daily_bonus', 'dailyBonusCheck', [], msUntilMidnight, 0, 120000);
 
     } catch (err) {
         console.error('[DailyBonus] Schedule error:', err);
     }
+}
+
+if (typeof registerTimeoutHandler === 'function') {
+    registerTimeoutHandler('dailyBonusCheck', checkAndScheduleDailyBonus);
 }
 
 /**

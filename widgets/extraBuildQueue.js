@@ -13,7 +13,7 @@ function getBuildQueueTimeoutId(villageId) {
 
 /**
  * Returns the maximum number of simultaneous active build queue slots.
- * Premium accounts support up to 15; free accounts support 2.
+ * Premium accounts support up to 5; free accounts support 2.
  * Premium status is account-wide, so this is valid for any village.
  * @returns {number}
  */
@@ -144,9 +144,8 @@ function setBuildQueueButtonLoading(button, isLoading) {
 /**
  * Fetches a village's main-building page via AJAX. Works for the currently displayed village
  * as well as any other village belonging to the account — cookies/session apply account-wide,
- * only the "village" query parameter changes. Retries on HTTP 429 (see fetchWithRetry429) since
- * this is called once per village on screen=overview_villages and can otherwise trip the
- * server's rate limiter on accounts with many villages.
+ * only the "village" query parameter changes. The compatibility request wrapper performs no
+ * automatic 429 retry; batching is controlled by the cooperative scheduler.
  * @param {string|number} villageId
  * @returns {Promise<{doc: Document, html: string}>}
  */
@@ -1247,13 +1246,7 @@ function callRemoveFromActiveBuildingQueue(idToRemove, villageId) {
  */
 function clearVillageBuildQueueTimeout(villageId) {
     const bqId = getBuildQueueTimeoutId(villageId);
-    localStorage.removeItem('function_' + bqId);
-    localStorage.removeItem('handler_' + bqId);
-    localStorage.removeItem('endTime_' + bqId);
-    if (activeTimeouts[bqId]) {
-        clearTimeout(activeTimeouts[bqId]);
-        delete activeTimeouts[bqId];
-    }
+    if (typeof clearPersistedTimeout === 'function') clearPersistedTimeout(bqId);
 }
 
 /**
@@ -1546,6 +1539,7 @@ var backgroundQueueSweepInterval = null;
 function initBackgroundVillageQueueSweep() {
     if (backgroundQueueSweepInterval) return;
     backgroundQueueSweepInterval = setInterval(() => {
+        if (window.PremiumFeaturesCoordination && !window.PremiumFeaturesCoordination.isCoordinator()) return;
         const currentId = game_data?.village?.id;
         getAllVillageIds().forEach(vId => {
             if (vId == currentId) return;

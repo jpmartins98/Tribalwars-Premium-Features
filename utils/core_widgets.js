@@ -51,8 +51,9 @@ function isEditableKeyboardTarget(target) {
  * Only active when the navigation arrows setting is enabled and no editable field has focus.
  */
 function defineKeyboardShortcuts() {
+    $(document).off('keydown.premium_features_navigation');
     if (settings_cookies.general['show__navigation_arrows']) {
-        $(document).keydown(function (evt) {
+        $(document).on('keydown.premium_features_navigation', function (evt) {
             if (textSelected || isEditableKeyboardTarget(evt.target)) return;
 
             if (evt.keyCode == 65) {
@@ -149,13 +150,10 @@ function createWidgetElement({ identifier, contents, columnToUse, update, extra_
         contentDiv.appendChild(contents);
         containerDiv.appendChild(header);
         containerDiv.appendChild(contentDiv);
-        //if update, remove the current element
-        if (update) {
-            var currentElement = document.getElementById('show_' + elemName);
-            if (currentElement) {
-                columnElement.removeChild(currentElement);
-            }
-        }
+        // A partial reload may reconcile the same logical widget again. Replace by stable id
+        // regardless of the caller's update flag so no duplicate UI can survive.
+        var currentElement = document.getElementById('show_' + elemName);
+        if (currentElement) currentElement.remove();
 
         // Insert at the saved position if valid, otherwise append to the column
         var widgetIndex = settings_cookies.widgets.find(widget => widget.name === elemName).pos;
@@ -284,7 +282,7 @@ function restoreNativeWidgetPosition(item) {
  */
 function injectScriptColumn() {
     var overviewtableElement = document.getElementById('overviewtable');
-    if (overviewtableElement) {
+    if (overviewtableElement && !document.getElementById('script_column')) {
         var trElement = overviewtableElement.getElementsByTagName('tr')[0];
         var scriptColumn = document.createElement('td');
         scriptColumn.setAttribute('valign', 'top');

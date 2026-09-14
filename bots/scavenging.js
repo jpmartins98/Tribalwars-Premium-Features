@@ -68,11 +68,20 @@ function _scavGetWorldSpeed() {
 const SCAVENGE_TIER_RATIOS = [0.10, 0.25, 0.50, 0.75];
 
 /**
- * Returns a random delay between 5 and 10 minutes in milliseconds.
- * Added after each troop return to avoid predictable bot timing.
+ * Returns a stable per-village delay between 5 and 10 minutes in milliseconds.
+ * The spread prevents simultaneous internal work without random timing.
  */
-function _scavRandomDelayMs() {
-    return (5 + Math.random() * 5) * 60 * 1000;
+function _scavSpreadDelayMs() {
+    const villageId = game_data?.village?.id || 'unknown';
+    return deterministicSpread('scavenging:' + villageId, 5 * 60 * 1000, 10 * 60 * 1000);
+}
+
+function _scheduleScavengingAuto(waitMs) {
+    setHandlerOnTimeOut('scavenging-auto', 'scavengingAutoCheck', [], waitMs);
+}
+
+if (typeof registerTimeoutHandler === 'function') {
+    registerTimeoutHandler('scavengingAutoCheck', triggerScavengingAuto);
 }
 
 // Unit order used in distribution calculations (excludes spy/ram/catapult/snob)
@@ -260,13 +269,13 @@ async function runOptimizedScavenge(forceRun = false) {
         }
     } catch (e) {
         console.error('[AutoScavenge] Optimize: fetch failed:', e);
-        setFunctionOnTimeOut('scavenging-auto', function () { triggerScavengingAuto(); }, 5 * 60 * 1000);
+        _scheduleScavengingAuto(5 * 60 * 1000);
         return;
     }
 
     if (!villageData) {
         console.warn('[AutoScavenge] Optimize: could not parse village data. Retrying in 5 min.');
-        setFunctionOnTimeOut('scavenging-auto', function () { triggerScavengingAuto(); }, 5 * 60 * 1000);
+        _scheduleScavengingAuto(5 * 60 * 1000);
         return;
     }
 
@@ -306,13 +315,13 @@ async function runOptimizedScavenge(forceRun = false) {
     }
 
     if (earliestReturn) {
-        const jitterMs = _scavRandomDelayMs();
-        const waitMs = Math.max(0, earliestReturn - Date.now()) + jitterMs;
-        localStorage.setItem('endTime_scavenging-auto', String(earliestReturn + jitterMs));
-        setFunctionOnTimeOut('scavenging-auto', function () { triggerScavengingAuto(); }, waitMs);
-        console.log(`[AutoScavenge] Optimize: next check in ${Math.round(waitMs / 60000)} min (incl. ${Math.round(jitterMs / 60000)} min jitter).`);
+        const spreadMs = _scavSpreadDelayMs();
+        const waitMs = Math.max(0, earliestReturn - Date.now()) + spreadMs;
+        localStorage.setItem('endTime_scavenging-auto', String(earliestReturn + spreadMs));
+        _scheduleScavengingAuto(waitMs);
+        console.log(`[AutoScavenge] Optimize: next check in ${Math.round(waitMs / 60000)} min (incl. ${Math.round(spreadMs / 60000)} min deterministic spread).`);
     } else {
-        setFunctionOnTimeOut('scavenging-auto', function () { triggerScavengingAuto(); }, 30 * 60 * 1000);
+        _scheduleScavengingAuto(30 * 60 * 1000);
         console.warn('[AutoScavenge] Optimize: no return times found. Retrying in 30 min.');
     }
 
@@ -493,7 +502,7 @@ async function triggerScavengingAuto() {
             doc = new DOMParser().parseFromString(await resp.text(), 'text/html');
         } catch (e) {
             console.error('[AutoScavenge] Failed to fetch scavenge page:', e);
-            setFunctionOnTimeOut('scavenging-auto', function () { triggerScavengingAuto(); }, 30 * 60 * 1000);
+            _scheduleScavengingAuto(30 * 60 * 1000);
             return;
         }
 
@@ -516,7 +525,7 @@ async function triggerScavengingAuto() {
         }
         if (!fetchedVillage) {
             console.warn('[AutoScavenge] level=0: no village data in fetched HTML; retrying in 30 min.');
-            setFunctionOnTimeOut('scavenging-auto', function () { triggerScavengingAuto(); }, 30 * 60 * 1000);
+            _scheduleScavengingAuto(30 * 60 * 1000);
             return;
         }
         console.log('[AutoScavenge] level=0: village data parsed | options:', Object.keys(fetchedVillage.options || {}));
@@ -534,10 +543,10 @@ async function triggerScavengingAuto() {
                 const rt = opt?.scavenging_squad?.return_time;
                 if (rt && (earliestRt === null || rt < earliestRt)) earliestRt = rt;
             });
-            const jitterMs = _scavRandomDelayMs();
-            const waitMs = earliestRt ? Math.max(0, earliestRt * 1000 - Date.now()) + jitterMs : 0;
-            console.log('[AutoScavenge] level=0: all options busy | earliest return_time:', earliestRt, '| waiting:', Math.round(waitMs / 60000), 'min (incl. jitter).');
-            setFunctionOnTimeOut('scavenging-auto', function () { triggerScavengingAuto(); }, waitMs > 0 ? waitMs : 30 * 60 * 1000);
+            const spreadMs = _scavSpreadDelayMs();
+            const waitMs = earliestRt ? Math.max(0, earliestRt * 1000 - Date.now()) + spreadMs : 0;
+            console.log('[AutoScavenge] level=0: all options busy | earliest return_time:', earliestRt, '| waiting:', Math.round(waitMs / 60000), 'min (incl. deterministic spread).');
+            _scheduleScavengingAuto(waitMs > 0 ? waitMs : 30 * 60 * 1000);
             return;
         }
 
@@ -562,7 +571,7 @@ async function triggerScavengingAuto() {
 
         if (Object.keys(fetchedUnitCounts).length === 0) {
             console.warn('[AutoScavenge] level=0: no unit counts available; retrying in 30 min.');
-            setFunctionOnTimeOut('scavenging-auto', function () { triggerScavengingAuto(); }, 30 * 60 * 1000);
+            _scheduleScavengingAuto(30 * 60 * 1000);
             return;
         }
 
@@ -574,16 +583,16 @@ async function triggerScavengingAuto() {
         const fetchedResult = await sendScavengeSquadApi(fetchedUnitCounts, fetchedOptionId, fetchedCarryMax);
         console.log('[AutoScavenge] level=0: result — success:', fetchedResult.success, '| returnMs:', fetchedResult.returnMs);
         if (fetchedResult.returnMs > 0) {
-            const jitterMs = _scavRandomDelayMs();
-            const totalMs = fetchedResult.returnMs + jitterMs;
-            console.log('[AutoScavenge] level=0: next run in', Math.round(totalMs / 60000), 'min (incl.', Math.round(jitterMs / 60000), 'min jitter).');
-            setFunctionOnTimeOut('scavenging-auto', function () { triggerScavengingAuto(); }, totalMs);
+            const spreadMs = _scavSpreadDelayMs();
+            const totalMs = fetchedResult.returnMs + spreadMs;
+            console.log('[AutoScavenge] level=0: next run in', Math.round(totalMs / 60000), 'min (incl.', Math.round(spreadMs / 60000), 'min deterministic spread).');
+            _scheduleScavengingAuto(totalMs);
         } else if (fetchedResult.success) {
             console.warn('[AutoScavenge] level=0: send succeeded but no returnMs — retrying in 5 min.');
-            setFunctionOnTimeOut('scavenging-auto', function () { triggerScavengingAuto(); }, 5 * 60 * 1000);
+            _scheduleScavengingAuto(5 * 60 * 1000);
         } else {
             console.warn('[AutoScavenge] level=0: send failed with no returnMs — retrying in 30 min.');
-            setFunctionOnTimeOut('scavenging-auto', function () { triggerScavengingAuto(); }, 30 * 60 * 1000);
+            _scheduleScavengingAuto(30 * 60 * 1000);
         }
         if (game_data?.screen === 'overview' && typeof getPlaceInfo === 'function') { getPlaceInfo(); }
         return;
@@ -602,7 +611,7 @@ async function triggerScavengingAuto() {
             console.log('[AutoScavenge] Scavenge page fetched for seeding.');
         } catch (e) {
             console.error('[AutoScavenge] Failed to fetch scavenge page for seeding:', e);
-            setFunctionOnTimeOut('scavenging-auto', function () { triggerScavengingAuto(); }, 30 * 60 * 1000);
+            _scheduleScavengingAuto(30 * 60 * 1000);
             return;
         }
 
@@ -624,7 +633,7 @@ async function triggerScavengingAuto() {
         }
         if (!seedVillage) {
             console.warn('[AutoScavenge] Seed: no village data in fetched HTML; retrying in 30 min.');
-            setFunctionOnTimeOut('scavenging-auto', function () { triggerScavengingAuto(); }, 30 * 60 * 1000);
+            _scheduleScavengingAuto(30 * 60 * 1000);
             return;
         }
         console.log('[AutoScavenge] Seed: village data parsed | options:', Object.keys(seedVillage.options || {}));
@@ -636,7 +645,7 @@ async function triggerScavengingAuto() {
 
         if (!seedTarget) {
             console.warn('[AutoScavenge] Level', config.level, 'not available; retrying in 30 min.');
-            setFunctionOnTimeOut('scavenging-auto', function () { triggerScavengingAuto(); }, 30 * 60 * 1000);
+            _scheduleScavengingAuto(30 * 60 * 1000);
             return;
         }
 
@@ -653,7 +662,7 @@ async function triggerScavengingAuto() {
                 unitCounts = seedCounts;
             } else {
                 console.warn('[AutoScavenge] No units at home in fetched data; retrying in 30 min.');
-                setFunctionOnTimeOut('scavenging-auto', function () { triggerScavengingAuto(); }, 30 * 60 * 1000);
+                _scheduleScavengingAuto(30 * 60 * 1000);
                 return;
             }
         } else {
@@ -664,7 +673,7 @@ async function triggerScavengingAuto() {
 
     if (!unitCounts || Object.keys(unitCounts).length === 0) {
         console.warn('[AutoScavenge] No unit counts for level', config.level, '; retrying in 30 min.');
-        setFunctionOnTimeOut('scavenging-auto', function () { triggerScavengingAuto(); }, 30 * 60 * 1000);
+        _scheduleScavengingAuto(30 * 60 * 1000);
         return;
     }
 
@@ -676,16 +685,16 @@ async function triggerScavengingAuto() {
     const result = await sendScavengeSquadApi(unitCounts, optionId, carryMax);
     console.log('[AutoScavenge] Result — success:', result.success, '| returnMs:', result.returnMs);
     if (result.returnMs > 0) {
-        const jitterMs = _scavRandomDelayMs();
-        const totalMs = result.returnMs + jitterMs;
-        console.log('[AutoScavenge] Next run in', Math.round(totalMs / 60000), 'min (incl.', Math.round(jitterMs / 60000), 'min jitter).');
-        setFunctionOnTimeOut('scavenging-auto', function () { triggerScavengingAuto(); }, totalMs);
+        const spreadMs = _scavSpreadDelayMs();
+        const totalMs = result.returnMs + spreadMs;
+        console.log('[AutoScavenge] Next run in', Math.round(totalMs / 60000), 'min (incl.', Math.round(spreadMs / 60000), 'min deterministic spread).');
+        _scheduleScavengingAuto(totalMs);
     } else if (result.success) {
         console.warn('[AutoScavenge] Send succeeded but no returnMs — retrying in 5 min.');
-        setFunctionOnTimeOut('scavenging-auto', function () { triggerScavengingAuto(); }, 5 * 60 * 1000);
+        _scheduleScavengingAuto(5 * 60 * 1000);
     } else {
         console.warn('[AutoScavenge] Send failed with no returnMs — retrying in 30 min.');
-        setFunctionOnTimeOut('scavenging-auto', function () { triggerScavengingAuto(); }, 30 * 60 * 1000);
+        _scheduleScavengingAuto(30 * 60 * 1000);
     }
     if (game_data?.screen === 'overview' && typeof getPlaceInfo === 'function') { getPlaceInfo(); }
 }
@@ -1168,7 +1177,7 @@ function injectScavengeConfigPanel() {
                     saveScavengeConfig({ enabled: false, level, units, optimizeMode: false, allUnits: false, distributionByOption: null });
                 }
                 if (result.returnMs > 0 && isEnabled) {
-                    setFunctionOnTimeOut('scavenging-auto', function () { triggerScavengingAuto(); }, result.returnMs);
+                    _scheduleScavengingAuto(result.returnMs);
                 }
                 _scavengeSchedulePageReload();
             }
@@ -1291,8 +1300,8 @@ async function runAutoScavengingAll() {
     if (returnTime) {
         const waitTime = Math.floor(timeToMilliseconds(returnTime.textContent));
         if (waitTime > 0) {
-            const jitterMs = _scavRandomDelayMs();
-            setFunctionOnTimeOut('scavenging-auto', function () { triggerScavengingAuto(); }, waitTime + jitterMs);
+            const spreadMs = _scavSpreadDelayMs();
+            _scheduleScavengingAuto(waitTime + spreadMs);
         }
         return;
     }
@@ -1345,16 +1354,16 @@ async function runAutoScavengingAll() {
         const result = await sendScavengeSquadApi(unitCounts, optionId, carryMax);
         console.log('[AutoScavenge] runAutoScavengingAll: result — success:', result.success, '| returnMs:', result.returnMs);
         if (result.returnMs > 0) {
-            const jitterMs = _scavRandomDelayMs();
-            const totalMs = result.returnMs + jitterMs;
-            console.log('[AutoScavenge] runAutoScavengingAll: next run in', Math.round(totalMs / 60000), 'min (incl.', Math.round(jitterMs / 60000), 'min jitter).');
-            setFunctionOnTimeOut('scavenging-auto', function () { triggerScavengingAuto(); }, totalMs);
+            const spreadMs = _scavSpreadDelayMs();
+            const totalMs = result.returnMs + spreadMs;
+            console.log('[AutoScavenge] runAutoScavengingAll: next run in', Math.round(totalMs / 60000), 'min (incl.', Math.round(spreadMs / 60000), 'min deterministic spread).');
+            _scheduleScavengingAuto(totalMs);
         } else if (result.success) {
             console.warn('[AutoScavenge] runAutoScavengingAll: send succeeded but no returnMs — retrying in 5 min.');
-            setFunctionOnTimeOut('scavenging-auto', function () { triggerScavengingAuto(); }, 5 * 60 * 1000);
+            _scheduleScavengingAuto(5 * 60 * 1000);
         } else {
             console.warn('[AutoScavenge] runAutoScavengingAll: send failed with no returnMs — retrying in 30 min.');
-            setFunctionOnTimeOut('scavenging-auto', function () { triggerScavengingAuto(); }, 30 * 60 * 1000);
+            _scheduleScavengingAuto(30 * 60 * 1000);
         }
     } else {
         console.log('[AutoScavenge] runAutoScavengingAll: no targetOption — nothing to send.');

@@ -45,6 +45,9 @@
         stopHookTimer();
         stopObserver();
         $(document).off('partial_reload_end.premium_features');
+        window.PremiumFeaturesBackgroundScheduler?.hardStop?.({ source: 'bot-protection' });
+        window.PremiumFeaturesCoordination?.broadcast?.('hard-stop', { source: 'bot-protection' });
+        window.PremiumFeaturesCoordination?.stop?.();
     }
 
     function hookBotProtection() {
@@ -109,6 +112,12 @@
             blockPremiumFeatures();
         }
     };
+
+    window.PremiumFeaturesCoordination?.subscribe?.('hard-stop', function () {
+        window.PremiumFeaturesBackgroundScheduler?.hardStop?.({ source: 'remote-hard-stop' });
+        window.PremiumFeaturesCoordination?.stop?.();
+        blockPremiumFeatures();
+    });
 
     if (document.body) {
         watchForBotProtection();

@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         Tribalwars: Premium Features [Premium Compat]
-// @version      5.0.4.2
+// @version      5.1.0
 // @description  Feature-rich enhancement suite for TribalWars. Widgets: Village List, Notepad, Extra Build Queue, Recruit Troops. Map: hover details, outgoing command overlay, attack heat-map, custom CTX attack template buttons, large map view. Automation: Auto Daily Bonus collection. UI: Custom Navigation Bar, Navigation Arrows, Visual Building Overview. Settings: full import/export support.
 // @author       killwilll
 // @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/i18n/i18n_utils.js
@@ -8,6 +8,8 @@
 // @resource     i18n_pt      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/i18n/pt.json
 // @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/utils/emojiMap.js
 // @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/utils/core_storage.js
+// @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/utils/core_runtime.js
+// @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/utils/core_coordination.js
 // @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/utils/core_state.js
 // @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/utils/core_utils.js
 // @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/utils/core_widgets.js
@@ -74,6 +76,8 @@
 (function () {
     'use strict';
 
+    const runtime = window.PremiumFeaturesRuntimeRegistry;
+
     function isBotProtectionActive() {
         return Boolean(window.PremiumFeaturesBotProtection && window.PremiumFeaturesBotProtection.isActive());
     }
@@ -86,32 +90,42 @@
         .off('partial_reload_end.premium_features')
         .on('partial_reload_end.premium_features', function () {
             if (!isBotProtectionActive() && !document.getElementById('mobileContent')) {
-                start();
+                runtime.requestReconcile('partial-reload', function () {
+                    init().then(start).catch(function (error) {
+                        console.error('[TW] Partial reload reconcile failed', error);
+                    });
+                });
             }
         });
 
     var villageList;
-    async function init() {
-        if (isBotProtectionActive()) return;
-        await hydrateBuildQueueCache();
-        cleanupLegacyRecruitQueueLocalStorage();
-        cleanupLegacyReportsLocalStorage();
-        await cleanupLegacyNotepadStorage();
-        await hydrateNotepadCache();
-        await hydrateVillageProfileNotesCache();
-        await hydrateReservationsCache();
-        cleanupLegacyMapDataLocalStorage();
-        await hydrateMapDataCache();
-        restoreTimeouts();
-        prepareLocalStorageItems();
-        if (!document.getElementById('mobileContent')) {
-            start();
-        }
+    function init() {
+        return runtime.onceAsync('core:boot', async function () {
+            if (isBotProtectionActive()) return;
+            await hydrateBuildQueueCache();
+            cleanupLegacyRecruitQueueLocalStorage();
+            cleanupLegacyReportsLocalStorage();
+            await cleanupLegacyNotepadStorage();
+            await hydrateNotepadCache();
+            await hydrateVillageProfileNotesCache();
+            await hydrateReservationsCache();
+            cleanupLegacyMapDataLocalStorage();
+            await hydrateMapDataCache();
+            restoreTimeouts();
+            prepareLocalStorageItems();
+            runtime.installInteractionTracking(document);
+            window.PremiumFeaturesCoordination?.start?.();
+            window.PremiumFeaturesBackgroundScheduler?.start?.();
+        });
     }
 
-    setTimeout(() => {
+    runtime.setTimeout('core:boot-delay', () => {
         if (!isBotProtectionActive()) {
-            init();
+            init().then(function () {
+                if (!document.getElementById('mobileContent')) start();
+            }).catch(function (error) {
+                console.error('[TW] Boot failed', error);
+            });
         }
-    }, 500);
+    }, 500, false);
 })();
