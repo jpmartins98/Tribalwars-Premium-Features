@@ -133,6 +133,12 @@
                 return null;
             }
             heldLeases.set(taskKey, candidate);
+            host.PremiumFeaturesDiagnostics?.record?.({
+                taskKey,
+                status: 'LEASE',
+                reason: 'acquired',
+                fencingToken: candidate.token
+            });
             broadcast('lease-changed', { taskKey, owner: tabId, token: candidate.token, expiresAt: candidate.expiresAt });
             return Object.assign({}, candidate);
         }
@@ -343,6 +349,7 @@
             const ttlMs = Math.max(1000, Number(leaseOptions.ttlMs) || 30000);
             const lease = acquireLease(taskKey, ttlMs);
             if (!lease) {
+                host.PremiumFeaturesDiagnostics?.record?.({ taskKey, status: 'SKIPPED', reason: 'lease-unavailable' });
                 const error = new Error('Lease unavailable for ' + taskKey);
                 error.code = 'LEASE_UNAVAILABLE';
                 error.currentLease = readLease(taskKey);

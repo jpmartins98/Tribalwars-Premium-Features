@@ -229,17 +229,31 @@ function setBuildQueueButtonLoading(button, isLoading) {
 function fetchVillageMainPage(villageId) {
     const vId = String(villageId || game_data?.village?.id || '');
     const run = function () {
-        return fetchWithRetry429({
-            url: getVillageLinkBase(vId) + 'main',
-            type: 'GET',
-            cache: false
-        }).then(function (data) {
+        const request = function () { return fetchWithRetry429({
+                url: getVillageLinkBase(vId) + 'main',
+                type: 'GET',
+                cache: false
+            }); };
+        const pending = window.PremiumFeaturesDiagnostics?.request
+            ? window.PremiumFeaturesDiagnostics.request({
+                feature: 'build-state',
+                villageId: vId,
+                logicalResource: 'village-main:' + vId,
+                method: 'GET',
+                reason: 'shared-build-state'
+            }, request)
+            : request();
+        return pending.then(function (data) {
             const parser = new DOMParser();
-            return { doc: parser.parseFromString(data, 'text/html'), html: data, source: 'network' };
+            const result = { doc: parser.parseFromString(data, 'text/html'), html: data, source: 'network' };
+            if (typeof observeBuildQueueDocument === 'function') {
+                result.buildStateObservation = observeBuildQueueDocument(result.doc, vId, 'network');
+            }
+            return result;
         });
     };
     if (window.PremiumFeaturesSingleFlight?.run) {
-        return window.PremiumFeaturesSingleFlight.run('GET:screen=main:village=' + vId, run);
+        return window.PremiumFeaturesSingleFlight.run('village-main:' + vId, run);
     }
     return run();
 }
@@ -506,6 +520,13 @@ function parseAndStoreQueueState(tempElement, villageId, source = 'network') {
     const queueBuildLevelsActive = [];
     const allSlotTimestamps = [];
     const cancelIds = [];
+    const instantButton = tempElement.querySelector('.btn-instant-free');
+    const instantOrderMatch = (instantButton?.getAttribute('onclick') || '').match(/change_order\((\d+)/);
+    const instantFree = instantButton ? {
+        orderId: instantOrderMatch?.[1] || null,
+        availableFrom: (parseInt(instantButton.getAttribute('data-available-from'), 10) || 0) * 1000 || null,
+        availableTo: (parseInt(instantButton.getAttribute('data-available-to'), 10) || 0) * 1000 || null
+    } : null;
 
     cancelButtons.forEach(function (element) {
         const row = element.parentElement?.parentElement;
@@ -552,7 +573,8 @@ function parseAndStoreQueueState(tempElement, villageId, source = 'network') {
         maxSlots: maxQueueSize,
         currentLevels,
         fetchedAt: Date.now(),
-        source
+        source,
+        instantFree
     };
     setVillageQueueFull(vId, official.full);
 
@@ -1424,8 +1446,14 @@ function createBuildQueueCatalog(doc) {
     return Object.assign({}, catalog, { capturedAt: Date.now() });
 }
 
+var buildQueueDocumentObservationCache = new WeakMap();
+
 function observeBuildQueueDocument(doc, villageId, source) {
     const vId = String(villageId || game_data?.village?.id || '');
+    if (doc && doc !== document) {
+        const cached = buildQueueDocumentObservationCache.get(doc);
+        if (cached?.villageId === vId) return cached.observation;
+    }
     const parsed = parseAndStoreQueueState(doc, vId, source);
     const resources = buildResourceStateFromDoc(doc, source);
     const catalog = createBuildQueueCatalog(doc);
@@ -1436,7 +1464,9 @@ function observeBuildQueueDocument(doc, villageId, source) {
     }
     state?.updateCatalog(vId, catalog);
     state?.publishObservation?.(vId);
-    return { official: parsed.official, resources, catalog, doc, alreadyStored: true };
+    const observation = { official: parsed.official, resources, catalog, doc, alreadyStored: true };
+    if (doc && doc !== document) buildQueueDocumentObservationCache.set(doc, { villageId: vId, observation });
+    return observation;
 }
 
 async function inspectBuildQueueVillage(villageId, context = {}) {
@@ -1461,7 +1491,7 @@ async function inspectBuildQueueVillage(villageId, context = {}) {
     const result = await fetchVillageMainPage(vId);
     context.guard?.assertActive?.();
     if (!getBuildQueueStateApi()?.isCurrent(vId, context.captured)) return { stale: true };
-    return observeBuildQueueDocument(result.doc, vId, result.source || 'network');
+    return result.buildStateObservation || observeBuildQueueDocument(result.doc, vId, result.source || 'network');
 }
 
 function executeBuildQueueMutation(villageId, item, context = {}) {
@@ -2087,16 +2117,25 @@ function installBuildQueueMutationInvalidation() {
         function (_event, _xhr, settings) {
             const url = String(settings?.url || '');
             if (settings?.twpfBuildQueueMutation) return;
-            const method = String(settings?.type || settings?.method || 'GET').toUpperCase();
-            const isKnownMutation = method !== 'GET' || /(?:action=upgrade_building|ajaxaction=|screen=market.*action=|screen=place.*action=)/i.test(url);
-            if (!isKnownMutation) return;
             let parsed;
             try { parsed = new URL(url, window.location.href); } catch (_error) { return; }
             if (parsed.origin !== window.location.origin) return;
+            const method = String(settings?.type || settings?.method || 'GET').toUpperCase();
+            const screen = String(parsed.searchParams.get('screen') || '');
+            const action = String(parsed.searchParams.get('action') || parsed.searchParams.get('ajaxaction') || '');
+            const changesBuildQueue = screen === 'main' && /(?:upgrade_building|build_order_reduce|cancel)/i.test(action + ' ' + url);
+            const changesResources = changesBuildQueue || (
+                method !== 'GET' && ['market', 'train', 'smith', 'snob'].includes(screen)
+            );
+            if (!changesResources) return;
             const vId = String(parsed.searchParams.get('village') || game_data?.village?.id || '');
             if (!vId || buildQueueRequestInFlightByVillage[vId]) return;
             const state = getBuildQueueStateApi();
-            state?.invalidateResources?.(vId, 'same-origin-mutation');
+            state?.invalidate?.(
+                vId,
+                changesBuildQueue ? ['resources', 'officialQueue', 'instant'] : ['resources'],
+                changesBuildQueue ? 'known-build-mutation' : 'known-resource-mutation'
+            );
             if (state?.get(vId)?.queue?.length) {
                 ensureBuildQueueController()?.schedule(vId, {
                     delayMs: BUILD_QUEUE_EDIT_DEBOUNCE_MS,
@@ -2104,6 +2143,9 @@ function installBuildQueueMutationInvalidation() {
                     reason: 'resource-invalidated',
                     forceFresh: true
                 });
+            }
+            if (changesBuildQueue && typeof scheduleBuildInstantReconciliation === 'function') {
+                scheduleBuildInstantReconciliation(vId, 200);
             }
         }
     );

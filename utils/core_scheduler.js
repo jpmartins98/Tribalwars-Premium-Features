@@ -187,7 +187,10 @@ function createCooperativeScheduler(options = {}) {
         try {
             let value;
             const invoke = async function (guard) {
-                if (task.generation !== capturedGeneration) return { status: 'STALE_GENERATION' };
+                if (task.generation !== capturedGeneration) {
+                    window.PremiumFeaturesDiagnostics?.record?.({ taskKey: task.key, status: 'SKIPPED', reason: 'stale-generation' });
+                    return { status: 'STALE_GENERATION' };
+                }
                 guard?.assertActive?.();
                 return task.run(guard || { assertActive: function () { return true; }, isActive: function () { return true; } });
             };
@@ -345,6 +348,11 @@ function registerTimeoutHandler(name, fn) {
     timeoutHandlers[name] = fn;
 }
 
+// core_utils loads before the scheduler so it cannot register this handler at evaluation time.
+if (typeof runKeepAwakeCheck === 'function') {
+    registerTimeoutHandler('keepAwakeCheck', runKeepAwakeCheck);
+}
+
 function timeoutGenerationKey(id) {
     return 'timeoutGeneration_' + id;
 }
@@ -387,6 +395,7 @@ function getPersistentTaskPolicy(id, args) {
     if (match) return { priority: BACKGROUND_TASK_PRIORITY.AUTOMATIC, requiresCoordinator: true, leaseKey: 'build-instant:' + match[1] };
     if (id === 'auto_trainer_paladin') return { priority: BACKGROUND_TASK_PRIORITY.AUTOMATIC, requiresCoordinator: true, leaseKey: 'paladin' };
     if (id === 'daily_bonus') return { priority: BACKGROUND_TASK_PRIORITY.AUTOMATIC, requiresCoordinator: true, leaseKey: 'daily-bonus' };
+    if (id === 'keep-awake') return { priority: BACKGROUND_TASK_PRIORITY.HOUSEKEEPING, requiresCoordinator: true, leaseKey: 'keep-awake' };
     if (String(id).startsWith('scavenging')) {
         const villageId = args?.[0] || window.game_data?.village?.id || 'unknown';
         return { priority: BACKGROUND_TASK_PRIORITY.AUTOMATIC, requiresCoordinator: true, leaseKey: 'scavenging:' + villageId };
@@ -395,25 +404,67 @@ function getPersistentTaskPolicy(id, args) {
 }
 
 function consumeAndRunPersistedTimeout(id, generation, endTime) {
-    if (!isCurrentPersistedTimeout(id, generation, endTime)) return { status: 'STALE_GENERATION' };
+    if (!isCurrentPersistedTimeout(id, generation, endTime)) {
+        window.PremiumFeaturesDiagnostics?.record?.({ taskKey: id, status: 'SKIPPED', reason: 'stale-timeout-generation' });
+        return { status: 'STALE_GENERATION' };
+    }
     const handlerRaw = localStorage.getItem('handler_' + id);
     const functionRaw = localStorage.getItem('function_' + id);
 
-    // Final generation check is deliberately adjacent to consuming the record and real work.
+    // Final generation check is deliberately adjacent to claiming the record and real work.
+    // Keep the persisted descriptor while the Promise is unresolved: if this tab is suspended or
+    // disappears mid-callback, another coordinator can execute it after the task lease expires.
     if (!isCurrentPersistedTimeout(id, generation, endTime)) return { status: 'STALE_GENERATION' };
-    localStorage.removeItem('endTime_' + id);
-    localStorage.removeItem('handler_' + id);
-    localStorage.removeItem('function_' + id);
     clearActiveTimeout(id, generation);
 
+    const clearClaimedRecord = function () {
+        if (!isCurrentPersistedTimeout(id, generation, endTime)) return;
+        localStorage.removeItem('endTime_' + id);
+        localStorage.removeItem('handler_' + id);
+        localStorage.removeItem('function_' + id);
+    };
+    let result;
     if (handlerRaw) {
-        const parsed = JSON.parse(handlerRaw);
+        let parsed;
+        try {
+            parsed = JSON.parse(handlerRaw);
+        } catch (error) {
+            clearClaimedRecord();
+            throw error;
+        }
         const handler = timeoutHandlers[parsed.handlerName];
-        if (!handler) throw new Error('No timeout handler registered for "' + parsed.handlerName + '"');
-        return handler(...(parsed.args || []));
+        if (!handler) {
+            clearClaimedRecord();
+            throw new Error('No timeout handler registered for "' + parsed.handlerName + '"');
+        }
+        try {
+            result = handler(...(parsed.args || []));
+        } catch (error) {
+            clearClaimedRecord();
+            throw error;
+        }
+    } else if (!functionRaw) {
+        clearClaimedRecord();
+        return { status: 'MISSING_CALLBACK' };
+    } else {
+        try {
+            result = eval('(' + functionRaw + ')();');
+        } catch (error) {
+            clearClaimedRecord();
+            throw error;
+        }
     }
-    if (!functionRaw) return { status: 'MISSING_CALLBACK' };
-    return eval('(' + functionRaw + ')();');
+    if (!result || typeof result.then !== 'function') {
+        clearClaimedRecord();
+        return result;
+    }
+    return Promise.resolve(result).then(value => {
+        clearClaimedRecord();
+        return value;
+    }, error => {
+        clearClaimedRecord();
+        throw error;
+    });
 }
 
 function dispatchPersistedTimeout(id, generation, endTime) {

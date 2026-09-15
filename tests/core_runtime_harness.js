@@ -247,6 +247,24 @@ test('replacing timer A fences and cancels the old callback', async () => {
     assert.deepEqual(Array.from(env.context.events), ['new']);
 });
 
+test('persisted timeout remains recoverable until its asynchronous callback settles', async () => {
+    const env = createContext();
+    loadCore(env.context);
+    let release;
+    env.context.pendingCallback = new Promise(resolve => { release = resolve; });
+    vm.runInContext(`
+        registerTimeoutHandler('recoverable', function () { return pendingCallback; });
+        setHandlerOnTimeOut('recoverable', 'recoverable', [], 100, 0, 0);
+    `, env.context);
+    const generation = env.context.getPersistedTimeoutGeneration('recoverable');
+    const endTime = Number(env.context.localStorage.getItem('endTime_recoverable'));
+    const running = env.context.consumeAndRunPersistedTimeout('recoverable', generation, endTime);
+    assert.equal(Number(env.context.localStorage.getItem('endTime_recoverable')), endTime);
+    release('done');
+    assert.equal(await running, 'done');
+    assert.equal(env.context.localStorage.getItem('endTime_recoverable'), null);
+});
+
 test('start called five times installs one logical lifecycle', () => {
     const env = createContext();
     load(env.context, 'utils/core_runtime.js');
@@ -305,10 +323,10 @@ test('start called five times installs one logical lifecycle', () => {
 
     assert.equal(counters.prepare, 1);
     assert.equal(counters.ui, 1);
-    assert.equal(counters.background, 6);
+    assert.equal(counters.background, 7);
     assert.equal(counters.observers, 1);
     assert.equal(target.listenerCount('change'), 1);
-    assert.equal(registry.stats().intervals, 1);
+    assert.equal(registry.stats().intervals, 0);
     assert.strictEqual(env.context.window.PremiumFeaturesBackgroundScheduler, scheduler);
 });
 
@@ -623,7 +641,10 @@ test('write-behind consolidates rapid writes and idle infrastructure makes no re
 
 test('main userscript require graph resolves locally and Premium Compat remains present', () => {
     const main = fs.readFileSync(path.join(ROOT, 'main.user.js'), 'utf8');
-    const requires = Array.from(main.matchAll(/^\/\/ @require\s+https:\/\/raw\.githubusercontent\.com\/jpmartins98\/Tribalwars-Premium-Features\/master\/(.+)$/gm), match => match[1]);
+    const requires = Array.from(
+        main.matchAll(/^\/\/ @require\s+https:\/\/raw\.githubusercontent\.com\/jpmartins98\/Tribalwars-Premium-Features\/master\/(.+)$/gm),
+        match => match[1].split(/[?#]/)[0]
+    );
     assert.ok(requires.length > 0);
     requires.forEach(relativePath => assert.ok(fs.existsSync(path.join(ROOT, relativePath)), 'missing @require ' + relativePath));
     assert.match(main, /Premium Features \[Premium Compat\]/);

@@ -1,292 +1,395 @@
-// Bot: Auto Build Instant Free
-// Completes the active building upgrade for free during the last 3-minute window.
-// TribalWars allows free instant completion when ≤ 3 minutes remain on the active build.
-//
-// Flow:
-//   1. checkAndScheduleBuildInstantFree(villageId) — called on page load (current village) and
-//      after every queue refresh (current or background village). Reads building_queue_next_slot
-//      (real epoch ms, no jitter) via bqGet, derives the free-window start time, and
-//      arms a persistent (reload-surviving) timer via setHandlerOnTimeOut, with a narrow,
-//      deterministic 15-60s spread so simultaneous internal work is avoided.
-//   2. When the timer fires: fetchAndExecuteBuildInstantFree(_, villageId) fetches that village's
-//      screen=main, finds .btn-instant-free, extracts the orderId, and calls the API.
-//   3. buildInstantFreeApiCall(orderId, villageId) — performs the free-complete GET request.
-//
-// Multi-village note: timers are scheduled with setHandlerOnTimeOut (core_utils.user.js), which
-// persists {handlerName, args} as plain JSON and dispatches via a registry on restore — NOT
-// eval/new Function, which were found to be unreliable across some of Tampermonkey's execution
-// contexts (a strict CSP blocks them outright there, silently breaking every scheduled timer).
-// fetchAndExecuteBuildInstantFree/buildInstantFreeApiCall are registered via
-// registerTimeoutHandler near the bottom of this file.
-//
-// Integration points (called externally):
-//   • start() in core_utils.user.js → checkAndScheduleBuildInstantFree()
-//   • scheduleCompletionNotification(villageId) in extraBuildQueue.js (after a build
-//     finishes, for the current OR any background village) → checkAndScheduleBuildInstantFree(villageId)
-//     to re-arm for that village's next queued build.
+// Bot: Auto Build Instant Free — event-driven, generation-fenced and multi-tab safe.
 
-// ─── Constants ────────────────────────────────────────────────────────────────
+const BUILD_INSTANT_FREE_WINDOW_SEC = 180;
+const BUILD_INSTANT_COMPLETION_MARGIN_MS = 2000;
 
-/** Seconds the free-complete window is open before the build would finish naturally. */
-const BUILD_INSTANT_FREE_WINDOW_SEC = 180; // 3 minutes
-
-// Deliberately narrower than the default deterministic spread, since the window is also 3 min.
-const BUILD_INSTANT_FREE_JITTER_MIN_MS = 15000;
-const BUILD_INSTANT_FREE_JITTER_MAX_MS = 60000;
-
-// ─── Public entry point ────────────────────────────────────────────────────────
-
-/**
- * Schedules fetchAndExecuteBuildInstantFree() to run for a specific village once its free-window
- * opens, surviving page reloads/village switches. Uses setHandlerOnTimeOut (villageId passed as
- * a plain JSON arg, not baked into eval'd code) since eval/new Function were found to be
- * unreliable across some of Tampermonkey's execution contexts (CSP blocks them outright there).
- * @param {string|number} villageId
- * @param {number} waitTime - Delay in milliseconds.
- */
-function scheduleVillageInstantFreeCheck(villageId, waitTime) {
-    setHandlerOnTimeOut('build_instant_free_' + villageId, 'instantFreeCheck', [undefined, villageId], waitTime, BUILD_INSTANT_FREE_JITTER_MIN_MS, BUILD_INSTANT_FREE_JITTER_MAX_MS);
+function _buildInstantStateApi() {
+    return window.PremiumFeaturesBuildState;
 }
 
-/**
- * Schedules the exact API call for the moment the free-complete window opens (used when the
- * initial timer fired slightly early). Same rationale as scheduleVillageInstantFreeCheck.
- * @param {string|number} villageId
- * @param {number} orderId
- * @param {number} waitTime - Delay in milliseconds.
- */
-function scheduleVillageInstantFreeApiCall(villageId, orderId, waitTime) {
-    setHandlerOnTimeOut('build_instant_free_' + villageId, 'instantFreeApiCall', [orderId, villageId], waitTime, BUILD_INSTANT_FREE_JITTER_MIN_MS, BUILD_INSTANT_FREE_JITTER_MAX_MS);
+function _buildInstantEnabled() {
+    return Boolean(settings_cookies?.general?.show__auto_build_instant_free);
 }
 
-/**
- * Derives the free-window start from building_queue_next_slot (already stored in real
- * epoch ms by the widget) and arms a persistent, reload-surviving timer for the given village.
- *
- * Call this:
- *   • on every page load (from start(), for the currently displayed village)
- *   • after each build completes, for the current OR any background village
- *     (from scheduleCompletionNotification(villageId))
- * @param {string|number} [villageId] - Defaults to the currently loaded village.
- */
-function checkAndScheduleBuildInstantFree(villageId) {
-    if (!settings_cookies?.general?.show__auto_build_instant_free) return;
-
-    const vId = villageId || game_data?.village?.id;
-    if (!vId) return;
-
-    const nextSlotMs = parseInt(bqGet('building_queue_next_slot', vId), 10);
-
-    if (!nextSlotMs || isNaN(nextSlotMs)) {
-        _clearBuildInstantFreeTimeout(vId);
-        return;
-    }
-
-    const freeWindowStartMs = nextSlotMs - BUILD_INSTANT_FREE_WINDOW_SEC * 1000;
-    const now = Date.now();
-    const msUntilWindow = freeWindowStartMs - now;
-
-    _clearBuildInstantFreeTimeout(vId);
-
-    if (msUntilWindow > 0) {
-        scheduleVillageInstantFreeCheck(vId, msUntilWindow);
-    } else if (now < nextSlotMs) {
-        fetchAndExecuteBuildInstantFree(nextSlotMs, vId);
-    }
-    // else: build already completed — nothing to do
+function _buildInstantTaskId(villageId) {
+    return 'build_instant_free_' + String(villageId);
 }
 
-/**
- * Arms the instant-free timer for every known village on script load. Without this, only the
- * currently displayed village gets (re)armed by start() — a background village with an active
- * server-side build but no local fake/waiting queue entry is never picked up by the periodic
- * background sweep either (it only watches fake/waiting queues), so its free window would be
- * missed entirely until the user happens to visit that village's page.
- */
-function initInstantFreeForAllVillages() {
-    if (!settings_cookies?.general?.show__auto_build_instant_free) return;
-    if (typeof getAllVillageIds !== 'function') return;
-    getAllVillageIds().forEach(vId => checkAndScheduleBuildInstantFree(vId));
+function _buildInstantSnapshot(villageId, official) {
+    const value = {
+        villageId: String(villageId),
+        generation: Number(official?.generation) || 0,
+        queue: official?.queue || [],
+        slots: official?.slots || [],
+        cancelIds: official?.cancelIds || [],
+        nextSlotAt: Number(official?.nextSlotAt) || null
+    };
+    return window.PremiumFeaturesAsync?.stableSnapshotHash?.(value) || JSON.stringify(value);
 }
 
-// ─── Core execution ────────────────────────────────────────────────────────────
-
-/**
- * Fetches the given village's screen=main, verifies the free-complete button is present and
- * active, extracts the orderId, then calls the API.
- *
- * @param {number} expectedCompletionMs - epoch ms when the build was expected to finish.
- *   Used as a sanity guard to detect if a different build is now active.
- * @param {string|number} [villageId] - Defaults to the currently loaded village.
- */
-async function fetchAndExecuteBuildInstantFree(expectedCompletionMs, villageId) {
-    const vId = villageId || game_data?.village?.id;
-    let doc;
-    try {
-        if (typeof fetchVillageMainPage === 'function') {
-            const result = await fetchVillageMainPage(vId);
-            doc = result.doc;
-            if (typeof observeBuildQueueDocument === 'function') {
-                observeBuildQueueDocument(doc, vId, 'build-instant-inspection');
-            }
-        } else {
-            const url = (typeof getVillageLinkBase === 'function' ? getVillageLinkBase(vId) : game_data.link_base_pure) + 'main';
-            const resp = await fetch(url, { credentials: 'include' });
-            if (!resp.ok) {
-                console.error('[BuildInstantFree] Fetch failed:', resp.status, resp.statusText);
-                return;
-            }
-            doc = new DOMParser().parseFromString(await resp.text(), 'text/html');
-        }
-    } catch (e) {
-        console.error('[BuildInstantFree] Fetch exception:', e);
-        return;
-    }
-
-    // Find the instant-free button
-    const freeBtn = doc.querySelector('.btn-instant-free');
-    if (!freeBtn) {
-        console.warn('[BuildInstantFree] .btn-instant-free not found for village ' + vId + ' — build already complete or no active build.');
-        checkAndScheduleBuildInstantFree(vId);
-        return;
-    }
-
-    const availableFromMs = parseInt(freeBtn.getAttribute('data-available-from'), 10) * 1000;
-    const availableToMs   = parseInt(freeBtn.getAttribute('data-available-to'),   10) * 1000;
-    const now             = Date.now();
-
-    // Extract orderId from onclick: "return BuildingMain.change_order(462717, 'BuildInstantFree', 0)"
-    const onclickAttr = freeBtn.getAttribute('onclick') || '';
-    const orderIdMatch = onclickAttr.match(/change_order\((\d+)/);
-    if (!orderIdMatch) {
-        console.error('[BuildInstantFree] Could not extract orderId from onclick:', onclickAttr);
-        return;
-    }
-    const orderId = parseInt(orderIdMatch[1], 10);
-
-    if (now < availableFromMs) {
-        // Slight timing offset — re-schedule for exact open moment
-        const remaining = availableFromMs - now;
-        scheduleVillageInstantFreeApiCall(vId, orderId, remaining);
-        return;
-    }
-
-    if (now >= availableToMs) {
-        console.warn('[BuildInstantFree] Window already closed for village ' + vId + ' (build completed naturally). Re-arming...');
-        checkAndScheduleBuildInstantFree(vId);
-        return;
-    }
-
-    await buildInstantFreeApiCall(orderId, vId);
+function _buildInstantLeaseActive(villageId) {
+    const coordinator = window.PremiumFeaturesCoordination;
+    if (!coordinator?.readLease) return true;
+    const lease = coordinator.readLease('build-instant:' + String(villageId));
+    return Boolean(lease && lease.owner === coordinator.tabId &&
+        lease.instanceId === coordinator.instanceId && lease.expiresAt > Date.now());
 }
 
-// ─── API call ─────────────────────────────────────────────────────────────────
-
-/**
- * Executes the free instant-complete for the given build order, in the given (or current) village.
- * GET game.php?...&screen=main&ajaxaction=build_order_reduce&h={csrf}&id={orderId}&destroy=0
- *
- * @param {number} orderId - The build order ID from the button onclick attribute.
- * @param {string|number} [villageId] - Defaults to the currently loaded village.
- */
-async function buildInstantFreeApiCall(orderId, villageId) {
-    const vId  = villageId || game_data?.village?.id;
-    const csrf = game_data?.csrf;
-
-    if (!vId || !csrf) {
-        console.error('[BuildInstantFree] Missing villageId or csrf — cannot call the API.');
-        return;
-    }
-
-    const linkBase = typeof getVillageLinkBase === 'function' ? getVillageLinkBase(vId) : game_data.link_base_pure;
-    const url = linkBase
-        + 'main&ajaxaction=build_order_reduce'
-        + '&h=' + csrf
-        + '&id=' + orderId
-        + '&destroy=0';
-
-    try {
-        const resp = await fetch(url, {
-            method: 'GET',
-            headers: {
-                'accept': 'application/json, text/javascript, */*; q=0.01',
-                'tribalwars-ajax': '1',
-                'x-requested-with': 'XMLHttpRequest',
-            },
-            credentials: 'include',
-        });
-
-        if (!resp.ok) {
-            console.error('[BuildInstantFree] HTTP error:', resp.status, resp.statusText);
-            return;
-        }
-
-        await resp.json();
-        const buildState = window.PremiumFeaturesBuildState;
-        if (buildState?.get && buildState?.updateOfficial) {
-            const official = buildState.get(vId).official || {};
-            const queue = (official.queue || []).slice();
-            const levels = (official.levels || []).slice();
-            const slots = (official.slots || []).slice();
-            const cancelIds = (official.cancelIds || []).slice();
-            let completedIndex = cancelIds.findIndex(id => String(id) === String(orderId));
-            if (completedIndex < 0) completedIndex = 0;
-            queue.splice(completedIndex, 1);
-            levels.splice(completedIndex, 1);
-            slots.splice(completedIndex, 1);
-            cancelIds.splice(completedIndex, 1);
-            buildState.updateOfficial(vId, Object.assign({}, official, {
-                queue,
-                levels,
-                slots,
-                cancelIds,
-                nextSlotAt: slots[0] || null,
-                lastSlotAt: slots.length > 1 ? slots[slots.length - 1] : null,
-                full: false,
-                fetchedAt: Date.now(),
-                source: 'build-instant-response'
-            }));
-            buildState.publishObservation?.(vId);
-            checkAndScheduleBuildInstantFree(vId);
-        }
-        const isCurrent = vId == game_data?.village?.id;
-        const villageName = typeof getVillageName === 'function' ? getVillageName(vId) : vId;
-        const completedMsg = '[' + villageName + '] ' + t('buildQueue.instantFreeCompleted');
-        showAutoHideBox(completedMsg, false);
-
-        // The official queue changed.  Queue v2 performs one fenced reconciliation; it can share
-        // an in-flight screen=main read and never creates the old immediate duplicate refresh.
-        setTimeout(() => {
-            if (typeof requestBuildQueueReconcile === 'function') {
-                requestBuildQueueReconcile(vId, { reason: 'build-instant-completed' });
-            } else if (isCurrent && typeof fetchBuildQueueWidget === 'function') {
-                fetchBuildQueueWidget(true);
-            } else if (!isCurrent && typeof refreshBackgroundVillageQueue === 'function') {
-                refreshBackgroundVillageQueue(vId);
-            } else {
-                checkAndScheduleBuildInstantFree(vId);
-            }
-        }, 1000);
-    } catch (e) {
-        console.error('[BuildInstantFree] Error in API call:', e);
-    }
+function _throwBuildInstantResponse(response, url) {
+    if (response?.ok) return response;
+    const error = new Error('HTTP ' + (response?.status || 0));
+    error.status = Number(response?.status) || 0;
+    error.url = response?.url || url;
+    throw error;
 }
 
-// ─── Internal helpers ──────────────────────────────────────────────────────────
+function _buildInstantRequest(fields, run) {
+    return window.PremiumFeaturesDiagnostics?.request
+        ? window.PremiumFeaturesDiagnostics.request(fields, run)
+        : Promise.resolve().then(run);
+}
 
-/**
- * Clears any pending persisted instant-free timer for the given (or current) village.
- * @param {string|number} [villageId] - Defaults to the currently loaded village.
- */
+function _setBuildInstantState(villageId, patch, immediate) {
+    return _buildInstantStateApi()?.setInstant?.(String(villageId), patch, immediate);
+}
+
 function _clearBuildInstantFreeTimeout(villageId) {
-    const vId = villageId || game_data?.village?.id;
-    const id = 'build_instant_free_' + vId;
+    const id = _buildInstantTaskId(villageId || game_data?.village?.id);
     if (typeof clearPersistedTimeout === 'function') clearPersistedTimeout(id);
 }
 
-// Registered so setHandlerOnTimeOut/restoreTimeouts (core_utils.user.js) can call these by name
-// after a reload, without ever needing eval/new Function.
+function _scheduleBuildInstantWorker(villageId, dueAt, reason, official, extra = {}) {
+    const vId = String(villageId);
+    const state = _buildInstantStateApi();
+    const currentOfficial = official || state?.get(vId)?.official || {};
+    const generation = Number(currentOfficial.generation) || 0;
+    const snapshotHash = _buildInstantSnapshot(vId, currentOfficial);
+    const targetAt = Math.max(Date.now(), Number(dueAt) || Date.now());
+    _setBuildInstantState(vId, Object.assign({
+        state: reason === 'window-open' ? 'CHECKING' : 'WAITING_WINDOW',
+        nextDueAt: targetAt,
+        checkedOfficialGeneration: Number(extra.checkedOfficialGeneration) || 0,
+        snapshotHash,
+        reason,
+        uncertain: extra.uncertain || null
+    }, extra.statePatch || {}), true);
+    setHandlerOnTimeOut(
+        _buildInstantTaskId(vId),
+        'instantFreeWorker',
+        [vId, generation, snapshotHash, reason, extra.orderId || null],
+        Math.max(0, targetAt - Date.now())
+    );
+}
+
+/** Rebuilds the one relevant timer without fetching merely because the page reloaded. */
+function checkAndScheduleBuildInstantFree(villageId, options = {}) {
+    const vId = String(villageId || game_data?.village?.id || '');
+    if (!vId) return { status: 'NO_VILLAGE' };
+    if (!_buildInstantEnabled()) {
+        _clearBuildInstantFreeTimeout(vId);
+        _setBuildInstantState(vId, { state: 'IDLE', nextDueAt: null, reason: 'disabled', uncertain: null }, true);
+        return { status: 'DISABLED' };
+    }
+
+    const state = _buildInstantStateApi();
+    if (vId == String(game_data?.village?.id || '') &&
+        document.querySelector('#building_wrapper') && document.querySelector('#buildings') &&
+        typeof observeBuildQueueDocument === 'function' && options.observeDom !== false) {
+        const cached = state?.get(vId);
+        if (cached?.official?.source !== 'dom' || Date.now() - Number(cached.official.fetchedAt || 0) > 1000) {
+            observeBuildQueueDocument(document, vId, 'dom');
+        }
+    }
+
+    const record = state?.get(vId);
+    const official = record?.official || {};
+    const instant = record?.instant || {};
+    if (instant.state === 'UNCERTAIN') {
+        const dueAt = Math.max(Date.now(), Number(instant.nextDueAt) || Date.now());
+        const orderId = instant.uncertain?.orderId || instant.orderId || null;
+        _scheduleBuildInstantWorker(vId, dueAt, 'uncertain-reconcile', official, {
+            orderId,
+            uncertain: instant.uncertain,
+            statePatch: { state: 'UNCERTAIN', orderId: orderId != null ? String(orderId) : null }
+        });
+        return { status: 'UNCERTAIN', dueAt };
+    }
+    const nextSlotAt = Number(official.nextSlotAt || bqGet('building_queue_next_slot', vId)) || 0;
+    if (!nextSlotAt || nextSlotAt <= Date.now()) {
+        _clearBuildInstantFreeTimeout(vId);
+        _setBuildInstantState(vId, { state: 'IDLE', nextDueAt: null, reason: 'no-active-build', uncertain: null }, true);
+        return { status: 'IDLE' };
+    }
+
+    const freeAt = nextSlotAt - BUILD_INSTANT_FREE_WINDOW_SEC * 1000;
+    if (Date.now() < freeAt) {
+        _scheduleBuildInstantWorker(vId, freeAt, 'known-free-window', official);
+        return { status: 'WAITING_WINDOW', dueAt: freeAt };
+    }
+
+    const snapshotHash = _buildInstantSnapshot(vId, official);
+    if (instant.state === 'STALE' && instant.snapshotHash === snapshotHash &&
+        Number(instant.checkedOfficialGeneration) === Number(official.generation)) {
+        const dueAt = Math.max(Date.now(), nextSlotAt + BUILD_INSTANT_COMPLETION_MARGIN_MS);
+        if (!localStorage.getItem('endTime_' + _buildInstantTaskId(vId))) {
+            _scheduleBuildInstantWorker(vId, dueAt, 'known-completion', official, {
+                checkedOfficialGeneration: official.generation,
+                statePatch: { state: 'STALE' }
+            });
+        }
+        window.PremiumFeaturesDiagnostics?.record?.({
+            feature: 'build-instant', villageId: vId, taskKey: 'build-instant:' + vId,
+            status: 'SKIPPED', reason: 'same-stale-snapshot'
+        });
+        return { status: 'STALE', dueAt };
+    }
+
+    _scheduleBuildInstantWorker(vId, Date.now(), 'window-open', official);
+    return { status: 'CHECKING', dueAt: Date.now() };
+}
+
+function initInstantFreeForAllVillages() {
+    if (typeof getAllVillageIds !== 'function') return;
+    if (!_buildInstantEnabled()) {
+        getAllVillageIds().forEach(vId => _clearBuildInstantFreeTimeout(vId));
+        return;
+    }
+    getAllVillageIds().forEach(vId => checkAndScheduleBuildInstantFree(vId));
+}
+
+/** A known build mutation is a legitimate reason to inspect the new queue once. */
+function scheduleBuildInstantReconciliation(villageId, delayMs = 200) {
+    const vId = String(villageId || game_data?.village?.id || '');
+    if (!vId || !_buildInstantEnabled()) return { status: 'DISABLED' };
+    const official = _buildInstantStateApi()?.get(vId)?.official || {};
+    _scheduleBuildInstantWorker(vId, Date.now() + Math.max(0, Number(delayMs) || 0), 'known-build-mutation', official, {
+        statePatch: { state: 'STALE' }
+    });
+    return { status: 'RECONCILING' };
+}
+
+async function _inspectBuildInstant(villageId, reason) {
+    const vId = String(villageId);
+    if (vId == String(game_data?.village?.id || '') &&
+        document.querySelector('#building_wrapper') && document.querySelector('#buildings') &&
+        typeof observeBuildQueueDocument === 'function') {
+        return observeBuildQueueDocument(document, vId, 'dom');
+    }
+    if (typeof fetchVillageMainPage === 'function') {
+        const result = await fetchVillageMainPage(vId);
+        return typeof observeBuildQueueDocument === 'function'
+            ? observeBuildQueueDocument(result.doc, vId, 'build-instant-' + reason)
+            : { doc: result.doc };
+    }
+    const url = (typeof getVillageLinkBase === 'function' ? getVillageLinkBase(vId) : game_data.link_base_pure) + 'main';
+    const response = await _buildInstantRequest({
+        feature: 'build-instant', villageId: vId, logicalResource: 'village-main:' + vId,
+        method: 'GET', reason
+    }, () => fetch(url, { credentials: 'include' }));
+    _throwBuildInstantResponse(response, url);
+    return { doc: new DOMParser().parseFromString(await response.text(), 'text/html') };
+}
+
+function _buildInstantButtonData(observed) {
+    const fromState = observed?.official?.instantFree;
+    if (fromState?.orderId) return fromState;
+    const button = observed?.doc?.querySelector?.('.btn-instant-free');
+    if (!button) return null;
+    const match = (button.getAttribute('onclick') || '').match(/change_order\((\d+)/);
+    return {
+        orderId: match?.[1] || null,
+        availableFrom: (parseInt(button.getAttribute('data-available-from'), 10) || 0) * 1000 || null,
+        availableTo: (parseInt(button.getAttribute('data-available-to'), 10) || 0) * 1000 || null
+    };
+}
+
+async function runBuildInstantFreeWorker(villageId, expectedGeneration, expectedHash, reason, uncertainOrderId) {
+    const vId = String(villageId || game_data?.village?.id || '');
+    if (!_buildInstantEnabled() || !vId) return { status: 'DISABLED' };
+    const state = _buildInstantStateApi();
+    let record = state?.get(vId);
+    if (!_buildInstantLeaseActive(vId)) return { status: 'LEASE_LOST' };
+    if (Number(record?.official?.generation) !== Number(expectedGeneration) ||
+        _buildInstantSnapshot(vId, record?.official) !== expectedHash) {
+        window.PremiumFeaturesDiagnostics?.record?.({
+            feature: 'build-instant', villageId: vId, taskKey: 'build-instant:' + vId,
+            status: 'SKIPPED', reason: 'stale-snapshot'
+        });
+        return checkAndScheduleBuildInstantFree(vId, { observeDom: false });
+    }
+
+    _setBuildInstantState(vId, { state: 'CHECKING', nextDueAt: null, reason }, true);
+    const inspectSnapshot = _buildInstantSnapshot(vId, record?.official);
+    const result = await window.PremiumFeaturesAsync.runResilientTask({
+        key: 'build-instant:inspect:' + vId,
+        feature: 'build-instant', villageId: vId, logicalResource: 'village-main:' + vId,
+        method: 'GET',
+        url: (typeof getVillageLinkBase === 'function' ? getVillageLinkBase(vId) : game_data.link_base_pure) + 'main',
+        snapshotHash: inspectSnapshot,
+        run: () => _inspectBuildInstant(vId, reason)
+    });
+    if (result.status !== 'SUCCESS') {
+        if (result.status === 'SOFT_PAUSED') {
+            _scheduleBuildInstantWorker(vId, result.retryAt, 'soft-pause', record?.official, {
+                statePatch: { state: 'SOFT_PAUSED' }
+            });
+        }
+        return result;
+    }
+
+    if (!_buildInstantLeaseActive(vId)) return { status: 'LEASE_LOST' };
+    record = state?.get(vId);
+    const button = _buildInstantButtonData(result.value);
+    if (uncertainOrderId && String(button?.orderId || '') !== String(uncertainOrderId) &&
+        !record?.official?.cancelIds?.some(id => String(id) === String(uncertainOrderId))) {
+        _setBuildInstantState(vId, { state: 'IDLE', uncertain: null, reason: 'uncertain-confirmed-complete' }, true);
+        return checkAndScheduleBuildInstantFree(vId, { observeDom: false });
+    }
+    if (!button?.orderId) {
+        const snapshotHash = _buildInstantSnapshot(vId, record?.official);
+        const dueAt = Number(record?.official?.nextSlotAt) > Date.now()
+            ? Number(record.official.nextSlotAt) + BUILD_INSTANT_COMPLETION_MARGIN_MS
+            : null;
+        _setBuildInstantState(vId, {
+            state: 'STALE', nextDueAt: dueAt,
+            checkedOfficialGeneration: record?.official?.generation || 0,
+            snapshotHash, reason: 'button-absent', uncertain: null
+        }, true);
+        if (dueAt) _scheduleBuildInstantWorker(vId, dueAt, 'known-completion', record.official, {
+            checkedOfficialGeneration: record.official.generation,
+            statePatch: { state: 'STALE' }
+        });
+        return { status: 'STALE' };
+    }
+
+    const now = Date.now();
+    if (button.availableFrom && now < button.availableFrom) {
+        _scheduleBuildInstantWorker(vId, button.availableFrom, 'button-window', record.official, {
+            orderId: button.orderId,
+            statePatch: { state: 'WAITING_WINDOW', orderId: String(button.orderId), availableFrom: button.availableFrom, availableTo: button.availableTo }
+        });
+        return { status: 'WAITING_WINDOW' };
+    }
+    if (button.availableTo && now >= button.availableTo) {
+        _setBuildInstantState(vId, {
+            state: 'STALE', checkedOfficialGeneration: record.official.generation,
+            snapshotHash: _buildInstantSnapshot(vId, record.official), reason: 'window-closed'
+        }, true);
+        return { status: 'STALE' };
+    }
+    return buildInstantFreeApiCall(button.orderId, vId, record.official.generation, _buildInstantSnapshot(vId, record.official));
+}
+
+async function buildInstantFreeApiCall(orderId, villageId, expectedGeneration, expectedHash) {
+    const vId = String(villageId || game_data?.village?.id || '');
+    const csrf = game_data?.csrf;
+    const state = _buildInstantStateApi();
+    const record = state?.get(vId);
+    if (!vId || !csrf || !_buildInstantLeaseActive(vId)) return { status: 'LEASE_LOST' };
+    if (Number(record?.official?.generation) !== Number(expectedGeneration) ||
+        _buildInstantSnapshot(vId, record?.official) !== expectedHash ||
+        !record?.official?.cancelIds?.some(id => String(id) === String(orderId))) {
+        window.PremiumFeaturesDiagnostics?.record?.({
+            feature: 'build-instant', villageId: vId, taskKey: 'build-instant:' + vId,
+            status: 'SKIPPED', reason: 'mutation-precondition'
+        });
+        return { status: 'STALE_GENERATION' };
+    }
+
+    _setBuildInstantState(vId, { state: 'EXECUTING', orderId: String(orderId), reason: 'free-window' }, true);
+    const linkBase = typeof getVillageLinkBase === 'function' ? getVillageLinkBase(vId) : game_data.link_base_pure;
+    const url = linkBase + 'main&ajaxaction=build_order_reduce&h=' + csrf + '&id=' + orderId + '&destroy=0';
+    const resilient = await window.PremiumFeaturesAsync.runResilientTask({
+        key: 'build-instant:mutation:' + vId,
+        feature: 'build-instant', villageId: vId, logicalResource: 'build-instant:' + vId,
+        method: 'GET', url, mutation: true, leaseKey: 'build-instant:' + vId,
+        snapshotHash: expectedHash, scheduler: window.PremiumFeaturesBackgroundScheduler,
+        reconcile: function () {
+            const latest = state?.get(vId)?.official || {};
+            _scheduleBuildInstantWorker(vId, Date.now(), 'uncertain-reconcile', latest, { orderId: String(orderId) });
+        },
+        run: async function () {
+            if (!_buildInstantLeaseActive(vId)) {
+                const error = new Error('Build Instant lease lost');
+                error.code = 'LEASE_LOST';
+                throw error;
+            }
+            const response = await _buildInstantRequest({
+                feature: 'build-instant', villageId: vId, logicalResource: 'build-instant:' + vId,
+                method: 'GET', reason: 'instant-free-mutation'
+            }, () => fetch(url, {
+                method: 'GET',
+                headers: { accept: 'application/json, text/javascript, */*; q=0.01', 'tribalwars-ajax': '1', 'x-requested-with': 'XMLHttpRequest' },
+                credentials: 'include'
+            }));
+            _throwBuildInstantResponse(response, url);
+            return response.json();
+        }
+    });
+
+    if (resilient.status === 'UNCERTAIN') {
+        _setBuildInstantState(vId, {
+            state: 'UNCERTAIN', uncertain: { orderId: String(orderId), snapshotHash: expectedHash, at: Date.now() },
+            nextDueAt: resilient.retryAt, reason: 'mutation-uncertain'
+        }, true);
+        return resilient;
+    }
+    if (resilient.status === 'SOFT_PAUSED') {
+        _scheduleBuildInstantWorker(vId, resilient.retryAt, 'soft-pause', record.official, {
+            statePatch: { state: 'SOFT_PAUSED' }
+        });
+        return resilient;
+    }
+    if (resilient.status !== 'SUCCESS') return resilient;
+    if (!_buildInstantLeaseActive(vId)) return { status: 'LEASE_LOST' };
+
+    const official = state.get(vId).official || {};
+    const queue = (official.queue || []).slice();
+    const levels = (official.levels || []).slice();
+    const slots = (official.slots || []).slice();
+    const cancelIds = (official.cancelIds || []).slice();
+    let completedIndex = cancelIds.findIndex(id => String(id) === String(orderId));
+    if (completedIndex < 0) completedIndex = 0;
+    queue.splice(completedIndex, 1); levels.splice(completedIndex, 1);
+    slots.splice(completedIndex, 1); cancelIds.splice(completedIndex, 1);
+    state.updateOfficial(vId, Object.assign({}, official, {
+        queue, levels, slots, cancelIds,
+        nextSlotAt: slots[0] || null,
+        lastSlotAt: slots.length > 1 ? slots[slots.length - 1] : null,
+        full: false, instantFree: null, fetchedAt: Date.now(), source: 'build-instant-response'
+    }));
+    _setBuildInstantState(vId, { state: 'IDLE', uncertain: null, orderId: null, reason: 'completed' }, true);
+    state.publishObservation?.(vId);
+    const villageName = typeof getVillageName === 'function' ? getVillageName(vId) : vId;
+    showAutoHideBox('[' + villageName + '] ' + t('buildQueue.instantFreeCompleted'), false);
+    if (typeof requestBuildQueueReconcile === 'function') {
+        requestBuildQueueReconcile(vId, { reason: 'build-instant-completed', delayMs: BUILD_INSTANT_COMPLETION_MARGIN_MS });
+    }
+    return checkAndScheduleBuildInstantFree(vId, { observeDom: false });
+}
+
+// Compatibility wrappers for timeout records persisted by earlier versions.
+function fetchAndExecuteBuildInstantFree(_expectedCompletionMs, villageId) {
+    const vId = String(villageId || game_data?.village?.id || '');
+    const official = _buildInstantStateApi()?.get(vId)?.official || {};
+    return runBuildInstantFreeWorker(vId, official.generation, _buildInstantSnapshot(vId, official), 'legacy-check', null);
+}
+
+function scheduleVillageInstantFreeCheck(villageId, waitTime) {
+    const official = _buildInstantStateApi()?.get(villageId)?.official || {};
+    _scheduleBuildInstantWorker(villageId, Date.now() + Math.max(0, Number(waitTime) || 0), 'legacy-schedule', official);
+}
+
+function scheduleVillageInstantFreeApiCall(villageId, orderId, waitTime) {
+    const official = _buildInstantStateApi()?.get(villageId)?.official || {};
+    _scheduleBuildInstantWorker(villageId, Date.now() + Math.max(0, Number(waitTime) || 0), 'legacy-api-schedule', official, { orderId });
+}
+
 if (typeof registerTimeoutHandler === 'function') {
+    registerTimeoutHandler('instantFreeWorker', runBuildInstantFreeWorker);
     registerTimeoutHandler('instantFreeCheck', fetchAndExecuteBuildInstantFree);
-    registerTimeoutHandler('instantFreeApiCall', buildInstantFreeApiCall);
+    registerTimeoutHandler('instantFreeApiCall', function (orderId, villageId) {
+        const official = _buildInstantStateApi()?.get(villageId)?.official || {};
+        return runBuildInstantFreeWorker(villageId, official.generation, _buildInstantSnapshot(villageId, official), 'legacy-api', orderId);
+    });
 }

@@ -12,6 +12,15 @@
         SOFT_PAUSED: 'SOFT_PAUSED',
         UNCERTAIN: 'UNCERTAIN'
     });
+    const BUILD_INSTANT_STATE = Object.freeze({
+        IDLE: 'IDLE',
+        WAITING_WINDOW: 'WAITING_WINDOW',
+        CHECKING: 'CHECKING',
+        EXECUTING: 'EXECUTING',
+        STALE: 'STALE',
+        SOFT_PAUSED: 'SOFT_PAUSED',
+        UNCERTAIN: 'UNCERTAIN'
+    });
     const INTENT_VERSION = 2;
     const DEFAULT_EDIT_DEBOUNCE_MS = 350;
     const DEFAULT_FALLBACK_MS = 5 * 60 * 1000;
@@ -94,6 +103,7 @@
         let unsubscribeIntent = null;
         let unsubscribeSnapshot = null;
         let unsubscribeResourceInvalidation = null;
+        let unsubscribeInvalidation = null;
         let unsubscribeObservation = null;
 
         function normalizeVillageId(villageId) {
@@ -182,7 +192,9 @@
                 fetchedAt: Number(current.fetchedAt) || 0,
                 generation: Math.max(0, Number(current.generation) || 0),
                 source: current.source || 'persisted',
-                catalog: current.catalog || readField('build_queue_catalog_v1', villageId) || null
+                catalog: current.catalog || readField('build_queue_catalog_v1', villageId) || null,
+                instantFree: current.instantFree || null,
+                invalidatedBy: current.invalidatedBy || null
             };
         }
 
@@ -222,6 +234,24 @@
                 updatedAt: Number(current.updatedAt) || 0,
                 uncertain: current.uncertain || null,
                 freshness: current.freshness || null
+            };
+        }
+
+        function normalizeInstant(supplied) {
+            const current = supplied || {};
+            return {
+                state: Object.values(BUILD_INSTANT_STATE).includes(current.state)
+                    ? current.state
+                    : BUILD_INSTANT_STATE.IDLE,
+                orderId: current.orderId != null ? String(current.orderId) : null,
+                availableFrom: Number(current.availableFrom) || null,
+                availableTo: Number(current.availableTo) || null,
+                nextDueAt: Number(current.nextDueAt) || null,
+                checkedOfficialGeneration: Math.max(0, Number(current.checkedOfficialGeneration) || 0),
+                snapshotHash: current.snapshotHash || null,
+                reason: current.reason || null,
+                updatedAt: Number(current.updatedAt) || 0,
+                uncertain: current.uncertain || null
             };
         }
 
@@ -265,6 +295,8 @@
                 official: normalizeOfficial(villageId, savedRuntime.official),
                 resources: normalizeResources(villageId, savedRuntime.resources),
                 execution: normalizeExecution(villageId, savedRuntime.execution),
+                instant: normalizeInstant(savedRuntime.instant),
+                invalidationReason: savedRuntime.invalidationReason || null,
                 inFlight: null
             };
             if (record.queue.length && record.execution.state === BUILD_QUEUE_STATE.IDLE &&
@@ -352,10 +384,12 @@
 
         function persistRuntime(record, immediate) {
             const value = JSON.stringify({
-                version: 1,
+                version: 2,
                 official: record.official,
                 resources: record.resources,
                 execution: record.execution,
+                instant: record.instant,
+                invalidationReason: record.invalidationReason,
                 updatedAt: now()
             });
             if (writeBehind?.set) writeBehind.set(runtimeStorageKey(record.villageId), value, { immediate: !!immediate });
@@ -421,6 +455,16 @@
                 official: clone(record.official),
                 resources: clone(record.resources),
                 execution: clone(record.execution),
+                instant: clone(record.instant),
+                officialQueue: clone(record.official?.queue || []),
+                nextSlotAt: Number(record.official?.nextSlotAt) || null,
+                instantFreeAt: Number(record.official?.nextSlotAt)
+                    ? Number(record.official.nextSlotAt) - 180000
+                    : null,
+                fetchedAt: Number(record.official?.fetchedAt) || 0,
+                generation: Number(record.official?.generation) || 0,
+                parsed: clone(record.official?.catalog || null),
+                invalidationReason: clone(record.invalidationReason),
                 inFlight: clone(record.inFlight)
             };
         }
@@ -657,20 +701,46 @@
         }
 
         function invalidateResources(villageId, reason, shouldBroadcast = true) {
+            return invalidate(villageId, ['resources'], reason, shouldBroadcast);
+        }
+
+        function invalidate(villageId, fields, reason, shouldBroadcast = true) {
             const record = ensure(villageId);
-            if (record.resources) {
+            const selected = new Set((Array.isArray(fields) ? fields : [fields]).filter(Boolean));
+            if (selected.has('resources') && record.resources) {
                 record.resources = Object.assign({}, record.resources, {
                     fetchedAt: 0,
                     reliableUntil: null,
                     generation: (record.resources.generation || 0) + 1,
                     invalidatedBy: reason || 'unknown'
                 });
-                syncLegacyFields(record);
-                persistRuntime(record, false);
-                notify(record, { kind: 'resources-invalidated', reason });
             }
-            if (shouldBroadcast) coordination?.broadcast?.('build-resource-invalidated', {
+            if (selected.has('officialQueue') || selected.has('official') || selected.has('nextSlotAt')) {
+                record.official = Object.assign({}, record.official, {
+                    fetchedAt: 0,
+                    generation: (record.official?.generation || 0) + 1,
+                    invalidatedBy: reason || 'unknown'
+                });
+            }
+            if (selected.has('instant') || selected.has('officialQueue') || selected.has('official')) {
+                record.instant = Object.assign({}, record.instant, {
+                    state: BUILD_INSTANT_STATE.STALE,
+                    nextDueAt: null,
+                    reason: reason || 'dependency-invalidated',
+                    updatedAt: now()
+                });
+            }
+            record.invalidationReason = {
+                fields: Array.from(selected),
+                reason: reason || 'unknown',
+                at: now()
+            };
+            syncLegacyFields(record);
+            persistRuntime(record, false);
+            notify(record, { kind: 'invalidated', fields: Array.from(selected), reason });
+            if (shouldBroadcast) coordination?.broadcast?.('build-state-invalidated', {
                 villageId: record.villageId,
+                fields: Array.from(selected),
                 reason: reason || 'unknown',
                 at: now(),
                 source: actorId
@@ -684,6 +754,14 @@
             syncLegacyFields(record);
             persistRuntime(record, !!persistImmediately);
             notify(record, { kind: 'execution' });
+            return get(record.villageId);
+        }
+
+        function setInstant(villageId, patch, persistImmediately) {
+            const record = ensure(villageId);
+            record.instant = Object.assign({}, record.instant, patch || {}, { updatedAt: now() });
+            persistRuntime(record, !!persistImmediately);
+            notify(record, { kind: 'instant' });
             return get(record.villageId);
         }
 
@@ -748,6 +826,7 @@
                 villageId: record.villageId,
                 official: clone(record.official),
                 resources: clone(record.resources),
+                instant: clone(record.instant),
                 source: actorId,
                 publishedAt: now()
             });
@@ -781,6 +860,11 @@
             unsubscribeResourceInvalidation = coordination?.subscribe?.('build-resource-invalidated', payload => {
                 if (payload?.villageId && payload.source !== actorId) invalidateResources(payload.villageId, payload.reason, false);
             }) || null;
+            unsubscribeInvalidation = coordination?.subscribe?.('build-state-invalidated', payload => {
+                if (payload?.villageId && payload.source !== actorId) {
+                    invalidate(payload.villageId, payload.fields || [], payload.reason, false);
+                }
+            }) || null;
             unsubscribeObservation = coordination?.subscribe?.('build-state-observed', payload => {
                 if (!payload?.villageId || payload.source === actorId) return;
                 const record = ensure(payload.villageId);
@@ -794,6 +878,12 @@
                     hash(payload.resources) !== hash(record.resources)) {
                     updateResources(payload.villageId, payload.resources);
                 }
+                if (payload.instant && Number(payload.instant.updatedAt || 0) >= Number(record.instant?.updatedAt || 0) &&
+                    hash(payload.instant) !== hash(record.instant)) {
+                    record.instant = normalizeInstant(payload.instant);
+                    persistRuntime(record, false);
+                    notify(record, { kind: 'instant-observed' });
+                }
             }) || null;
             listVillageIds().forEach(ensure);
         }
@@ -803,12 +893,14 @@
             unsubscribeIntent?.();
             unsubscribeSnapshot?.();
             unsubscribeResourceInvalidation?.();
+            unsubscribeInvalidation?.();
             unsubscribeObservation?.();
-            unsubscribeIntent = unsubscribeSnapshot = unsubscribeResourceInvalidation = unsubscribeObservation = null;
+            unsubscribeIntent = unsubscribeSnapshot = unsubscribeResourceInvalidation = unsubscribeInvalidation = unsubscribeObservation = null;
         }
 
         return {
             STATE: BUILD_QUEUE_STATE,
+            INSTANT_STATE: BUILD_INSTANT_STATE,
             records,
             start,
             stop,
@@ -825,7 +917,9 @@
             updateCatalog,
             updateResources,
             invalidateResources,
+            invalidate,
             setExecution,
+            setInstant,
             setInFlight,
             capture,
             isCurrent,

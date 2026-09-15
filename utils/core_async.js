@@ -103,7 +103,14 @@ function createSingleFlight() {
     const inFlight = new Map();
     function run(key, factory) {
         const logicalKey = String(key);
-        if (inFlight.has(logicalKey)) return inFlight.get(logicalKey);
+        if (inFlight.has(logicalKey)) {
+            window.PremiumFeaturesDiagnostics?.record?.({
+                logicalResource: logicalKey,
+                status: 'COALESCED',
+                reason: 'single-flight'
+            });
+            return inFlight.get(logicalKey);
+        }
         const promise = Promise.resolve().then(factory);
         inFlight.set(logicalKey, promise);
         promise.finally(function () {
@@ -150,7 +157,14 @@ function createResourceCache(options = {}) {
         const logicalKey = String(key);
         loadPersisted(logicalKey);
         const entry = entries.get(logicalKey) || null;
-        return { state: classify(entry, policy), value: entry?.value, entry };
+        const state = classify(entry, policy);
+        if (state === CACHE_STATE.FRESH || state === CACHE_STATE.STALE_BUT_USABLE) {
+            window.PremiumFeaturesDiagnostics?.record?.({
+                logicalResource: logicalKey,
+                status: state === CACHE_STATE.FRESH ? 'CACHE_HIT' : 'STALE_HIT'
+            });
+        }
+        return { state, value: entry?.value, entry };
     }
 
     function set(key, value, setOptions = {}) {
@@ -314,6 +328,13 @@ async function runResilientTask(options) {
     const snapshotHash = options.snapshotHash || stableSnapshotHash(options.snapshot);
     const breaker = options.breaker || CircuitBreakers;
     if (!breaker.canRun(taskKey, snapshotHash)) {
+        window.PremiumFeaturesDiagnostics?.record?.({
+            feature: options.feature,
+            taskKey,
+            villageId: options.villageId,
+            logicalResource: options.logicalResource,
+            status: 'CIRCUIT_OPEN'
+        });
         return { status: TASK_RESULT.SOFT_PAUSED, retryAt: breaker.getState(taskKey).retryAt };
     }
     try {
@@ -340,9 +361,25 @@ async function runResilientTask(options) {
                     run: options.reconcile
                 });
             }
+            window.PremiumFeaturesDiagnostics?.record?.({
+                feature: options.feature,
+                taskKey,
+                villageId: options.villageId,
+                logicalResource: options.logicalResource,
+                method: options.method,
+                status: 'UNCERTAIN'
+            });
             return { status: TASK_RESULT.UNCERTAIN, failure, retryAt: breakerState.retryAt };
         }
         if (failure.transient) {
+            window.PremiumFeaturesDiagnostics?.record?.({
+                feature: options.feature,
+                taskKey,
+                villageId: options.villageId,
+                logicalResource: options.logicalResource,
+                method: options.method,
+                status: 'SOFT_PAUSE'
+            });
             return { status: TASK_RESULT.SOFT_PAUSED, failure, retryAt: breakerState.retryAt };
         }
         return { status: TASK_RESULT.FAILED, failure, retryAt: breakerState.retryAt };

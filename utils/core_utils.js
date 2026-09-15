@@ -51,11 +51,48 @@ function sizeOfObject(obj) {
  * @param {number} minutes - Inactivity threshold in minutes.
  */
 async function checkInactivity(minutes) {
-    if (TribalWars.getIdleTime() >= minutes * 60 * 1000) {
-        showAutoHideBox(t('core.inactivityReload'));
-        await wait(5);
-        location.reload();
+    return runKeepAwakeCheck(minutes);
+}
+
+function _keepAwakeLeaseActive() {
+    const coordinator = window.PremiumFeaturesCoordination;
+    if (!coordinator?.readLease) return true;
+    const lease = coordinator.readLease('keep-awake');
+    return Boolean(lease && lease.owner === coordinator.tabId &&
+        lease.instanceId === coordinator.instanceId && lease.expiresAt > Date.now());
+}
+
+function scheduleKeepAwakeCheck(minutes = 8) {
+    if (!settings_cookies?.general?.keep_awake) {
+        if (typeof clearPersistedTimeout === 'function') clearPersistedTimeout('keep-awake');
+        return { status: 'DISABLED' };
     }
+    const thresholdMs = Math.max(1, Number(minutes) || 8) * 60 * 1000;
+    const idleMs = Math.max(0, Number(TribalWars?.getIdleTime?.()) || 0);
+    const waitMs = Math.max(1000, thresholdMs - idleMs);
+    setHandlerOnTimeOut('keep-awake', 'keepAwakeCheck', [Number(minutes) || 8], waitMs);
+    return { status: 'SCHEDULED', dueAt: Date.now() + waitMs };
+}
+
+async function runKeepAwakeCheck(minutes = 8) {
+    if (!settings_cookies?.general?.keep_awake) {
+        if (typeof clearPersistedTimeout === 'function') clearPersistedTimeout('keep-awake');
+        return { status: 'DISABLED' };
+    }
+    if (!_keepAwakeLeaseActive()) return { status: 'LEASE_LOST' };
+    const thresholdMs = Math.max(1, Number(minutes) || 8) * 60 * 1000;
+    if ((Number(TribalWars?.getIdleTime?.()) || 0) < thresholdMs) {
+        return scheduleKeepAwakeCheck(minutes);
+    }
+    showAutoHideBox(t('core.inactivityReload'));
+    await wait(5);
+    if (!_keepAwakeLeaseActive()) return { status: 'LEASE_LOST' };
+    // Recheck after the notice: local activity may have reset the game's own idle counter.
+    if ((Number(TribalWars?.getIdleTime?.()) || 0) < thresholdMs) {
+        return scheduleKeepAwakeCheck(minutes);
+    }
+    location.reload();
+    return { status: 'RELOADING' };
 }
 
 // Auto-expand all quest group lists when the quest panel is opened
@@ -245,10 +282,14 @@ function start() {
 
         if (settings_cookies.general['keep_awake']) {
             const maxInactiveMin = 8;
-            if (runtime) runtime.setInterval('keep-awake:check', () => checkInactivity(maxInactiveMin), 30000);
-            else if (!window.__twpfKeepAwakeInterval) window.__twpfKeepAwakeInterval = setInterval(() => checkInactivity(maxInactiveMin), 30000);
+            runtime?.clearInterval?.('keep-awake:check');
+            registerBackground('keep-awake', function (guard) {
+                guard?.assertActive?.();
+                return scheduleKeepAwakeCheck(maxInactiveMin);
+            }, { priority: BACKGROUND_TASK_PRIORITY.HOUSEKEEPING, leaseKey: 'keep-awake' });
         } else if (runtime) {
             runtime.clearInterval('keep-awake:check');
+            if (typeof clearPersistedTimeout === 'function') clearPersistedTimeout('keep-awake');
         }
 
         const table = $("#overviewtable");
@@ -320,14 +361,12 @@ function start() {
 
         registerBackground('daily-bonus', function (guard) {
             guard?.assertActive?.();
-            if (settings_cookies.general['show__auto_daily_bonus']) return checkAndScheduleDailyBonus();
+            return checkAndScheduleDailyBonus();
         }, { priority: BACKGROUND_TASK_PRIORITY.AUTOMATIC, leaseKey: 'daily-bonus' });
 
         registerBackground('paladin', function (guard) {
             guard?.assertActive?.();
-            if (window.PremiumFeaturesPrivateAutomations && settings_cookies.general['show__auto_paladin_train']?.enabled) {
-                return checkAndSchedulePaladinTrainer();
-            }
+            return checkAndSchedulePaladinTrainer();
         }, { priority: BACKGROUND_TASK_PRIORITY.AUTOMATIC, leaseKey: 'paladin' });
 
     } else {

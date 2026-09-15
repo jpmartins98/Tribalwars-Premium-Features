@@ -947,7 +947,7 @@ async function loadFarmAssistantTargets() {
     _farmAssistantPage = 0;
 
     const syncResult = window.TWPFMapReports
-        ? await window.TWPFMapReports.sync({ force: true })
+        ? await window.TWPFMapReports.sync()
         : { changed: false };
     const ongoingAttacks = typeof getQuickFarmAttacksBySourceVillage === 'function'
         ? await getQuickFarmAttacksBySourceVillage(game_data.village.id)
@@ -1385,4 +1385,3 @@ async function handleFarmAssistantSend(button) {
         }, FARM_ASSISTANT_SEND_COOLDOWN_MS);
     }
 }
-
