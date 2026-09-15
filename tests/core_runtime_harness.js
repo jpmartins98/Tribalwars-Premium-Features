@@ -304,7 +304,9 @@ test('start called five times installs one logical lifecycle', () => {
         injectScriptSettingsPopUp() {},
         registerWidgetPopupSidebarShortcuts() {},
         fetchAndCacheWorldSettings: async () => ({}),
-        updateAllMapData: async () => {},
+        updateMapInfoVillages: async () => {},
+        updateMapInfoPlayers: async () => {},
+        updateMapInfoAllies: async () => {},
         storeUnitsInfo() {},
         fetchAndCacheBuildingsData: async () => ({}),
         localStorage: createStorage({ villages_info: '[]', settings_cookies: JSON.stringify({ widgets: [], general: { keep_awake: true } }) })
@@ -323,11 +325,28 @@ test('start called five times installs one logical lifecycle', () => {
 
     assert.equal(counters.prepare, 1);
     assert.equal(counters.ui, 1);
-    assert.equal(counters.background, 7);
+    assert.equal(counters.background, 10);
     assert.equal(counters.observers, 1);
     assert.equal(target.listenerCount('change'), 1);
     assert.equal(registry.stats().intervals, 0);
     assert.strictEqual(env.context.window.PremiumFeaturesBackgroundScheduler, scheduler);
+});
+
+test('replaceable observer rebinds after partial DOM reload and disconnects the stale target', () => {
+    const env = createContext();
+    load(env.context, 'utils/core_runtime.js');
+    const runtime = env.context.createRuntimeRegistry({ clock: env.clock });
+    let staleDisconnects = 0;
+    let currentDisconnects = 0;
+    const stale = { disconnect() { staleDisconnects++; } };
+    const current = { disconnect() { currentDisconnects++; } };
+    assert.equal(runtime.setObserver('resource-dom', () => stale), stale);
+    assert.equal(runtime.setObserver('resource-dom', () => current, true), current);
+    assert.equal(staleDisconnects, 1);
+    assert.equal(currentDisconnects, 0);
+    assert.equal(runtime.stats().observers, 1);
+    runtime.clearObserver('resource-dom');
+    assert.equal(currentDisconnects, 1);
 });
 
 test('two tabs compete, fail over, and reject stale fencing', () => {
@@ -357,6 +376,29 @@ test('two tabs compete, fail over, and reject stale fencing', () => {
     assert.equal(tabA.isCoordinator(), false);
 });
 
+test('coordinator delay is a future occurrence and does not occupy a scheduler slot', () => {
+    const env = createContext();
+    load(env.context, 'utils/core_runtime.js');
+    load(env.context, 'utils/core_coordination.js');
+    const scheduled = [];
+    env.context.PremiumFeaturesBackgroundScheduler = {
+        DUE_MODE: { REPLACE: 'REPLACE' },
+        enqueue(descriptor) { scheduled.push(descriptor); return Promise.resolve(); }
+    };
+    const coordinator = env.context.createTabCoordinator({
+        host: env.context, storage: createStorage(), now: () => env.clock.now,
+        clock: env.clock, tabId: 'A', instanceId: 'A1', scope: 'delayed-job-test'
+    });
+    assert.equal(coordinator.evaluateCoordinator(), true);
+    coordinator.registerBackgroundTask('map-player', function () {}, {
+        delayMs: 2000, dueMode: 'REPLACE', priority: 4, leaseKey: 'world-data-refresh'
+    });
+    assert.equal(scheduled.length, 1);
+    assert.equal(scheduled[0].dueAt, env.clock.now + 2000);
+    assert.equal(scheduled[0].dueMode, 'REPLACE');
+    assert.equal(scheduled[0].leaseKey, 'world-data-refresh');
+});
+
 test('single-flight shares the exact Promise and executes once', async () => {
     const env = createContext();
     load(env.context, 'utils/core_async.js');
@@ -372,6 +414,25 @@ test('single-flight shares the exact Promise and executes once', async () => {
     assert.equal(calls, 1);
     release('ok');
     assert.equal(await second, 'ok');
+});
+
+test('single-flight rejection is evicted and the next legitimate call runs again', async () => {
+    const env = createContext();
+    load(env.context, 'utils/core_async.js');
+    const flight = env.context.createSingleFlight();
+    let executions = 0;
+    await assert.rejects(flight.run('village-main:1', async () => {
+        executions++;
+        throw new Error('transient read failure');
+    }));
+    await flushMicrotasks();
+    const value = await flight.run('village-main:1', async () => {
+        executions++;
+        return 'fresh';
+    });
+    assert.equal(value, 'fresh');
+    assert.equal(executions, 2);
+    assert.equal(flight.size(), 0);
 });
 
 test('cache exposes fresh, stale-usable and expired states per resource policy', () => {
@@ -446,6 +507,61 @@ test('POST timeout becomes UNCERTAIN and schedules one reconciliation', async ()
     assert.equal(queued[0].priority, 2);
 });
 
+test('mutation HTTP 500/502/503 is UNCERTAIN and reconciliation prevents duplicate mutation', async () => {
+    const env = createContext();
+    load(env.context, 'utils/core_async.js');
+    const queued = [];
+    const scheduler = {
+        PRIORITY: { RECONCILIATION: 2 },
+        DUE_MODE: { EARLIEST: 'EARLIEST' },
+        enqueue(task) { queued.push(task); }
+    };
+    let mutations = 0;
+    for (const status of [500, 502, 503]) {
+        let applied = false;
+        const result = await env.context.runResilientTask({
+            key: 'mutation-' + status, mutation: true, method: 'POST', url: '/game.php',
+            snapshotHash: 'same-decision', scheduler,
+            run: async () => {
+                mutations++;
+                applied = true;
+                const error = new Error('HTTP ' + status + ' after apply');
+                error.status = status;
+                error.url = '/game.php';
+                throw error;
+            },
+            reconcile: async () => ({ applied })
+        });
+        assert.equal(result.status, 'UNCERTAIN');
+    }
+    assert.equal(mutations, 3);
+    assert.equal(queued.length, 3);
+    for (const task of queued) assert.equal((await task.run()).applied, true);
+    assert.equal(mutations, 3);
+});
+
+test('mutation response parse failure after transmission is UNCERTAIN', async () => {
+    const env = createContext();
+    load(env.context, 'utils/core_async.js');
+    const queued = [];
+    const parseError = Object.assign(new SyntaxError('invalid JSON after accepted mutation'), {
+        afterTransmission: true
+    });
+    const result = await env.context.runResilientTask({
+        key: 'mutation-parse', mutation: true, method: 'POST', url: '/game.php',
+        snapshotHash: 'transmitted',
+        scheduler: {
+            PRIORITY: { RECONCILIATION: 2 }, DUE_MODE: { EARLIEST: 'EARLIEST' },
+            enqueue(task) { queued.push(task); }
+        },
+        run: async () => { throw parseError; },
+        reconcile: async () => ({ applied: true })
+    });
+    assert.equal(result.status, 'UNCERTAIN');
+    assert.equal(queued.length, 1);
+    assert.deepEqual(await queued[0].run(), { applied: true });
+});
+
 test('same-origin 429 performs zero retries and hard-stops', async () => {
     let ajaxCalls = 0;
     let hardStops = 0;
@@ -518,6 +634,129 @@ test('resume processes overdue work one task per deterministic turn', async () =
     await drainTimers(env.clock);
     assert.equal(starts.length, 6);
     for (let i = 1; i < starts.length; i++) assert.ok(starts[i] - starts[i - 1] >= 100);
+});
+
+test('runtime resume makes overdue automation immediately eligible before housekeeping', async () => {
+    const env = createContext();
+    loadCore(env.context);
+    const order = [];
+    const scheduler = env.context.createCooperativeScheduler({
+        host: env.context, clock: env.clock, now: () => env.clock.now,
+        autoStart: false, turnGapMs: 10, concurrency: 1
+    });
+    scheduler.start();
+    scheduler.enqueue({ key: 'keep-awake', priority: 5, dueAt: 0, run: () => order.push('housekeeping') });
+    scheduler.enqueue({ key: 'build-queue', priority: 3, dueAt: 100, run: () => order.push('automatic') });
+    // Advance wall time without executing any JavaScript timers, modelling browser/OS suspension.
+    env.clock.now = 600;
+    scheduler.resume('pageshow-after-suspension');
+    env.clock.tick(0);
+    await flushMicrotasks();
+    assert.deepEqual(order, ['automatic']);
+    await drainTimers(env.clock);
+    assert.deepEqual(order, ['automatic', 'housekeeping']);
+});
+
+test('scheduler due modes make replacement semantics explicit', () => {
+    const env = createContext();
+    loadCore(env.context);
+    const scheduler = env.context.createCooperativeScheduler({
+        host: env.context, clock: env.clock, now: () => env.clock.now, autoStart: false
+    });
+    scheduler.start();
+    scheduler.pause();
+    scheduler.enqueue({ key: 'mode', dueAt: 100, run() {} });
+    scheduler.enqueue({ key: 'mode', dueAt: 200, dueMode: scheduler.DUE_MODE.REPLACE, run() {} });
+    assert.equal(scheduler.describe('mode').dueAt, 200);
+    scheduler.enqueue({ key: 'mode', dueAt: 150, dueMode: scheduler.DUE_MODE.LATEST, run() {} });
+    assert.equal(scheduler.describe('mode').dueAt, 200);
+    scheduler.enqueue({ key: 'mode', dueAt: 50, dueMode: scheduler.DUE_MODE.EARLIEST, run() {} });
+    assert.equal(scheduler.describe('mode').dueAt, 50);
+    scheduler.enqueue({ key: 'mode', dueAt: 500, dueMode: scheduler.DUE_MODE.KEEP, run() {} });
+    assert.equal(scheduler.describe('mode').dueAt, 50);
+});
+
+test('a hidden document does not pause due background work', async () => {
+    const env = createContext();
+    loadCore(env.context);
+    const runtime = env.context.createRuntimeRegistry({ clock: env.clock });
+    const scheduler = env.context.createCooperativeScheduler({
+        host: env.context, runtime, clock: env.clock, now: () => env.clock.now,
+        autoStart: false, turnGapMs: 10
+    });
+    let executions = 0;
+    scheduler.start();
+    env.document.hidden = true;
+    env.document.dispatch('visibilitychange');
+    scheduler.enqueue({ key: 'hidden-automatic', dueAt: env.clock.now, priority: 3, run: () => { executions++; } });
+    env.clock.tick(0);
+    await flushMicrotasks();
+    assert.equal(executions, 1);
+    assert.equal(scheduler.stats().paused, false);
+});
+
+test('lease contention records a future wake and executes after expiry without reload', async () => {
+    const env = createContext();
+    loadCore(env.context);
+    let attempts = 0;
+    const coordinator = {
+        isCoordinator: () => true,
+        readLease: () => ({ owner: 'other', expiresAt: 100 }),
+        async runWithLease(_key, run) {
+            attempts++;
+            if (attempts === 1) {
+                const error = new Error('owned elsewhere');
+                error.code = 'LEASE_UNAVAILABLE';
+                error.currentLease = { owner: 'other', expiresAt: 100 };
+                throw error;
+            }
+            return run({ assertActive() {}, isActive: () => true });
+        }
+    };
+    const scheduler = env.context.createCooperativeScheduler({
+        host: env.context, coordinator, clock: env.clock, now: () => env.clock.now,
+        autoStart: false, turnGapMs: 10
+    });
+    let ran = 0;
+    scheduler.start();
+    scheduler.enqueue({ key: 'leased', leaseKey: 'build-queue:1', dueAt: 0, run: () => { ran++; } });
+    env.clock.tick(0);
+    await flushMicrotasks();
+    const waiting = scheduler.describe('leased');
+    assert.equal(waiting.state, 'WAITING_LEASE');
+    assert.ok(waiting.dueAt > 100);
+    assert.equal(waiting.wakeArmed, true);
+    await drainTimers(env.clock);
+    assert.equal(ran, 1);
+});
+
+test('explicit hard-stop survives scheduler recreation until manual clear', async () => {
+    const storage = createStorage();
+    const first = createContext({ storage });
+    loadCore(first.context);
+    const firstScheduler = first.context.createCooperativeScheduler({
+        host: first.context, clock: first.clock, now: () => first.clock.now,
+        hardStopStorageKey: 'test-hard-stop', autoStart: false
+    });
+    firstScheduler.start();
+    firstScheduler.hardStop({ source: 'bot-protection' });
+
+    const resumed = createContext({ storage, clock: new FakeClock(first.clock.now) });
+    loadCore(resumed.context);
+    const secondScheduler = resumed.context.createCooperativeScheduler({
+        host: resumed.context, clock: resumed.clock, now: () => resumed.clock.now,
+        hardStopStorageKey: 'test-hard-stop', autoStart: false
+    });
+    let ran = 0;
+    secondScheduler.start();
+    secondScheduler.enqueue({ key: 'must-stay-stopped', run: () => { ran++; } });
+    resumed.clock.tick(1000);
+    await flushMicrotasks();
+    assert.equal(secondScheduler.stats().hardStopped, true);
+    assert.equal(ran, 0);
+    secondScheduler.clearHardStop();
+    await drainTimers(resumed.clock);
+    assert.equal(ran, 1);
 });
 
 test('an active task cannot erase or overwrite its newer same-key rerun', async () => {
@@ -654,7 +893,9 @@ test('main userscript require graph resolves locally and Premium Compat remains 
 
 (async () => {
     let passed = 0;
-    for (const current of tests) {
+    const pattern = process.env.TEST_PATTERN || '';
+    const selectedTests = pattern ? tests.filter(current => current.name.includes(pattern)) : tests;
+    for (const current of selectedTests) {
         try {
             await current.fn();
             passed++;

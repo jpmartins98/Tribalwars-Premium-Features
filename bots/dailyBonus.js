@@ -57,6 +57,14 @@ function _dailyLeaseActive() {
         lease.instanceId === coordinator.instanceId && lease.expiresAt > Date.now());
 }
 
+function _deferDailyLease(reason) {
+    const lease = window.PremiumFeaturesCoordination?.readLease?.('daily-bonus');
+    const dueAt = Math.max(Date.now() + 1000, Number(lease?.expiresAt) + 50 || 0);
+    const state = _dailyReadState();
+    _scheduleDailyWorker(dueAt, reason || 'lease-deferred', state);
+    return { status: 'WAITING_LEASE', dueAt };
+}
+
 function _dailyInvalidateBuildResources(reason) {
     const villageId = String(game_data?.village?.id || '');
     const buildState = window.PremiumFeaturesBuildState;
@@ -161,7 +169,7 @@ async function runDailyBonusWorker(expectedDay, expectedGeneration, expectedHash
     if (state.serverDay !== today) {
         state = _dailyWriteState({ serverDay: today, status: 'UNKNOWN', attempted: false, collected: false, uncertain: null });
     }
-    if (!_dailyLeaseActive()) return { status: 'LEASE_LOST' };
+    if (!_dailyLeaseActive()) return _deferDailyLease('lease-before-read');
     if (state.serverDay !== expectedDay || state.generation !== Number(expectedGeneration) || _dailySnapshot(state) !== expectedHash) {
         return checkAndScheduleDailyBonus();
     }
@@ -173,13 +181,14 @@ async function runDailyBonusWorker(expectedDay, expectedGeneration, expectedHash
         snapshotHash: String(state.serverDay), run: () => _readDailyBonus(reason)
     });
     if (readResult.status !== 'SUCCESS') {
-        if (readResult.status === 'SOFT_PAUSED') {
-            const paused = _dailyWriteState({ status: 'SOFT_PAUSED', nextDueAt: readResult.retryAt, reason: 'state-fetch-failed' });
-            _scheduleDailyWorker(readResult.retryAt, 'soft-pause', paused);
+        if (readResult.status !== 'HARD_STOP') {
+            const retryAt = Number(readResult.retryAt) || Date.now() + 60000;
+            const paused = _dailyWriteState({ status: 'SOFT_PAUSED', nextDueAt: retryAt, reason: 'state-fetch-failed' });
+            _scheduleDailyWorker(retryAt, 'soft-pause', paused);
         }
         return readResult;
     }
-    if (!_dailyLeaseActive()) return { status: 'LEASE_LOST' };
+    if (!_dailyLeaseActive()) return _deferDailyLease('lease-after-read');
     const bonusData = readResult.value;
     if (!bonusData?.chests) {
         const paused = _dailyWriteState({ status: 'SOFT_PAUSED', nextDueAt: Date.now() + 30000, reason: 'state-parse-failed' });
@@ -197,7 +206,11 @@ async function runDailyBonusWorker(expectedDay, expectedGeneration, expectedHash
 }
 
 async function _collectDailyBonus(day, expectedState) {
-    if (!_dailyLeaseActive()) return { status: 'LEASE_LOST' };
+    if (!settings_cookies?.general?.show__auto_daily_bonus) {
+        if (typeof clearPersistedTimeout === 'function') clearPersistedTimeout('daily_bonus');
+        return { status: 'DISABLED' };
+    }
+    if (!_dailyLeaseActive()) return _deferDailyLease('lease-before-collect');
     const current = _dailyReadState();
     if (current.generation !== expectedState.generation || current.serverDay !== expectedState.serverDay) return { status: 'STALE_GENERATION' };
     const executing = _dailyWriteState({ status: 'EXECUTING', attempted: true, reason: 'collect', uncertain: null });
@@ -212,6 +225,12 @@ async function _collectDailyBonus(day, expectedState) {
             _scheduleDailyWorker(Date.now(), 'uncertain-reconcile', latest);
         },
         run: async function () {
+            if (!settings_cookies?.general?.show__auto_daily_bonus) {
+                return Promise.reject(Object.assign(new Error('Daily Bonus disabled before mutation'), { code: 'STALE_CONFIG' }));
+            }
+            if (window.PremiumFeaturesBotProtection?.isActive?.()) {
+                return Promise.reject(Object.assign(new Error('Bot protection active'), { code: 'HARD_STOP' }));
+            }
             if (!_dailyLeaseActive()) {
                 const error = new Error('Daily Bonus lease lost');
                 error.code = 'LEASE_LOST';
@@ -228,7 +247,12 @@ async function _collectDailyBonus(day, expectedState) {
                 credentials: 'include'
             }));
             _dailyResponseError(response, url);
-            return response.json();
+            try {
+                return await response.json();
+            } catch (error) {
+                error.afterTransmission = true;
+                throw error;
+            }
         }
     });
     if (result.status === 'UNCERTAIN') {
@@ -243,7 +267,27 @@ async function _collectDailyBonus(day, expectedState) {
         _scheduleDailyWorker(result.retryAt, 'soft-pause', paused);
         return result;
     }
-    if (result.status !== 'SUCCESS' || !_dailyLeaseActive()) return result;
+    if (result.stale || result.failure?.error?.code === 'STALE_CONFIG') {
+        if (typeof clearPersistedTimeout === 'function') clearPersistedTimeout('daily_bonus');
+        _dailyWriteState({ status: 'UNKNOWN', nextDueAt: null, reason: 'disabled-before-mutation', uncertain: null });
+        return { status: 'DISABLED' };
+    }
+    if (result.status !== 'SUCCESS') {
+        if (result.status !== 'HARD_STOP') {
+            const paused = _dailyWriteState({ status: 'SOFT_PAUSED', nextDueAt: result.retryAt || Date.now() + 300000, reason: 'collect-confirmed-failure' });
+            _scheduleDailyWorker(paused.nextDueAt, 'soft-pause', paused);
+        }
+        return result;
+    }
+    if (!_dailyLeaseActive()) {
+        const retryAt = Date.now() + 30000;
+        const uncertain = _dailyWriteState({
+            status: 'UNCERTAIN', nextDueAt: retryAt, reason: 'lease-lost-after-response',
+            uncertain: { day, snapshotHash, at: Date.now() }
+        });
+        _scheduleDailyWorker(retryAt, 'uncertain-reconcile', uncertain);
+        return { status: 'UNCERTAIN', retryAt };
+    }
     if (result.value?.error) {
         showAutoHideBox(t('dailyBonus.apiError', { error: result.value.error }), true);
         const done = _dailyWriteState({ status: 'DONE', attempted: true, collected: false, nextDueAt: null, reason: 'server-rejected', uncertain: null });
@@ -263,7 +307,26 @@ function autoDailyBonusCollect() {
     return runDailyBonusWorker(state.serverDay, state.generation, _dailySnapshot(state), 'legacy-entry');
 }
 
+async function runDailyBonusWorkerSafely() {
+    try {
+        return await runDailyBonusWorker.apply(null, arguments);
+    } catch (error) {
+        if (error?.code === 'HARD_STOP') throw error;
+        const state = _dailyReadState();
+        const afterTransmission = state.status === 'EXECUTING';
+        const retryAt = Date.now() + (afterTransmission ? 30000 : 60000);
+        const recovered = _dailyWriteState({
+            status: afterTransmission ? 'UNCERTAIN' : 'SOFT_PAUSED',
+            nextDueAt: retryAt,
+            reason: afterTransmission ? 'worker-exception-uncertain' : 'worker-exception-soft-pause',
+            uncertain: afterTransmission ? (state.uncertain || { at: Date.now() }) : null
+        });
+        _scheduleDailyWorker(retryAt, afterTransmission ? 'uncertain-reconcile' : 'soft-pause', recovered);
+        return { status: afterTransmission ? 'UNCERTAIN' : 'SOFT_PAUSED', retryAt, error };
+    }
+}
+
 if (typeof registerTimeoutHandler === 'function') {
-    registerTimeoutHandler('dailyBonusWorker', runDailyBonusWorker);
+    registerTimeoutHandler('dailyBonusWorker', runDailyBonusWorkerSafely);
     registerTimeoutHandler('dailyBonusCheck', checkAndScheduleDailyBonus);
 }

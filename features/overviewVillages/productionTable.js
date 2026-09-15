@@ -55,6 +55,63 @@ function renderActiveQueueIcons(cell, villageId, doc) {
 }
 
 /**
+ * Returns the current first waiting-item status for the overview tooltip.  This deliberately
+ * reads BuildState and the scheduler on every refresh of the live tooltip: a due time captured
+ * when the row was rendered can become obsolete after lease contention, an edit defer, or a
+ * soft-pause rearm.
+ */
+function getBuildQueueOverviewWaitingStatus(villageId) {
+    const vId = String(villageId);
+    const record = window.PremiumFeaturesBuildState?.get?.(vId) || {};
+    const execution = record.execution || {};
+    const controller = typeof ensureBuildQueueController === 'function' ? ensureBuildQueueController() : null;
+    const taskKey = controller?.taskKey ? controller.taskKey(vId) : 'build-queue:reconcile:' + vId;
+    const task = window.PremiumFeaturesBackgroundScheduler?.describe?.(taskKey) || null;
+    const persistedDueAt = parseInt(localStorage.getItem('endTime_' + getBuildQueueTimeoutId(vId)), 10) || 0;
+    const dueAt = Number(task?.dueAt) || Number(execution.nextDueAt) || persistedDueAt;
+    const remaining = dueAt - Date.now();
+    const time = remaining > 0 ? formatQueueRemaining(remaining) : null;
+    if (task?.state === 'RUNNING' || execution.state === window.BUILD_QUEUE_STATE?.RECONCILING ||
+        execution.state === window.BUILD_QUEUE_STATE?.EXECUTING) return { kind: 'RECONCILING', dueAt, time };
+    if (task?.state === 'WAITING_LEASE') return { kind: 'WAITING_LEASE', dueAt, time };
+    if (task?.state === 'DEFERRED') return { kind: 'INTERACTION_DEFERRED', dueAt, time };
+    if (task?.state === 'HARD_STOP') return { kind: 'HARD_STOP', dueAt, time };
+    if (execution.state === window.BUILD_QUEUE_STATE?.UNCERTAIN) return { kind: 'UNCERTAIN', dueAt, time };
+    if (execution.state === window.BUILD_QUEUE_STATE?.SOFT_PAUSED) return { kind: 'SOFT_PAUSED', dueAt, time };
+    if (execution.state === window.BUILD_QUEUE_STATE?.WAITING_SLOT) return { kind: 'WAITING_SLOT', dueAt, time };
+    if (execution.state === window.BUILD_QUEUE_STATE?.WAITING_POPULATION) return { kind: 'WAITING_POPULATION', dueAt, time };
+    if (execution.state === window.BUILD_QUEUE_STATE?.WAITING_RESOURCES) return { kind: 'WAITING_RESOURCES', dueAt, time };
+    if (remaining > 0) return { kind: 'COUNTDOWN', dueAt, time };
+    return { kind: 'OVERDUE', dueAt, time: null };
+}
+
+function renderBuildQueueOverviewWaitingStatus(villageId) {
+    const status = getBuildQueueOverviewWaitingStatus(villageId);
+    if (status.kind === 'COUNTDOWN') {
+        return `<div style="margin-top:3px;border-top:1px solid #c1a264;padding-top:3px;color:#888;">${t('buildQueue.nextAttemptIn', { time: status.time })}</div>`;
+    }
+    const keys = {
+        RECONCILING: 'buildQueue.statusReconciling',
+        WAITING_LEASE: 'buildQueue.statusWaitingTab',
+        INTERACTION_DEFERRED: 'buildQueue.statusInteractionDeferred',
+        HARD_STOP: 'buildQueue.statusHardStop',
+        UNCERTAIN: 'buildQueue.statusUncertain',
+        SOFT_PAUSED: 'buildQueue.statusSoftPause',
+        WAITING_SLOT: 'buildQueue.statusWaitingSlot',
+        WAITING_POPULATION: 'buildQueue.statusWaitingPopulation',
+        WAITING_RESOURCES: 'buildQueue.statusWaitingResources',
+        OVERDUE: 'buildQueue.statusOverdue'
+    };
+    const color = status.kind === 'HARD_STOP' ? '#a00' :
+        (status.kind === 'UNCERTAIN' || status.kind === 'SOFT_PAUSED' || status.kind === 'OVERDUE') ? '#a60' : '#777';
+    const statusLine = `<div style="margin-top:3px;color:${color};">${t(keys[status.kind] || keys.OVERDUE)}</div>`;
+    const nextLine = status.time
+        ? `<div style="margin-top:2px;color:#888;">${t('buildQueue.nextAttemptIn', { time: status.time })}</div>`
+        : '';
+    return statusLine + nextLine;
+}
+
+/**
  * Renders the WAITING (fake/local, not yet submitted to the server) queue items for a village:
  * one icon per item, orange progress bar, tooltip shows "Next attempt in" (first item, live
  * countdown to the script's next retry) or "Position N in waiting queue" (further items) — same
@@ -68,20 +125,11 @@ function renderFakeQueueIcons(cell, villageId, allBuildingsImgs, doc) {
     const queueBuildIds = bqGet('building_queue', villageId) || [];
     if (!queueBuildIds.length) return;
 
-    // Scheduled time (ms epoch) when addToBuildQueue() will next fire for this village
-    const scheduledEndTime = Number(window.PremiumFeaturesBuildState?.get?.(villageId)?.execution?.nextDueAt) ||
-        parseInt(localStorage.getItem('endTime_' + getBuildQueueTimeoutId(villageId))) || 0;
-
     queueBuildIds.forEach(function (id, fakeIndex) {
         const buildingName = doc.querySelector('.visual-label-' + id)?.getAttribute('data-title') || id;
 
         function getBodyHtml() {
-            if (fakeIndex === 0 && scheduledEndTime > 0) {
-                const fmt = formatQueueRemaining(scheduledEndTime - Date.now());
-                return fmt
-                    ? `<div style="margin-top:3px;border-top:1px solid #c1a264;padding-top:3px;color:#888;">${t('buildQueue.nextAttemptIn', { time: fmt })}</div>`
-                    : `<div style="margin-top:3px;color:#aaa;">${t('buildQueue.retryingSoon')}</div>`;
-            }
+            if (fakeIndex === 0) return renderBuildQueueOverviewWaitingStatus(villageId);
             if (fakeIndex > 0) {
                 return `<div style="margin-top:3px;border-top:1px solid #c1a264;padding-top:3px;color:#aaa;">${t('buildQueue.positionInQueue', { position: fakeIndex + 1 })}</div>`;
             }

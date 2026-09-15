@@ -2,6 +2,7 @@
 
 const BUILD_INSTANT_FREE_WINDOW_SEC = 180;
 const BUILD_INSTANT_COMPLETION_MARGIN_MS = 2000;
+const BUILD_INSTANT_FALLBACK_MS = 5 * 60 * 1000;
 
 function _buildInstantStateApi() {
     return window.PremiumFeaturesBuildState;
@@ -33,6 +34,17 @@ function _buildInstantLeaseActive(villageId) {
     const lease = coordinator.readLease('build-instant:' + String(villageId));
     return Boolean(lease && lease.owner === coordinator.tabId &&
         lease.instanceId === coordinator.instanceId && lease.expiresAt > Date.now());
+}
+
+function _deferBuildInstantLease(villageId, reason) {
+    const vId = String(villageId);
+    const lease = window.PremiumFeaturesCoordination?.readLease?.('build-instant:' + vId);
+    const dueAt = Math.max(Date.now() + 1000, Number(lease?.expiresAt) + 50 || 0);
+    const official = _buildInstantStateApi()?.get(vId)?.official || {};
+    _scheduleBuildInstantWorker(vId, dueAt, reason || 'lease-deferred', official, {
+        statePatch: { state: 'STALE' }
+    });
+    return { status: 'WAITING_LEASE', dueAt };
 }
 
 function _throwBuildInstantResponse(response, url) {
@@ -113,6 +125,12 @@ function checkAndScheduleBuildInstantFree(villageId, options = {}) {
             statePatch: { state: 'UNCERTAIN', orderId: orderId != null ? String(orderId) : null }
         });
         return { status: 'UNCERTAIN', dueAt };
+    }
+    if (instant.state === 'SOFT_PAUSED' && Number(instant.nextDueAt) > Date.now()) {
+        _scheduleBuildInstantWorker(vId, instant.nextDueAt, 'soft-pause', official, {
+            statePatch: { state: 'SOFT_PAUSED' }
+        });
+        return { status: 'SOFT_PAUSED', dueAt: instant.nextDueAt };
     }
     const nextSlotAt = Number(official.nextSlotAt || bqGet('building_queue_next_slot', vId)) || 0;
     if (!nextSlotAt || nextSlotAt <= Date.now()) {
@@ -208,7 +226,7 @@ async function runBuildInstantFreeWorker(villageId, expectedGeneration, expected
     if (!_buildInstantEnabled() || !vId) return { status: 'DISABLED' };
     const state = _buildInstantStateApi();
     let record = state?.get(vId);
-    if (!_buildInstantLeaseActive(vId)) return { status: 'LEASE_LOST' };
+    if (!_buildInstantLeaseActive(vId)) return _deferBuildInstantLease(vId, 'lease-before-check');
     if (Number(record?.official?.generation) !== Number(expectedGeneration) ||
         _buildInstantSnapshot(vId, record?.official) !== expectedHash) {
         window.PremiumFeaturesDiagnostics?.record?.({
@@ -229,15 +247,16 @@ async function runBuildInstantFreeWorker(villageId, expectedGeneration, expected
         run: () => _inspectBuildInstant(vId, reason)
     });
     if (result.status !== 'SUCCESS') {
-        if (result.status === 'SOFT_PAUSED') {
-            _scheduleBuildInstantWorker(vId, result.retryAt, 'soft-pause', record?.official, {
+        if (result.status !== 'HARD_STOP') {
+            const retryAt = Number(result.retryAt) || Date.now() + BUILD_INSTANT_FALLBACK_MS;
+            _scheduleBuildInstantWorker(vId, retryAt, 'soft-pause', record?.official, {
                 statePatch: { state: 'SOFT_PAUSED' }
             });
         }
         return result;
     }
 
-    if (!_buildInstantLeaseActive(vId)) return { status: 'LEASE_LOST' };
+    if (!_buildInstantLeaseActive(vId)) return _deferBuildInstantLease(vId, 'lease-after-check');
     record = state?.get(vId);
     const button = _buildInstantButtonData(result.value);
     if (uncertainOrderId && String(button?.orderId || '') !== String(uncertainOrderId) &&
@@ -247,15 +266,16 @@ async function runBuildInstantFreeWorker(villageId, expectedGeneration, expected
     }
     if (!button?.orderId) {
         const snapshotHash = _buildInstantSnapshot(vId, record?.official);
+        const hasOfficialWork = (record?.official?.queue || []).length > 0;
         const dueAt = Number(record?.official?.nextSlotAt) > Date.now()
             ? Number(record.official.nextSlotAt) + BUILD_INSTANT_COMPLETION_MARGIN_MS
-            : null;
+            : hasOfficialWork ? Date.now() + BUILD_INSTANT_FALLBACK_MS : null;
         _setBuildInstantState(vId, {
             state: 'STALE', nextDueAt: dueAt,
             checkedOfficialGeneration: record?.official?.generation || 0,
             snapshotHash, reason: 'button-absent', uncertain: null
         }, true);
-        if (dueAt) _scheduleBuildInstantWorker(vId, dueAt, 'known-completion', record.official, {
+        if (dueAt) _scheduleBuildInstantWorker(vId, dueAt, record?.official?.nextSlotAt ? 'known-completion' : 'stale-fallback', record.official, {
             checkedOfficialGeneration: record.official.generation,
             statePatch: { state: 'STALE' }
         });
@@ -271,11 +291,18 @@ async function runBuildInstantFreeWorker(villageId, expectedGeneration, expected
         return { status: 'WAITING_WINDOW' };
     }
     if (button.availableTo && now >= button.availableTo) {
+        const dueAt = Number(record.official?.nextSlotAt) > now
+            ? Number(record.official.nextSlotAt) + BUILD_INSTANT_COMPLETION_MARGIN_MS
+            : now + BUILD_INSTANT_FALLBACK_MS;
         _setBuildInstantState(vId, {
             state: 'STALE', checkedOfficialGeneration: record.official.generation,
-            snapshotHash: _buildInstantSnapshot(vId, record.official), reason: 'window-closed'
+            snapshotHash: _buildInstantSnapshot(vId, record.official), reason: 'window-closed', nextDueAt: dueAt
         }, true);
-        return { status: 'STALE' };
+        _scheduleBuildInstantWorker(vId, dueAt, 'window-closed-reconcile', record.official, {
+            checkedOfficialGeneration: record.official.generation,
+            statePatch: { state: 'STALE' }
+        });
+        return { status: 'STALE', dueAt };
     }
     return buildInstantFreeApiCall(button.orderId, vId, record.official.generation, _buildInstantSnapshot(vId, record.official));
 }
@@ -285,7 +312,12 @@ async function buildInstantFreeApiCall(orderId, villageId, expectedGeneration, e
     const csrf = game_data?.csrf;
     const state = _buildInstantStateApi();
     const record = state?.get(vId);
-    if (!vId || !csrf || !_buildInstantLeaseActive(vId)) return { status: 'LEASE_LOST' };
+    if (!vId || !csrf) return { status: 'FAILED' };
+    if (!_buildInstantEnabled()) {
+        _clearBuildInstantFreeTimeout(vId);
+        return { status: 'DISABLED' };
+    }
+    if (!_buildInstantLeaseActive(vId)) return _deferBuildInstantLease(vId, 'lease-before-mutation');
     if (Number(record?.official?.generation) !== Number(expectedGeneration) ||
         _buildInstantSnapshot(vId, record?.official) !== expectedHash ||
         !record?.official?.cancelIds?.some(id => String(id) === String(orderId))) {
@@ -309,6 +341,10 @@ async function buildInstantFreeApiCall(orderId, villageId, expectedGeneration, e
             _scheduleBuildInstantWorker(vId, Date.now(), 'uncertain-reconcile', latest, { orderId: String(orderId) });
         },
         run: async function () {
+            if (!_buildInstantEnabled()) return Promise.reject(Object.assign(new Error('Build Instant disabled before mutation'), { code: 'STALE_CONFIG' }));
+            if (window.PremiumFeaturesBotProtection?.isActive?.()) {
+                return Promise.reject(Object.assign(new Error('Bot protection active'), { code: 'HARD_STOP' }));
+            }
             if (!_buildInstantLeaseActive(vId)) {
                 const error = new Error('Build Instant lease lost');
                 error.code = 'LEASE_LOST';
@@ -323,7 +359,12 @@ async function buildInstantFreeApiCall(orderId, villageId, expectedGeneration, e
                 credentials: 'include'
             }));
             _throwBuildInstantResponse(response, url);
-            return response.json();
+            try {
+                return await response.json();
+            } catch (error) {
+                error.afterTransmission = true;
+                throw error;
+            }
         }
     });
 
@@ -340,8 +381,35 @@ async function buildInstantFreeApiCall(orderId, villageId, expectedGeneration, e
         });
         return resilient;
     }
-    if (resilient.status !== 'SUCCESS') return resilient;
-    if (!_buildInstantLeaseActive(vId)) return { status: 'LEASE_LOST' };
+    if (resilient.stale || resilient.failure?.error?.code === 'STALE_CONFIG') {
+        _clearBuildInstantFreeTimeout(vId);
+        _setBuildInstantState(vId, { state: 'IDLE', nextDueAt: null, reason: 'disabled-before-mutation', uncertain: null }, true);
+        return { status: 'DISABLED' };
+    }
+    if (resilient.status !== 'SUCCESS') {
+        if (resilient.status !== 'HARD_STOP') {
+            const dueAt = Number(record.official?.nextSlotAt) > Date.now()
+                ? Number(record.official.nextSlotAt) + BUILD_INSTANT_COMPLETION_MARGIN_MS
+                : Date.now() + BUILD_INSTANT_FALLBACK_MS;
+            _scheduleBuildInstantWorker(vId, dueAt, 'mutation-confirmed-failure', record.official, {
+                statePatch: { state: 'STALE' }
+            });
+        }
+        return resilient;
+    }
+    if (!_buildInstantLeaseActive(vId)) {
+        const retryAt = Date.now() + 30000;
+        _setBuildInstantState(vId, {
+            state: 'UNCERTAIN', uncertain: { orderId: String(orderId), snapshotHash: expectedHash, at: Date.now() },
+            nextDueAt: retryAt, reason: 'lease-lost-after-response'
+        }, true);
+        _scheduleBuildInstantWorker(vId, retryAt, 'uncertain-reconcile', record.official, {
+            orderId: String(orderId),
+            uncertain: { orderId: String(orderId), snapshotHash: expectedHash, at: Date.now() },
+            statePatch: { state: 'UNCERTAIN' }
+        });
+        return { status: 'UNCERTAIN', retryAt };
+    }
 
     const official = state.get(vId).official || {};
     const queue = (official.queue || []).slice();
@@ -385,8 +453,26 @@ function scheduleVillageInstantFreeApiCall(villageId, orderId, waitTime) {
     _scheduleBuildInstantWorker(villageId, Date.now() + Math.max(0, Number(waitTime) || 0), 'legacy-api-schedule', official, { orderId });
 }
 
+async function runBuildInstantFreeWorkerSafely() {
+    const args = Array.from(arguments);
+    const vId = String(args[0] || game_data?.village?.id || '');
+    try {
+        return await runBuildInstantFreeWorker.apply(null, args);
+    } catch (error) {
+        if (error?.code === 'HARD_STOP') throw error;
+        const record = _buildInstantStateApi()?.get(vId);
+        const afterTransmission = record?.instant?.state === 'EXECUTING';
+        const dueAt = Date.now() + (afterTransmission ? 30000 : BUILD_INSTANT_FALLBACK_MS);
+        _scheduleBuildInstantWorker(vId, dueAt, afterTransmission ? 'worker-exception-uncertain' : 'worker-exception-soft-pause', record?.official || {}, {
+            uncertain: afterTransmission ? { orderId: record?.instant?.orderId, at: Date.now() } : null,
+            statePatch: { state: afterTransmission ? 'UNCERTAIN' : 'SOFT_PAUSED' }
+        });
+        return { status: afterTransmission ? 'UNCERTAIN' : 'SOFT_PAUSED', retryAt: dueAt, error };
+    }
+}
+
 if (typeof registerTimeoutHandler === 'function') {
-    registerTimeoutHandler('instantFreeWorker', runBuildInstantFreeWorker);
+    registerTimeoutHandler('instantFreeWorker', runBuildInstantFreeWorkerSafely);
     registerTimeoutHandler('instantFreeCheck', fetchAndExecuteBuildInstantFree);
     registerTimeoutHandler('instantFreeApiCall', function (orderId, villageId) {
         const official = _buildInstantStateApi()?.get(villageId)?.official || {};

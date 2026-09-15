@@ -166,6 +166,18 @@ function _scavengingLeaseActive(villageId) {
         lease.instanceId === coordinator.instanceId && lease.expiresAt > Date.now());
 }
 
+function _deferScavengingForLease(villageId) {
+    const vId = _getScavengeVillageId(villageId);
+    const lease = window.PremiumFeaturesCoordination?.readLease?.('scavenging:' + vId);
+    const dueAt = Math.max(Date.now() + 1000, Number(lease?.expiresAt) + 50 || 0);
+    _scheduleScavengingAuto(dueAt - Date.now(), vId);
+    window.PremiumFeaturesDiagnostics?.record?.({
+        feature: 'scavenging', taskKey: 'scavenging:' + vId, villageId: vId,
+        status: 'LEASE', reason: 'lease-deferred', dueAt
+    });
+    return { status: 'WAITING_LEASE', dueAt };
+}
+
 function _parseScavengingVillageDocument(doc) {
     const scriptText = Array.from(doc.querySelectorAll('script'))
         .map(script => script.textContent)
@@ -574,6 +586,7 @@ async function sendScavengeSquadApi(unitCounts, optionId, carryMax, explicitVill
             const scheduled = await scheduler.enqueue({
                 key: 'manual:scavenging:' + villageId + ':' + String(optionId),
                 priority: scheduler.PRIORITY?.MANUAL || 1,
+                dueMode: scheduler.DUE_MODE?.EARLIEST || 'EARLIEST',
                 leaseKey: 'scavenging:' + villageId,
                 run: runLeased
             });
@@ -595,6 +608,7 @@ async function sendScavengeSquadApi(unitCounts, optionId, carryMax, explicitVill
             feature: 'scavenging', taskKey: 'scavenging:' + villageId,
             villageId, status: 'SKIPPED', reason: 'lease-lost-before-mutation'
         });
+        _deferScavengingForLease(villageId);
         return { success: false, returnMs: 0, paused: true };
     }
     if (!_scavengingDecisionIsCurrent(villageId, expectedDecisionHash, 'stale-config-before-mutation')) {
@@ -630,6 +644,11 @@ async function sendScavengeSquadApi(unitCounts, optionId, carryMax, explicitVill
             : game_data.link_base_pure;
         const url = targetBase + 'scavenge_api&ajaxaction=send_squads';
         const request = () => {
+            if (window.PremiumFeaturesBotProtection?.isActive?.()) {
+                const protectionError = new Error('Bot protection active');
+                protectionError.code = 'HARD_STOP';
+                throw protectionError;
+            }
             if (_scavengingTaskVillageId && !_scavengingLeaseActive(villageId)) {
                 const leaseError = new Error('Scavenging lease lost before network');
                 leaseError.code = 'LEASE_LOST';
@@ -666,6 +685,18 @@ async function sendScavengeSquadApi(unitCounts, optionId, carryMax, explicitVill
             responseError.url = response.url || url;
             const failure = window.PremiumFeaturesAsync?.classifyRequestFailure?.(responseError, { url }) || {};
             if (failure.hardStop) return { success: false, returnMs: 0, paused: true, hardStop: true };
+            if ([500, 502, 503].includes(Number(response.status))) {
+                saveScavengeConfig(Object.assign({}, getScavengeConfig(villageId), {
+                    uncertain: { optionId: Number(optionId), at: Date.now(), status: Number(response.status) }
+                }), villageId);
+                _softPauseScavenging(responseError, 'send-uncertain-http');
+                window.PremiumFeaturesDiagnostics?.record?.({
+                    feature: 'scavenging', taskKey: 'scavenging:' + villageId,
+                    villageId, logicalResource: 'scavenging-send:' + villageId,
+                    method: 'POST', status: 'UNCERTAIN', reason: 'http-' + response.status
+                });
+                return { success: false, returnMs: 0, uncertain: true };
+            }
             if (failure.transient) {
                 saveScavengeConfig(Object.assign({}, getScavengeConfig(villageId), { uncertain: null }), villageId);
                 _softPauseScavenging(responseError, 'send-transient');
@@ -750,8 +781,7 @@ async function triggerScavengingAuto(villageId) {
 }
 
 async function _triggerScavengingAutoForActiveVillage() {
-    if (!window.PremiumFeaturesPrivateAutomations) return;
-    if (!_scavengingLeaseActive()) return { status: 'LEASE_LOST' };
+    if (!_scavengingLeaseActive()) return _deferScavengingForLease();
 
     // Skip if a timer is already scheduled and still in the future — avoids redundant API calls.
     const existingEndTime = parseInt(localStorage.getItem('endTime_' + _scavengingTimerId()), 10);
@@ -769,6 +799,18 @@ async function _triggerScavengingAutoForActiveVillage() {
     }
     if (config.uncertain && await _reconcileUncertainScavenging(config)) return;
     if (!config.enabled) return;
+
+    // A known return event can make resources available earlier than a Build Queue ETA.
+    // Invalidate logically; the queue controller still follows DOM/store/single-flight/network.
+    window.PremiumFeaturesBuildState?.invalidateResources?.(_getScavengeVillageId(), 'scavenging-return-due');
+    const buildRecord = window.PremiumFeaturesBuildState?.get?.(_getScavengeVillageId());
+    if (buildRecord?.queue?.length && typeof ensureBuildQueueController === 'function') {
+        ensureBuildQueueController()?.schedule(_getScavengeVillageId(), {
+            delayMs: 0,
+            priority: window.PremiumFeaturesBackgroundScheduler?.PRIORITY?.RECONCILIATION || 2,
+            reason: 'scavenging-return-due'
+        });
+    }
 
     if (config.optimizeMode) {
         await runOptimizedScavenge();
@@ -1011,14 +1053,23 @@ function injectScavengeConfigPanel() {
     enableCheckbox.id = 'scavenge_config_enabled';
     enableCheckbox.checked = config.enabled === true;
     enableCheckbox.style.marginRight = '5px';
-    if (!window.PremiumFeaturesPrivateAutomations) {
-        enableRow.style.display = 'none';
-        enableCheckbox.checked = false;
-        enableCheckbox.disabled = true;
-    }
     enableLabel.appendChild(enableCheckbox);
     enableLabel.appendChild(document.createTextNode(t('scavenge.enableLabel')));
     ec1.appendChild(enableLabel);
+
+    const statusRow = tbody.insertRow();
+    statusRow.insertCell(0).textContent = t('scavenge.statusLabel');
+    const statusCell = statusRow.insertCell(1);
+    function refreshAutomationStatus() {
+        const saved = getScavengeConfig();
+        const dueAt = Number(localStorage.getItem('endTime_' + _scavengingTimerId())) || 0;
+        statusCell.textContent = saved.enabled
+            ? t('scavenge.statusActive') + (dueAt > Date.now()
+                ? ' · ' + t('scavenge.nextRunAt', { time: new Date(dueAt).toLocaleTimeString() })
+                : '')
+            : t('scavenge.statusOff');
+    }
+    refreshAutomationStatus();
 
     // Optimized multi-level row
     const optimizeRow = tbody.insertRow();
@@ -1312,7 +1363,7 @@ function injectScavengeConfigPanel() {
     const startBtn = document.createElement('a');
     startBtn.className = 'btn btn-default';
     startBtn.style.marginTop = '8px';
-    startBtn.textContent = 'Start';
+    startBtn.textContent = t('scavenge.saveAndStart');
     startBtn.style.display = enableCheckbox.checked ? '' : 'none';
     startBtn.onclick = async () => {
         const isOptimize = document.getElementById('scavenge_config_optimize').checked;
@@ -1341,6 +1392,7 @@ function injectScavengeConfigPanel() {
 
         if (isEnabled) _scheduleScavengingAuto(0);
         else if (typeof clearPersistedTimeout === 'function') clearPersistedTimeout(_scavengingTimerId());
+        refreshAutomationStatus();
     };
     contentDiv.appendChild(startBtn);
 
@@ -1349,7 +1401,10 @@ function injectScavengeConfigPanel() {
         syncLevelCheckboxState();
         if (!enableCheckbox.checked) {
             applyManualDefaults();
+            saveScavengeConfig(Object.assign({}, getScavengeConfig(), { enabled: false }));
+            if (typeof clearPersistedTimeout === 'function') clearPersistedTimeout(_scavengingTimerId());
         }
+        refreshAutomationStatus();
         refreshDistributionPreview();
     };
 
@@ -1508,7 +1563,7 @@ function injectScavengeConfigPanel() {
  */
 function injectAutoScavengingOption() {
     injectScavengeConfigPanel();
-    if (window.PremiumFeaturesPrivateAutomations && getScavengeConfig().enabled) {
+    if (getScavengeConfig().enabled) {
         _scheduleScavengingAuto(0);
     }
 }
@@ -1519,8 +1574,6 @@ function injectAutoScavengingOption() {
  * If a mission is already in progress, schedules the next check and exits immediately.
  */
 async function runAutoScavengingAll() {
-    if (!window.PremiumFeaturesPrivateAutomations) return;
-
     // Skip if a timer is already scheduled and still in the future — avoids redundant API calls on every page visit.
     const existingEndTime = parseInt(localStorage.getItem('endTime_' + _scavengingTimerId()), 10);
     if (existingEndTime && existingEndTime > Date.now()) {

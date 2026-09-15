@@ -69,8 +69,12 @@ function _writePaladinState(patch, options = {}) {
 }
 
 function _paladinEnabled() {
-    return Boolean(window.PremiumFeaturesPrivateAutomations &&
-        settings_cookies?.general?.show__auto_paladin_train?.enabled);
+    return Boolean(settings_cookies?.general?.show__auto_paladin_train?.enabled);
+}
+
+function _paladinMaxLevel() {
+    const configured = Number(settings_cookies?.general?.show__auto_paladin_train?.maxLevel);
+    return Number.isInteger(configured) && configured > 0 ? configured : 30;
 }
 
 function _paladinLeaseActive() {
@@ -79,6 +83,14 @@ function _paladinLeaseActive() {
     const lease = coordinator.readLease('paladin');
     return Boolean(lease && lease.owner === coordinator.tabId &&
         lease.instanceId === coordinator.instanceId && lease.expiresAt > Date.now());
+}
+
+function _deferPaladinLease(reason) {
+    const lease = window.PremiumFeaturesCoordination?.readLease?.('paladin');
+    const dueAt = Math.max(Date.now() + 1000, Number(lease?.expiresAt) + 50 || 0);
+    const state = _readPaladinState();
+    _schedulePaladinWorker(dueAt, reason || 'lease-deferred', state);
+    return { status: 'WAITING_LEASE', dueAt };
 }
 
 function _schedulePaladinWorker(dueAt, reason, state) {
@@ -110,7 +122,7 @@ function checkAndSchedulePaladinTrainer() {
     }
     const state = _readPaladinState();
     const serverNow = Timing.getCurrentServerTime();
-    const configuredMaxLevel = Number(settings_cookies.general.show__auto_paladin_train?.maxLevel ?? 30);
+    const configuredMaxLevel = _paladinMaxLevel();
     if (state.state === 'COMPLETE' && Number(state.level) >= configuredMaxLevel) {
         return { status: 'COMPLETE' };
     }
@@ -127,7 +139,7 @@ function checkAndSchedulePaladinTrainer() {
     return { status: 'CHECKING', dueAt: Date.now() };
 }
 
-function _parseKnightData(doc) {
+function _parseKnightData(doc, strict = false) {
     const scriptText = Array.from(doc.querySelectorAll('script'))
         .map(script => script.textContent)
         .find(text => text.includes('receiveKnightsData'));
@@ -149,6 +161,7 @@ function _parseKnightData(doc) {
         return Object.values(knights)[0] ?? null;
     } catch (error) {
         console.error('[PaladinTrainer] Failed to parse knights data:', error);
+        if (strict) throw error;
         return null;
     }
 }
@@ -175,7 +188,7 @@ async function _fetchPaladinState(reason) {
             method: 'GET', reason
         }, () => fetch(url, { credentials: 'include' }));
         _paladinResponseError(response, url);
-        return _parseKnightData(new DOMParser().parseFromString(await response.text(), 'text/html'));
+        return _parseKnightData(new DOMParser().parseFromString(await response.text(), 'text/html'), true);
     });
 }
 
@@ -199,7 +212,7 @@ function _observePaladinKnight(knight, reason) {
 async function runPaladinTrainerWorker(expectedGeneration, expectedHash, reason) {
     if (!_paladinEnabled()) return { status: 'DISABLED' };
     let state = _readPaladinState();
-    if (!_paladinLeaseActive()) return { status: 'LEASE_LOST' };
+    if (!_paladinLeaseActive()) return _deferPaladinLease('lease-before-read');
     if (Number(state.generation) !== Number(expectedGeneration) || _paladinSnapshot(state) !== expectedHash) {
         window.PremiumFeaturesDiagnostics?.record?.({
             feature: 'paladin', taskKey: 'paladin', status: 'SKIPPED', reason: 'stale-generation'
@@ -215,18 +228,19 @@ async function runPaladinTrainerWorker(expectedGeneration, expectedHash, reason)
         run: () => _fetchPaladinState(reason)
     });
     if (result.status !== 'SUCCESS') {
-        if (result.status === 'SOFT_PAUSED') {
-            const paused = _writePaladinState({ state: 'SOFT_PAUSED', nextDueAt: result.retryAt, reason: 'state-fetch-failed' });
-            _schedulePaladinWorker(result.retryAt, 'soft-pause', paused);
+        if (result.status !== 'HARD_STOP') {
+            const retryAt = Number(result.retryAt) || Date.now() + 60000;
+            const paused = _writePaladinState({ state: 'SOFT_PAUSED', nextDueAt: retryAt, reason: 'state-fetch-failed' });
+            _schedulePaladinWorker(retryAt, 'soft-pause', paused);
         }
         return result;
     }
-    if (!_paladinLeaseActive()) return { status: 'LEASE_LOST' };
+    if (!_paladinLeaseActive()) return _deferPaladinLease('lease-after-read');
     const knight = result.value;
     state = _observePaladinKnight(knight, 'server-state');
     if (!knight) return { status: 'IDLE' };
 
-    const maxLevel = settings_cookies.general.show__auto_paladin_train?.maxLevel ?? 30;
+    const maxLevel = _paladinMaxLevel();
     if (Number(knight.level) >= Number(maxLevel)) {
         _writePaladinState({ state: 'COMPLETE', nextDueAt: null, reason: 'max-level' });
         return { status: 'COMPLETE' };
@@ -248,7 +262,11 @@ async function runPaladinTrainerWorker(expectedGeneration, expectedHash, reason)
 }
 
 async function _startPaladinTraining(knightId, regimenId, durationSec, expectedState) {
-    if (!_paladinLeaseActive()) return { status: 'LEASE_LOST' };
+    if (!_paladinEnabled()) {
+        if (typeof clearPersistedTimeout === 'function') clearPersistedTimeout('auto_trainer_paladin');
+        return { status: 'DISABLED' };
+    }
+    if (!_paladinLeaseActive()) return _deferPaladinLease('lease-before-training');
     const current = _readPaladinState();
     if (current.generation !== expectedState.generation || _paladinSnapshot(current) !== _paladinSnapshot(expectedState) ||
         current.knightId !== knightId || current.state !== 'IDLE') {
@@ -269,6 +287,10 @@ async function _startPaladinTraining(knightId, regimenId, durationSec, expectedS
             _schedulePaladinWorker(Date.now(), 'uncertain-reconcile', latest);
         },
         run: async function () {
+            if (!_paladinEnabled()) return Promise.reject(Object.assign(new Error('Paladin disabled before mutation'), { code: 'STALE_CONFIG' }));
+            if (window.PremiumFeaturesBotProtection?.isActive?.()) {
+                return Promise.reject(Object.assign(new Error('Bot protection active'), { code: 'HARD_STOP' }));
+            }
             if (!_paladinLeaseActive()) {
                 const error = new Error('Paladin lease lost');
                 error.code = 'LEASE_LOST';
@@ -283,7 +305,12 @@ async function _startPaladinTraining(knightId, regimenId, durationSec, expectedS
                 body: params.toString(), credentials: 'include', mode: 'cors'
             }));
             _paladinResponseError(response, url);
-            return response.json();
+            try {
+                return await response.json();
+            } catch (error) {
+                error.afterTransmission = true;
+                throw error;
+            }
         }
     });
     if (result.status === 'UNCERTAIN') {
@@ -298,7 +325,28 @@ async function _startPaladinTraining(knightId, regimenId, durationSec, expectedS
         _schedulePaladinWorker(result.retryAt, 'soft-pause', paused);
         return result;
     }
-    if (result.status !== 'SUCCESS' || !_paladinLeaseActive()) return result;
+    if (result.stale || result.failure?.error?.code === 'STALE_CONFIG') {
+        if (typeof clearPersistedTimeout === 'function') clearPersistedTimeout('auto_trainer_paladin');
+        _writePaladinState({ state: 'IDLE', nextDueAt: null, reason: 'disabled-before-mutation', uncertain: null });
+        return { status: 'DISABLED' };
+    }
+    if (result.status !== 'SUCCESS') {
+        if (result.status !== 'HARD_STOP') {
+            const retryAt = Number(result.retryAt) || Date.now() + 60000;
+            const paused = _writePaladinState({ state: 'SOFT_PAUSED', nextDueAt: retryAt, reason: 'training-confirmed-failure' });
+            _schedulePaladinWorker(retryAt, 'soft-pause', paused);
+        }
+        return result;
+    }
+    if (!_paladinLeaseActive()) {
+        const retryAt = Date.now() + 30000;
+        const uncertain = _writePaladinState({
+            state: 'UNCERTAIN', nextDueAt: retryAt, reason: 'lease-lost-after-response',
+            uncertain: { knightId, regimenId, snapshotHash: mutationSnapshot, at: Date.now() }
+        });
+        _schedulePaladinWorker(retryAt, 'uncertain-reconcile', uncertain);
+        return { status: 'UNCERTAIN', retryAt };
+    }
 
     showAutoHideBox(t('trainerPaladin.trainingStarted'), false);
     const data = result.value;
@@ -359,11 +407,10 @@ function installPaladinDomObserver() {
         });
         observer.observe(target, { childList: true, subtree: true, attributes: true, attributeFilter: ['data-endtime'] });
         return observer;
-    });
+    }, true);
 }
 
 function injectScriptAutoTrainerPaladin() {
-    if (!window.PremiumFeaturesPrivateAutomations) return;
     if (!_paladinEnabled()) {
         if (typeof clearPersistedTimeout === 'function') clearPersistedTimeout('auto_trainer_paladin');
         return;
@@ -389,7 +436,35 @@ function injectScriptAutoTrainerPaladin() {
     }
 }
 
+async function runPaladinTrainerWorkerSafely(expectedGeneration, expectedHash, reason) {
+    try {
+        return await runPaladinTrainerWorker(expectedGeneration, expectedHash, reason);
+    } catch (error) {
+        if (error?.code === 'HARD_STOP') throw error;
+        const current = _readPaladinState();
+        const afterTransmission = current.state === 'EXECUTING';
+        const retryAt = Date.now() + (afterTransmission ? 30000 : 60000);
+        const recovered = _writePaladinState({
+            state: afterTransmission ? 'UNCERTAIN' : 'SOFT_PAUSED',
+            nextDueAt: retryAt,
+            reason: afterTransmission ? 'worker-exception-uncertain' : 'worker-exception-soft-pause',
+            uncertain: afterTransmission ? (current.uncertain || {
+                knightId: current.knightId,
+                regimenId: current.regimenId,
+                at: Date.now()
+            }) : null
+        });
+        _schedulePaladinWorker(retryAt, afterTransmission ? 'uncertain-reconcile' : 'soft-pause', recovered);
+        window.PremiumFeaturesDiagnostics?.record?.({
+            feature: 'paladin', taskKey: 'paladin',
+            status: afterTransmission ? 'UNCERTAIN' : 'SOFT_PAUSE',
+            reason: 'worker-exception:' + (error?.message || String(error))
+        });
+        return { status: afterTransmission ? 'UNCERTAIN' : 'SOFT_PAUSED', retryAt, error };
+    }
+}
+
 if (typeof registerTimeoutHandler === 'function') {
-    registerTimeoutHandler('paladinTrainerWorker', runPaladinTrainerWorker);
+    registerTimeoutHandler('paladinTrainerWorker', runPaladinTrainerWorkerSafely);
     registerTimeoutHandler('paladinTrainerCheck', checkAndSchedulePaladinTrainer);
 }

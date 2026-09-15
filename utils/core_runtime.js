@@ -11,6 +11,7 @@
         const featureClaims = new Map();
         const oncePromises = new Map();
         const interactions = new Map();
+        const interactionListeners = new Set();
         let generation = 1;
         let reconcilePending = false;
 
@@ -65,8 +66,11 @@
             return true;
         }
 
-        function setObserver(key, factory) {
-            if (observers.has(key)) return observers.get(key);
+        function setObserver(key, factory, replace = false) {
+            if (observers.has(key)) {
+                if (!replace) return observers.get(key);
+                clearObserver(key);
+            }
             const observer = factory();
             if (observer) observers.set(key, observer);
             return observer || null;
@@ -115,6 +119,9 @@
         function beginInteraction(scope) {
             const key = String(scope || 'global');
             interactions.set(key, (interactions.get(key) || 0) + 1);
+            interactionListeners.forEach(function (listener) {
+                try { listener(key, true); } catch (error) { console.error('[TW Runtime] Interaction listener failed', error); }
+            });
         }
 
         function endInteraction(scope) {
@@ -122,10 +129,19 @@
             const remaining = (interactions.get(key) || 0) - 1;
             if (remaining > 0) interactions.set(key, remaining);
             else interactions.delete(key);
+            interactionListeners.forEach(function (listener) {
+                try { listener(key, remaining > 0); } catch (error) { console.error('[TW Runtime] Interaction listener failed', error); }
+            });
         }
 
         function isInteractionActive(scope) {
             return (interactions.get(String(scope || 'global')) || 0) > 0;
+        }
+
+        function onInteractionChange(listener) {
+            if (typeof listener !== 'function') return function () {};
+            interactionListeners.add(listener);
+            return function () { interactionListeners.delete(listener); };
         }
 
         function installInteractionTracking(target) {
@@ -168,6 +184,7 @@
             Array.from(timeouts.keys()).forEach(clearLogicalTimeout);
             Array.from(observers.keys()).forEach(clearObserver);
             interactions.clear();
+            interactionListeners.clear();
         }
 
         return {
@@ -187,6 +204,7 @@
             beginInteraction,
             endInteraction,
             isInteractionActive,
+            onInteractionChange,
             installInteractionTracking,
             stats,
             disposeAll

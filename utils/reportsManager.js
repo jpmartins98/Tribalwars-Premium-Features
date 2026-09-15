@@ -94,6 +94,7 @@
             const scheduled = await scheduler.enqueue({
                 key: 'reports:sync',
                 priority: scheduler.PRIORITY?.REFRESH || 4,
+                dueMode: scheduler.DUE_MODE?.EARLIEST || 'EARLIEST',
                 leaseKey: 'reports-sync',
                 rerunWhileActive: true,
                 run: function () { return sync(Object.assign({}, options, { scheduled: true })); }
@@ -487,6 +488,7 @@
                     const scheduled = await scheduler.enqueue({
                         key: 'manual:report:' + reportKey,
                         priority: scheduler.PRIORITY?.MANUAL || 1,
+                        dueMode: scheduler.DUE_MODE?.EARLIEST || 'EARLIEST',
                         run: load
                     });
                     if (scheduled?.status !== 'COMPLETED') throw scheduled?.error || new Error('Report detail task did not complete');

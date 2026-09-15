@@ -166,6 +166,7 @@ async function getOutgoingCommandsFromOverview() {
         return scheduler.enqueue({
             key: 'outgoing:sync',
             priority: scheduler.PRIORITY?.REFRESH || 4,
+            dueMode: scheduler.DUE_MODE?.EARLIEST || 'EARLIEST',
             leaseKey: 'outgoing',
             rerunWhileActive: true,
             run: coalesced
@@ -758,6 +759,27 @@ function insertOwnVillageDetailsRows(tgtVillage, popUpBody) {
  * for the village currently under the cursor. Fetches and caches full report details
  * on first access via fetch.
  */
+function isMapPopupStillShowingVillage(village) {
+    const popup = document.getElementById('map_popup');
+    return Boolean(village && TWMap?.popup?._currentVillage === village.id && popup?.isConnected &&
+        popup.style.display !== 'none');
+}
+
+async function hydrateReportForCurrentMapHover(report, village, popupBody) {
+    if (!isMapPopupStillShowingVillage(village)) {
+        window.PremiumFeaturesDiagnostics?.record?.({
+            feature: 'reports', logicalResource: 'report:' + String(report?.id || ''),
+            status: 'SKIPPED', reason: 'hover-ended-before-start'
+        });
+        return null;
+    }
+    const hydrated = await window.TWPFMapReports.hydrateFullReport(report);
+    // Do not cancel an in-flight immutable report read; simply discard visual work if the user
+    // has moved to another village by the time it settles.
+    if (hydrated && isMapPopupStillShowingVillage(village)) insertReportData(hydrated, popupBody);
+    return hydrated;
+}
+
 async function getReportInfoToMap(currentCoords, currentPopUpBody) {
     if (!isMapHoverInfoEnabled()) return;
     clearTimeout(_moraleHoverIntentTimer);
@@ -799,7 +821,7 @@ async function getReportInfoToMap(currentCoords, currentPopUpBody) {
             // TWMap.popup._currentVillage guards against injecting into a different village's popup.
             const injectMoraleRow = (morale) => {
                 document.getElementById('info_morale')?.remove();
-                if (TWMap.popup._currentVillage !== tgtVillage.id) return;
+                if (!isMapPopupStillShowingVillage(tgtVillage)) return;
                 const liveBody = document.getElementById('map_popup')?.querySelector('tbody');
                 if (!liveBody) return;
                 const color = morale >= 90 ? '#4caf50' : morale >= 70 ? '#ff9800' : morale >= 50 ? '#ff5722' : '#f44336';
@@ -815,9 +837,7 @@ async function getReportInfoToMap(currentCoords, currentPopUpBody) {
             };
 
             _moraleHoverIntentTimer = setTimeout(async () => {
-                const livePopup = document.getElementById('map_popup');
-                if (TWMap.popup._currentVillage !== tgtVillage.id || !livePopup?.isConnected ||
-                    livePopup.style.display === 'none') {
+                if (!isMapPopupStillShowingVillage(tgtVillage)) {
                     window.PremiumFeaturesDiagnostics?.record?.({
                         feature: 'morale', logicalResource: 'morale:' + ownerId,
                         status: 'SKIPPED', reason: 'hover-ended-before-start'
@@ -843,8 +863,7 @@ async function getReportInfoToMap(currentCoords, currentPopUpBody) {
             const report = reports_list[i];
 
             if (report.coords.includes(currentCoords)) {
-                const hydratedReport = await window.TWPFMapReports.hydrateFullReport(report);
-                if (hydratedReport) insertReportData(hydratedReport, currentPopUpBody);
+                await hydrateReportForCurrentMapHover(report, tgtVillage, currentPopUpBody);
                 break;
             }
         }
@@ -1257,6 +1276,7 @@ async function getMoraleForOwner(ownerId, defenderName, defenderPoints) {
         return scheduler.enqueue({
             key: 'manual:' + logicalKey,
             priority: scheduler.PRIORITY?.MANUAL || 1,
+            dueMode: scheduler.DUE_MODE?.EARLIEST || 'EARLIEST',
             run: load
         }).then(result => {
             if (result?.status !== 'COMPLETED') throw result?.error || new Error('Morale task did not complete');

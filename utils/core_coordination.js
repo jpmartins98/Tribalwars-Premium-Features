@@ -214,6 +214,8 @@
             const descriptor = {
                 key: 'coordinator-job:' + job.key,
                 priority: job.priority,
+                dueAt: now() + job.delayMs,
+                dueMode: job.dueMode || scheduler?.DUE_MODE?.REPLACE || 'REPLACE',
                 requiresCoordinator: true,
                 leaseKey: job.leaseKey || ('background:' + job.key),
                 run: job.run,
@@ -331,6 +333,8 @@
             job.run = run;
             job.priority = Number(taskOptions.priority) || 4;
             job.leaseKey = taskOptions.leaseKey;
+            job.delayMs = Math.max(0, Number(taskOptions.delayMs) || 0);
+            job.dueMode = taskOptions.dueMode || 'REPLACE';
             job.rerunWhileActive = !!taskOptions.reconcile;
             if (existing && taskOptions.reconcile) job.lastTerm = null;
             jobs.set(key, job);

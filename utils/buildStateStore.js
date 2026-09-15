@@ -6,6 +6,7 @@
         IDLE: 'IDLE',
         WAITING_SLOT: 'WAITING_SLOT',
         WAITING_RESOURCES: 'WAITING_RESOURCES',
+        WAITING_POPULATION: 'WAITING_POPULATION',
         READY: 'READY',
         EXECUTING: 'EXECUTING',
         RECONCILING: 'RECONCILING',
@@ -22,7 +23,7 @@
         UNCERTAIN: 'UNCERTAIN'
     });
     const INTENT_VERSION = 2;
-    const DEFAULT_EDIT_DEBOUNCE_MS = 350;
+    const DEFAULT_EDIT_DEBOUNCE_MS = 800;
     const DEFAULT_FALLBACK_MS = 5 * 60 * 1000;
 
     function clone(value) {
@@ -177,6 +178,25 @@
             const levels = current.levels || readField('building_queue_active_levels', villageId) || [];
             const slots = current.slots || readField('building_queue_slots', villageId) || [];
             const maxSlots = Number(current.maxSlots) || (host.game_data?.features?.Premium?.active ? 5 : 2);
+            const nextBuildOffers = {};
+            Object.keys(current.nextBuildOffers || {}).forEach(function (buildingId) {
+                const offer = current.nextBuildOffers[buildingId];
+                const level = Number(offer?.level);
+                const wood = Number(offer?.wood);
+                const stone = Number(offer?.stone);
+                const iron = Number(offer?.iron);
+                if (!Number.isInteger(level) || level <= 0 || ![wood, stone, iron].every(Number.isFinite)) return;
+                nextBuildOffers[String(buildingId)] = {
+                    level,
+                    wood,
+                    stone,
+                    iron,
+                    pop: Math.max(0, Number(offer.pop) || 0),
+                    observedAt: Number(offer.observedAt) || Number(current.fetchedAt) || 0,
+                    generation: Math.max(0, Number(offer.generation) || Number(current.generation) || 0),
+                    source: offer.source || current.source || 'persisted'
+                };
+            });
             return {
                 queue: Array.isArray(queue) ? queue.slice() : [],
                 levels: Array.isArray(levels) ? levels.slice() : [],
@@ -189,6 +209,7 @@
                 full: typeof current.full === 'boolean' ? current.full : queue.length >= maxSlots,
                 maxSlots,
                 currentLevels: Object.assign({}, current.currentLevels || {}),
+                nextBuildOffers,
                 fetchedAt: Number(current.fetchedAt) || 0,
                 generation: Math.max(0, Number(current.generation) || 0),
                 source: current.source || 'persisted',
@@ -233,7 +254,8 @@
                 reason: current.reason || null,
                 updatedAt: Number(current.updatedAt) || 0,
                 uncertain: current.uncertain || null,
-                freshness: current.freshness || null
+                freshness: current.freshness || null,
+                diagnostics: clone(current.diagnostics || null)
             };
         }
 
@@ -332,7 +354,18 @@
                 const index = queue.findIndex(item => item.id === event.itemId);
                 if (index >= 0) {
                     const [item] = queue.splice(index, 1);
-                    const targetIndex = Math.max(0, Math.min(queue.length, Number(event.toIndex) || 0));
+                    let targetIndex;
+                    if (event.beforeItemId != null) {
+                        const beforeIndex = queue.findIndex(candidate => candidate.id === event.beforeItemId);
+                        targetIndex = beforeIndex >= 0 ? beforeIndex : queue.length;
+                    } else if (event.afterItemId != null) {
+                        const afterIndex = queue.findIndex(candidate => candidate.id === event.afterItemId);
+                        targetIndex = afterIndex >= 0 ? afterIndex + 1 : queue.length;
+                    } else {
+                        // Legacy v2 MOVE events used a positional index. Keep replay compatibility.
+                        targetIndex = Number(event.toIndex) || 0;
+                    }
+                    targetIndex = Math.max(0, Math.min(queue.length, targetIndex));
                     queue.splice(targetIndex, 0, item);
                 }
             } else if (event.type === 'CLEAR') {
@@ -375,7 +408,8 @@
                 build_queue_catalog_v1: clone(official.catalog),
                 building_queue_next_slot: official.nextSlotAt || null,
                 building_queue_last_slot: official.lastSlotAt || null,
-                waiting_for_queue: record.execution.state === BUILD_QUEUE_STATE.WAITING_RESOURCES
+                waiting_for_queue: record.execution.state === BUILD_QUEUE_STATE.WAITING_RESOURCES ||
+                    record.execution.state === BUILD_QUEUE_STATE.WAITING_POPULATION
                     ? { buildId: record.queue[0]?.buildingId, earliestPossibleAt: record.execution.nextDueAt }
                     : {}
             };
@@ -593,7 +627,9 @@
                 event.itemId = payload.itemId;
             } else if (type === 'MOVE') {
                 event.itemId = payload.itemId;
-                event.toIndex = Number(payload.toIndex) || 0;
+                if (payload.beforeItemId != null) event.beforeItemId = String(payload.beforeItemId);
+                else if (payload.afterItemId != null) event.afterItemId = String(payload.afterItemId);
+                else event.toIndex = Number(payload.toIndex) || 0;
             }
             if (payload.rebase?.buildingId && Number.isFinite(Number(payload.rebase.startLevel))) {
                 event.rebase = {
@@ -653,6 +689,45 @@
             });
         }
 
+        function moveItem(villageId, itemId, relation = {}) {
+            const record = ensure(villageId);
+            const item = record.queue.find(candidate => candidate.id === String(itemId));
+            if (!item) return null;
+            const payload = {
+                itemId: item.id,
+                rebase: rebaseForUserEdit(record, item.buildingId)
+            };
+            if (relation.beforeItemId != null) payload.beforeItemId = String(relation.beforeItemId);
+            else if (relation.afterItemId != null) payload.afterItemId = String(relation.afterItemId);
+            else payload.toIndex = Number(relation.toIndex) || 0;
+            if (payload.beforeItemId === item.id || payload.afterItemId === item.id) return null;
+            return command(record.villageId, 'MOVE', payload);
+        }
+
+        function rebaseTargetsFromOffers(record, offers) {
+            let changed = false;
+            Object.keys(offers || {}).forEach(function (buildingId) {
+                let nextLevel = Number(offers[buildingId]?.level);
+                if (!Number.isInteger(nextLevel) || nextLevel <= 0) return;
+                record.queue = record.queue.map(function (item) {
+                    if (item.buildingId !== buildingId) return item;
+                    const targetLevel = nextLevel++;
+                    if (Number(item.targetLevel) === targetLevel) return item;
+                    changed = true;
+                    return Object.assign({}, item, { targetLevel });
+                });
+            });
+            if (!changed) return false;
+            // targetLevel is derived metadata. Rebase it without changing intentRevision, while
+            // bumping executionGeneration so an older worker cannot cross the mutation boundary.
+            record.executionGeneration += 1;
+            const snapshot = snapshotValue(record);
+            writeImmediate(snapshotStorageKey(record.villageId), snapshot);
+            coordination?.broadcast?.('build-queue-snapshot', snapshot);
+            notify(record, { kind: 'metadata-rebase', source: 'official-next-build-offer' });
+            return true;
+        }
+
         function clear(villageId) {
             const record = ensure(villageId);
             return record.queue.length ? command(record.villageId, 'CLEAR') : null;
@@ -671,8 +746,20 @@
             const next = normalizeOfficial(record.villageId, Object.assign({}, previous, supplied));
             next.fetchedAt = Number(supplied.fetchedAt) || now();
             next.generation = previous.generation + 1;
+            if (Object.prototype.hasOwnProperty.call(supplied, 'nextBuildOffers')) {
+                Object.keys(next.nextBuildOffers || {}).forEach(function (buildingId) {
+                    next.nextBuildOffers[buildingId].generation = next.generation;
+                    if (!next.nextBuildOffers[buildingId].observedAt) next.nextBuildOffers[buildingId].observedAt = next.fetchedAt;
+                });
+            }
             record.official = next;
+            const rebased = rebaseTargetsFromOffers(record, supplied.nextBuildOffers || {});
             syncLegacyFields(record);
+            if (rebased) {
+                Promise.resolve(queueStorage?.persistVillage?.(record.villageId)).catch(function (error) {
+                    console.warn('[TW BuildState] Failed to mirror rebased targets', error);
+                });
+            }
             persistRuntime(record, false);
             notify(record, { kind: 'official' });
             return get(record.villageId);
@@ -910,6 +997,7 @@
             removeAt,
             removeItem,
             move,
+            moveItem,
             clear,
             consume,
             command,
@@ -935,10 +1023,14 @@
     function createBuildQueueController(options = {}) {
         const store = options.store;
         const scheduler = options.scheduler;
+        const runtime = options.runtime || root.PremiumFeaturesRuntimeRegistry || null;
+        const coordination = options.coordination || root.PremiumFeaturesCoordination || null;
+        const clock = options.clock || root;
         const now = options.now || (() => Date.now());
         const inspect = options.inspect;
         const mutate = options.mutate;
         const getCost = options.getCost;
+        const isEnabled = typeof options.isEnabled === 'function' ? options.isEnabled : function () { return true; };
         const resilientRun = options.runResilientTask;
         const editDebounceMs = Math.max(0, Number(options.editDebounceMs) || DEFAULT_EDIT_DEBOUNCE_MS);
         const fallbackMs = Math.max(1000, Number(options.fallbackMs) || DEFAULT_FALLBACK_MS);
@@ -948,6 +1040,7 @@
         const handlerName = options.handlerName || null;
         const onInvalidate = options.onInvalidate || function () {};
         const requestCounts = { inspections: 0, mutations: 0 };
+        const editSessions = new Map();
 
         function priority(name) {
             return scheduler?.PRIORITY?.[name] || ({ MANUAL: 1, RECONCILIATION: 2, AUTOMATIC: 3 })[name] || 3;
@@ -955,15 +1048,70 @@
 
         function taskKey(villageId) { return taskPrefix + String(villageId); }
 
+        function normalizeCostDecision(villageId, head, record) {
+            const resolved = getCost?.(villageId, head, record);
+            if (!resolved) return null;
+            if (resolved.cost) return resolved;
+            return {
+                effectiveLevel: Number(head?.targetLevel) || null,
+                cost: resolved,
+                source: 'LEGACY_COST_CALLBACK',
+                authoritative: true,
+                observedAt: Number(record.official?.fetchedAt) || 0,
+                officialGeneration: Number(record.official?.generation) || 0,
+                persistedTargetLevel: Number(head?.targetLevel) || null
+            };
+        }
+
         function queueDecisionHash(record) {
             const head = record.queue[0] || null;
+            const costDecision = head ? normalizeCostDecision(record.villageId, head, record) : null;
             return (options.hash || root.PremiumFeaturesAsync?.stableSnapshotHash || JSON.stringify)({
                 villageId: record.villageId,
-                revision: record.revision,
-                executionGeneration: record.executionGeneration,
-                head: head && { id: head.id, buildingId: head.buildingId, targetLevel: head.targetLevel },
+                head: head && { id: head.id, buildingId: head.buildingId },
+                effectiveLevel: costDecision?.effectiveLevel || null,
+                cost: costDecision?.cost ? {
+                    wood: Number(costDecision.cost.wood),
+                    stone: Number(costDecision.cost.stone),
+                    iron: Number(costDecision.cost.iron),
+                    pop: Number(costDecision.cost.pop) || 0
+                } : null,
+                costSource: costDecision?.source || null,
                 officialGeneration: record.official?.generation || 0,
-                resourceGeneration: record.resources?.generation || 0
+                resourceGeneration: record.resources?.generation || 0,
+                officialFull: !!record.official?.full,
+                nextSlotAt: Number(record.official?.nextSlotAt) || null
+            });
+        }
+
+        function diagnostics(villageId) {
+            const vId = String(villageId);
+            const record = store.get(vId);
+            const task = scheduler?.describe?.(taskKey(vId)) || null;
+            const lease = coordination?.readLease?.('build-queue:' + vId) || null;
+            const execution = record.execution || {};
+            return Object.assign({}, execution.diagnostics || {}, {
+                villageId: vId,
+                itemId: record.queue?.[0]?.id || null,
+                buildingId: record.queue?.[0]?.buildingId || null,
+                persistedTargetLevel: Number(record.queue?.[0]?.targetLevel) || null,
+                productionSource: record.resources?.productionSource || record.resources?.source || null,
+                ETA: Number(execution.diagnostics?.ETA) || null,
+                nextDueAt: Number(execution.nextDueAt) || Number(task?.dueAt) || null,
+                schedulerTaskPresent: Boolean(task && task.state !== 'MISSING'),
+                schedulerWakeArmed: Boolean(task?.wakeArmed),
+                schedulerWakeAt: Number(task?.wakeAt) || null,
+                overdueByMs: Number(task?.overdueByMs) || 0,
+                executionState: execution.state || BUILD_QUEUE_STATE.IDLE,
+                reason: execution.reason || null,
+                leaseOwner: lease?.owner || null,
+                leaseExpiry: Number(lease?.expiresAt) || null,
+                interactionState: runtime?.isInteractionActive?.('build-queue:' + vId) ? 'ACTIVE' : 'INACTIVE',
+                hardStop: Boolean(task?.hardStopped),
+                hardStopReason: task?.hardStopReason || null,
+                softPauseRetryAt: execution.state === BUILD_QUEUE_STATE.SOFT_PAUSED
+                    ? Number(execution.nextDueAt) || null
+                    : null
             });
         }
 
@@ -971,6 +1119,16 @@
             const vId = String(villageId);
             const record = store.get(vId);
             const key = taskKey(vId);
+            if (!isEnabled(vId)) {
+                scheduler?.cancel?.(key, 'build queue disabled');
+                store.setExecution(vId, {
+                    state: record.execution?.uncertain ? BUILD_QUEUE_STATE.UNCERTAIN : BUILD_QUEUE_STATE.IDLE,
+                    nextDueAt: null,
+                    reason: 'disabled',
+                    decisionHash: queueDecisionHash(record)
+                }, true);
+                return Promise.resolve({ status: 'DISABLED' });
+            }
             if (!record.queue.length) {
                 scheduler?.cancel?.(key, 'empty build queue');
                 store.setExecution(vId, {
@@ -982,9 +1140,17 @@
                 }, true);
                 return Promise.resolve({ status: 'IDLE' });
             }
-            const dueAt = Number(scheduleOptions.dueAt) || now() + Math.max(0, Number(scheduleOptions.delayMs) || 0);
+            const requestedDueAt = Number(scheduleOptions.dueAt) || now() + Math.max(0, Number(scheduleOptions.delayMs) || 0);
+            const dueMode = scheduleOptions.dueMode || scheduler?.DUE_MODE?.REPLACE || 'REPLACE';
+            const existingDueAt = Number(record.execution?.nextDueAt);
+            const dueAt = dueMode === 'EARLIEST' && Number.isFinite(existingDueAt)
+                ? Math.min(existingDueAt, requestedDueAt)
+                : dueMode === 'LATEST' && Number.isFinite(existingDueAt)
+                    ? Math.max(existingDueAt, requestedDueAt)
+                    : dueMode === 'KEEP' && Number.isFinite(existingDueAt)
+                        ? existingDueAt
+                        : requestedDueAt;
             const taskPriority = Number(scheduleOptions.priority) || priority('AUTOMATIC');
-            scheduler?.cancel?.(key, 'replaced by newer build queue state');
             store.setExecution(vId, {
                 state: scheduleOptions.state || BUILD_QUEUE_STATE.RECONCILING,
                 nextDueAt: dueAt,
@@ -996,12 +1162,17 @@
                 key,
                 priority: taskPriority,
                 dueAt,
+                dueMode,
                 leaseKey: 'build-queue:' + vId,
                 interactionScope: 'build-queue:' + vId,
                 generation: record.executionGeneration,
                 snapshotHash: store.capture(vId).hash,
                 rerunWhileActive: true,
-                run: guard => reconcile(vId, guard)
+                run: guard => Promise.resolve().then(function () {
+                    return reconcile(vId, guard);
+                }).catch(function (error) {
+                    return recoverWorkerException(vId, error);
+                })
             };
             if (handlerName) {
                 descriptor.persist = true;
@@ -1020,24 +1191,69 @@
 
         function invalidateForEdit(villageId) {
             const vId = String(villageId);
-            onInvalidate(vId);
-            return schedule(vId, {
-                delayMs: editDebounceMs,
-                priority: priority('MANUAL'),
-                state: BUILD_QUEUE_STATE.RECONCILING,
-                reason: 'intent-edit',
-                immediatePersistence: false
+            const record = store.get(vId);
+            const dependencyHash = queueDecisionHash(record);
+            const dependencyChanged = record.execution?.decisionHash !== dependencyHash;
+            let session = editSessions.get(vId);
+            if (!session) {
+                session = { active: true, dependencyChanged: false, timer: null };
+                editSessions.set(vId, session);
+                runtime?.beginInteraction?.('build-queue:' + vId);
+            }
+            session.dependencyChanged = session.dependencyChanged || dependencyChanged;
+            const finish = function () {
+                const current = editSessions.get(vId);
+                if (current !== session) return;
+                editSessions.delete(vId);
+                runtime?.endInteraction?.('build-queue:' + vId);
+                if (!session.dependencyChanged) return;
+                onInvalidate(vId);
+                schedule(vId, {
+                    delayMs: 0,
+                    priority: priority('MANUAL'),
+                    state: BUILD_QUEUE_STATE.RECONCILING,
+                    reason: 'intent-edit-settled',
+                    immediatePersistence: false
+                });
+            };
+            if (runtime?.setTimeout) {
+                runtime.setTimeout('build-queue:edit-quiet:' + vId, finish, editDebounceMs, true);
+            } else if (typeof clock.setTimeout === 'function') {
+                if (session.timer != null) clock.clearTimeout(session.timer);
+                session.timer = clock.setTimeout(finish, editDebounceMs);
+            } else {
+                // Deterministic harness/minimal-host fallback: represent the quiet window as a
+                // future scheduler occurrence without occupying its cooperative worker slot.
+                editSessions.delete(vId);
+                if (session.dependencyChanged) {
+                    onInvalidate(vId);
+                    schedule(vId, {
+                        delayMs: editDebounceMs,
+                        priority: priority('MANUAL'),
+                        state: BUILD_QUEUE_STATE.RECONCILING,
+                        reason: 'intent-edit-settled'
+                    });
+                }
+            }
+            // A tail-only edit leaves the executable dependency fingerprint unchanged. Preserve
+            // WAITING_* and nextDueAt; its local intent revision still fences old mutations.
+            return Promise.resolve({
+                status: dependencyChanged ? 'EDIT_DEFERRED' : 'LOCAL_ONLY',
+                key: taskKey(vId),
+                dueAt: record.execution?.nextDueAt || null
             });
         }
 
-        function hasEnough(resources, cost) {
-            if (!resources || !cost) return false;
-            if (resources.wood < cost.wood || resources.stone < cost.stone || resources.iron < cost.iron) return false;
+        function resourceShortage(resources, cost) {
+            if (!resources || !cost) return 'unknown-resources';
+            if (resources.wood < cost.wood) return 'insufficient-wood';
+            if (resources.stone < cost.stone) return 'insufficient-stone';
+            if (resources.iron < cost.iron) return 'insufficient-iron';
             if (Number(cost.pop) > 0) {
-                if (!Number.isFinite(resources.pop) || !Number.isFinite(resources.popMax)) return false;
-                return resources.popMax - resources.pop >= Number(cost.pop);
+                if (!Number.isFinite(resources.pop) || !Number.isFinite(resources.popMax)) return 'unknown-population';
+                if (resources.popMax - resources.pop < Number(cost.pop)) return 'insufficient-population';
             }
-            return true;
+            return null;
         }
 
         function activeSignatures(official) {
@@ -1076,6 +1292,45 @@
             });
         }
 
+        function recoverWorkerException(villageId, error) {
+            if (error?.code === 'LEASE_LOST' || error?.code === 'LEASE_UNAVAILABLE') throw error;
+            const record = store.get(villageId);
+            const afterTransmission = !!record.inFlight || record.execution?.state === BUILD_QUEUE_STATE.EXECUTING;
+            const retryAt = now() + (afterTransmission ? 30000 : fallbackMs);
+            root.PremiumFeaturesDiagnostics?.record?.({
+                feature: 'build-queue',
+                taskKey: taskKey(villageId),
+                villageId,
+                status: afterTransmission ? 'UNCERTAIN' : 'SOFT_PAUSE',
+                reason: 'worker-exception:' + (error?.message || String(error))
+            });
+            if (afterTransmission) {
+                const uncertain = record.execution?.uncertain || record.inFlight;
+                store.setInFlight(villageId, null);
+                store.setExecution(villageId, {
+                    state: BUILD_QUEUE_STATE.UNCERTAIN,
+                    uncertain,
+                    nextDueAt: retryAt,
+                    reason: 'worker-exception-after-transmission'
+                }, true);
+                return schedule(villageId, {
+                    dueAt: retryAt,
+                    priority: priority('RECONCILIATION'),
+                    state: BUILD_QUEUE_STATE.UNCERTAIN,
+                    reason: 'worker-exception-reconcile',
+                    forceFresh: true,
+                    immediatePersistence: true
+                });
+            }
+            return schedule(villageId, {
+                dueAt: retryAt,
+                priority: priority('RECONCILIATION'),
+                state: BUILD_QUEUE_STATE.SOFT_PAUSED,
+                reason: 'worker-exception-before-transmission',
+                immediatePersistence: true
+            });
+        }
+
         async function inspectFresh(villageId, captured, guard, forceFresh) {
             guard?.assertActive?.();
             if (!store.isCurrent(villageId, captured)) return { stale: true };
@@ -1110,6 +1365,7 @@
             const decisionHash = queueDecisionHash(record);
             const waitingState = record.execution?.state === BUILD_QUEUE_STATE.WAITING_SLOT ||
                 record.execution?.state === BUILD_QUEUE_STATE.WAITING_RESOURCES ||
+                record.execution?.state === BUILD_QUEUE_STATE.WAITING_POPULATION ||
                 record.execution?.state === BUILD_QUEUE_STATE.SOFT_PAUSED;
             if (waitingState && record.execution.nextDueAt > now() && record.execution.decisionHash === decisionHash) {
                 return schedule(vId, {
@@ -1158,10 +1414,6 @@
 
             const head = record.queue[0];
             const official = record.official || {};
-            if (head.targetLevel && Number(official.currentLevels?.[head.buildingId] || 0) >= Number(head.targetLevel)) {
-                store.consume(vId, head.id);
-                return schedule(vId, { delayMs: 250, priority: priority('AUTOMATIC'), reason: 'target-already-satisfied' });
-            }
             if (official.full) {
                 if (official.nextSlotAt && official.nextSlotAt > now()) {
                     return scheduleWait(vId, BUILD_QUEUE_STATE.WAITING_SLOT, official.nextSlotAt + slotMarginMs, 'official-slot');
@@ -1169,16 +1421,80 @@
                 return scheduleWait(vId, BUILD_QUEUE_STATE.WAITING_SLOT, now() + fallbackMs, 'slot-fallback');
             }
 
-            const cost = getCost(vId, head, record);
-            if (!cost) {
-                return scheduleWait(vId, BUILD_QUEUE_STATE.WAITING_RESOURCES, now() + fallbackMs, 'cost-fallback');
+            const costDecision = normalizeCostDecision(vId, head, record);
+            const diagnostics = {
+                itemId: head.id,
+                buildingId: head.buildingId,
+                persistedTargetLevel: Number(head.targetLevel) || null,
+                effectiveNextLevel: costDecision?.effectiveLevel || null,
+                costLevel: costDecision?.effectiveLevel || null,
+                costSource: costDecision?.source || 'MISSING',
+                costAuthoritative: !!costDecision?.authoritative,
+                officialGeneration: Number(official.generation) || 0,
+                officialFreshness: Number(official.fetchedAt) || 0,
+                officialFull: !!official.full,
+                resources: record.resources,
+                resourceSource: record.resources?.source || null,
+                resourceObservedAt: Number(record.resources?.fetchedAt) || 0,
+                productionSource: record.resources?.productionSource || record.resources?.source || null
+            };
+            if (!costDecision?.cost || !costDecision.authoritative) {
+                store.setExecution(vId, { diagnostics }, false);
+                // A fresh-store shortcut has not contacted the server, so one consolidated
+                // authoritative inspection is justified.  If this occurrence already observed
+                // DOM/network state and still found no offer, another immediate GET would only
+                // repeat the same evidence; retain a future retry instead.
+                if (!forceFresh && inspected.observed?.source === 'fresh-store') {
+                    return schedule(vId, {
+                        delayMs: 0,
+                        priority: priority('RECONCILIATION'),
+                        state: BUILD_QUEUE_STATE.RECONCILING,
+                        reason: 'cost-revalidation',
+                        forceFresh: true
+                    });
+                }
+                return schedule(vId, {
+                    dueAt: now() + fallbackMs,
+                    priority: priority('RECONCILIATION'),
+                    state: BUILD_QUEUE_STATE.SOFT_PAUSED,
+                    reason: 'cost-unverified',
+                    forceFresh: true,
+                    immediatePersistence: true
+                });
             }
-            if (!hasEnough(record.resources, cost)) {
+            const cost = costDecision.cost;
+            const shortage = resourceShortage(record.resources, cost);
+            diagnostics.woodCost = Number(cost.wood);
+            diagnostics.stoneCost = Number(cost.stone);
+            diagnostics.ironCost = Number(cost.iron);
+            diagnostics.popCost = Number(cost.pop) || 0;
+            diagnostics.shortage = shortage;
+            store.setExecution(vId, { diagnostics }, false);
+            if (shortage) {
+                const knownCompletionDue = Number(official.nextSlotAt) > now()
+                    ? Number(official.nextSlotAt) + slotMarginMs
+                    : null;
+                const earlierKnownEvent = function (proposedDueAt) {
+                    return knownCompletionDue ? Math.min(proposedDueAt, knownCompletionDue) : proposedDueAt;
+                };
+                if (shortage === 'insufficient-population' || shortage === 'unknown-population') {
+                    return scheduleWait(
+                        vId,
+                        BUILD_QUEUE_STATE.WAITING_POPULATION,
+                        earlierKnownEvent(now() + fallbackMs),
+                        knownCompletionDue ? shortage + ':known-building-completion' : shortage
+                    );
+                }
                 const eta = store.calculateResourceEta(vId, cost, now());
                 if (eta && eta > now()) {
-                    return scheduleWait(vId, BUILD_QUEUE_STATE.WAITING_RESOURCES, eta + resourceMarginMs, 'resource-eta');
+                    diagnostics.ETA = eta;
+                    const dueAt = earlierKnownEvent(eta + resourceMarginMs);
+                    return scheduleWait(vId, BUILD_QUEUE_STATE.WAITING_RESOURCES, dueAt,
+                        dueAt === knownCompletionDue ? shortage + ':known-production-change' : shortage + ':resource-eta');
                 }
-                return scheduleWait(vId, BUILD_QUEUE_STATE.WAITING_RESOURCES, now() + fallbackMs, 'resource-fallback');
+                const fallbackDueAt = earlierKnownEvent(now() + fallbackMs);
+                return scheduleWait(vId, BUILD_QUEUE_STATE.WAITING_RESOURCES, fallbackDueAt,
+                    fallbackDueAt === knownCompletionDue ? shortage + ':known-production-change' : shortage + ':resource-fallback');
             }
 
             const beforeMutation = store.capture(vId);
@@ -1186,12 +1502,21 @@
             if (!store.isCurrent(vId, beforeMutation, { includeObserved: true })) {
                 return rescheduleStale(vId, 'stale-before-mutation');
             }
-            if (store.get(vId).inFlight) return { status: 'IN_FLIGHT' };
+            if (store.get(vId).inFlight) {
+                return schedule(vId, {
+                    dueAt: now() + 30000,
+                    priority: priority('RECONCILIATION'),
+                    state: BUILD_QUEUE_STATE.UNCERTAIN,
+                    reason: 'equivalent-mutation-in-flight',
+                    forceFresh: true,
+                    immediatePersistence: true
+                });
+            }
 
             const uncertainRecord = {
                 itemId: head.id,
                 buildingId: head.buildingId,
-                targetLevel: head.targetLevel,
+                targetLevel: costDecision.effectiveLevel || head.targetLevel,
                 beforeActive: activeSignatures(official),
                 snapshotHash: beforeMutation.hash,
                 startedAt: now()
@@ -1327,6 +1652,8 @@
             reconcile,
             bootstrap,
             taskKey,
+            decisionHash: function (villageId) { return queueDecisionHash(store.get(villageId)); },
+            diagnostics,
             stats: function () { return Object.assign({}, requestCounts); }
         };
     }

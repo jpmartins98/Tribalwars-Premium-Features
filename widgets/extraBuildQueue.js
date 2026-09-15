@@ -88,7 +88,7 @@ function setVillageQueueFull(villageId, value) {
 // racing each other and sending duplicate upgrade requests for the same village's queue head.
 var buildQueueRequestInFlightByVillage = {};
 
-const BUILD_QUEUE_EDIT_DEBOUNCE_MS = 350;
+const BUILD_QUEUE_EDIT_DEBOUNCE_MS = 800;
 const BUILD_QUEUE_FALLBACK_MS = 5 * 60 * 1000;
 const BUILD_QUEUE_SLOT_MARGIN_MS = 2000;
 const BUILD_QUEUE_RESOURCE_MARGIN_MS = 2000;
@@ -122,10 +122,12 @@ function ensureBuildQueueController() {
     buildQueueController = window.createBuildQueueController({
         store: state,
         scheduler: window.PremiumFeaturesBackgroundScheduler,
+        runtime: window.PremiumFeaturesRuntimeRegistry,
         now: () => Date.now(),
         inspect: inspectBuildQueueVillage,
         mutate: executeBuildQueueMutation,
-        getCost: getQueuedBuildCost,
+        getCost: resolveHeadBuildCost,
+        isEnabled: () => Boolean(settings_cookies?.general?.show__building_queue),
         runResilientTask: typeof runResilientTask === 'function' ? runResilientTask : null,
         editDebounceMs: BUILD_QUEUE_EDIT_DEBOUNCE_MS,
         fallbackMs: BUILD_QUEUE_FALLBACK_MS,
@@ -545,6 +547,7 @@ function parseAndStoreQueueState(tempElement, villageId, source = 'network') {
     const buildingLevelsInfo = {};
     const currentLevels = {};
     const serverCosts = {};
+    const nextBuildOffers = {};
     tempElement.querySelectorAll("[id^='main_buildrow_']").forEach(row => {
         const buildId = row.id.replace('main_buildrow_', '');
         const tds = row.querySelectorAll('td');
@@ -558,7 +561,13 @@ function parseAndStoreQueueState(tempElement, villageId, source = 'network') {
             currentLevels[buildId] = currentLevel;
         }
         const serverCost = getServerBuildCost(tempElement, buildId);
-        if (serverCost) serverCosts[buildId] = serverCost;
+        if (serverCost) {
+            serverCosts[buildId] = serverCost;
+            nextBuildOffers[buildId] = Object.assign({}, serverCost, {
+                observedAt: Date.now(),
+                source: source === 'dom' ? 'SERVER_DOM' : 'SERVER_OBSERVATION'
+            });
+        }
     });
     updateCachedBuildCosts(serverCosts);
 
@@ -572,6 +581,7 @@ function parseAndStoreQueueState(tempElement, villageId, source = 'network') {
         full: cancelButtons.length >= maxQueueSize,
         maxSlots: maxQueueSize,
         currentLevels,
+        nextBuildOffers,
         fetchedAt: Date.now(),
         source,
         instantFree
@@ -763,12 +773,17 @@ function updateCachedBuildCost(buildId, serverCost) {
  * @param {{wood:number, stone:number, iron:number}} [resources] - Resource amounts to compare
  * costs against for the insufficient-resource warning; defaults to live DOM (only valid when
  * villageId is the currently loaded village — see readCurrentVillageDomResources).
+ * @param {{wood:number, stone:number, iron:number, pop:number}} [costOverride] - Authoritative
+ * cost resolved for the executable head; time metadata still comes from buildings_data.
  * @returns {string} HTML string, or empty string if data is unavailable.
  */
-function createResourceElementsString(buildId, nextLevel, villageId, resources) {
+function createResourceElementsString(buildId, nextLevel, villageId, resources, costOverride) {
     const vId = villageId || game_data?.village?.id;
     const allBuildingsData = JSON.parse(localStorage.getItem('buildings_data') || '{}');
-    const buildInfo = allBuildingsData[buildId]?.[nextLevel];
+    const cachedBuildInfo = allBuildingsData[buildId]?.[nextLevel] || null;
+    const buildInfo = costOverride
+        ? Object.assign({}, cachedBuildInfo || {}, costOverride)
+        : cachedBuildInfo;
     if (!buildInfo) return '';
 
     const res = resources || readCurrentVillageDomResources(vId) || { wood: 0, stone: 0, iron: 0 };
@@ -969,9 +984,6 @@ function injectFakeQueueList(queueBuildIdsActive, buildQueueElment, allBuildings
         buildingId
     }));
 
-    // Scheduled time (ms epoch) when addToBuildQueue() will next fire for this village
-    const scheduledEndTime = Number(getBuildQueueStateApi()?.get(vId)?.execution?.nextDueAt) ||
-        parseInt(localStorage.getItem('endTime_' + getBuildQueueTimeoutId(vId))) || 0;
     // Target levels stored at queue-add time (building_queue_levels mirrors building_queue)
     const fakeQueueLevels = bqGet('building_queue_levels', vId) || [];
 
@@ -984,6 +996,8 @@ function injectFakeQueueList(queueBuildIdsActive, buildQueueElment, allBuildings
         anchor.style.alignItems = 'center';
         anchor.setAttribute('data-title', `<b>${buildingName}</b>`);
         anchor.style.border = '1px solid #7d510f';
+        anchor.style.cursor = 'grab';
+        anchor.title = 'Drag to reorder the local waiting queue';
         anchor.draggable = true;
         anchor.dataset.buildQueueItemId = intentItems[fakeIndex]?.id || '';
         anchor.dataset.twpfInteractionScope = 'build-queue:' + vId;
@@ -996,19 +1010,20 @@ function injectFakeQueueList(queueBuildIdsActive, buildQueueElment, allBuildings
             clearTimeout(span.countdownTimeout);
             const tooltipEl = document.getElementById('tooltip');
             if (tooltipEl) tooltipEl.style.display = 'none';
-            var index = Array.from(this.parentElement.children).indexOf(this);
-            removeFromBuildQueue(index - queueBuildIdsActive.length, vId);
+            removeBuildQueueItemById(anchor.dataset.buildQueueItemId, vId);
             if (onAction) onAction();
         }
 
         anchor.addEventListener('dragstart', function (event) {
             anchor.dataset.dragged = '1';
+            anchor.style.cursor = 'grabbing';
             window.PremiumFeaturesRuntimeRegistry?.beginInteraction?.('build-queue:' + vId);
             event.dataTransfer?.setData('text/twpf-build-queue-item', anchor.dataset.buildQueueItemId);
             if (event.dataTransfer) event.dataTransfer.effectAllowed = 'move';
         });
         anchor.addEventListener('dragover', function (event) {
             event.preventDefault();
+            anchor.style.boxShadow = 'inset 3px 0 #2f8f2f';
             if (event.dataTransfer) event.dataTransfer.dropEffect = 'move';
         });
         anchor.addEventListener('drop', function (event) {
@@ -1017,31 +1032,78 @@ function injectFakeQueueList(queueBuildIdsActive, buildQueueElment, allBuildings
             const currentItems = getBuildQueueStateApi()?.get(vId)?.queue || [];
             const fromIndex = currentItems.findIndex(item => item.id === draggedId);
             const toIndex = currentItems.findIndex(item => item.id === anchor.dataset.buildQueueItemId);
-            if (fromIndex >= 0 && toIndex >= 0) moveBuildQueueItem(fromIndex, toIndex, vId);
+            if (fromIndex >= 0 && toIndex >= 0 && fromIndex !== toIndex) {
+                moveBuildQueueItemById(draggedId, vId, fromIndex < toIndex
+                    ? { afterItemId: anchor.dataset.buildQueueItemId }
+                    : { beforeItemId: anchor.dataset.buildQueueItemId });
+            }
+            anchor.style.boxShadow = '';
             if (onAction) onAction();
         });
+        anchor.addEventListener('dragleave', function () { anchor.style.boxShadow = ''; });
         anchor.addEventListener('dragend', function () {
+            anchor.style.cursor = 'grab';
+            anchor.style.boxShadow = '';
             window.PremiumFeaturesRuntimeRegistry?.endInteraction?.('build-queue:' + vId);
             setTimeout(function () { delete anchor.dataset.dragged; }, 0);
         });
 
-        const _fakeTargetLevel = fakeQueueLevels[fakeIndex] || 0;
-        const costHtml = createResourceElementsString(id, _fakeTargetLevel, vId, resources) || '';
-
         // Builds tooltip body: resource costs + time info line
         function buildTooltipBody() {
+            const currentRecord = getBuildQueueStateApi()?.get(vId);
+            const currentItem = currentRecord?.queue?.find(item => item.id === anchor.dataset.buildQueueItemId) || intentItems[fakeIndex];
+            const costDecision = resolveHeadBuildCost(vId, currentItem, currentRecord);
+            const effectiveLevel = costDecision?.effectiveLevel || fakeQueueLevels[fakeIndex] || 0;
+            const costHtml = createResourceElementsString(
+                id,
+                effectiveLevel,
+                vId,
+                currentRecord?.resources || resources,
+                costDecision?.authoritative ? costDecision.cost : null
+            ) || '';
             let timeHtml = '';
-            if (fakeIndex === 0 && scheduledEndTime > 0) {
+            if (fakeIndex === 0) {
+                const execution = currentRecord?.execution || {};
+                const controller = ensureBuildQueueController();
+                const taskDescription = controller?.taskKey
+                    ? window.PremiumFeaturesBackgroundScheduler?.describe?.(controller.taskKey(vId))
+                    : null;
+                const scheduledEndTime = Number(execution.nextDueAt) || Number(taskDescription?.dueAt) || 0;
                 const remaining = scheduledEndTime - Date.now();
-                if (remaining > 0) {
+                const countdownHtml = remaining > 0 ? (function () {
                     const s = Math.floor((remaining / 1000) % 60);
                     const m = Math.floor((remaining / 1000 / 60) % 60);
                     const h = Math.floor((remaining / 1000 / 60 / 60) % 24);
                     const d = Math.floor(remaining / 1000 / 60 / 60 / 24);
                     const fmt = (d > 0 ? d + 'd ' : '') + (h > 0 ? h + 'h ' : '') + (m > 0 ? m + 'm ' : '') + s + 's';
-                    timeHtml = `<div style="margin-top:3px;border-top:1px solid #c1a264;padding-top:3px;color:#888;">${t('buildQueue.nextAttemptIn', { time: fmt })}</div>`;
+                    return `<div style="margin-top:2px;color:#888;">${t('buildQueue.nextAttemptIn', { time: fmt })}</div>`;
+                })() : '';
+                if (taskDescription?.state === 'RUNNING' || execution.state === window.BUILD_QUEUE_STATE?.RECONCILING || execution.state === window.BUILD_QUEUE_STATE?.EXECUTING) {
+                    timeHtml = `<div style="margin-top:3px;color:#777;">${t('buildQueue.statusReconciling')}</div>`;
+                } else if (taskDescription?.state === 'WAITING_LEASE') {
+                    timeHtml = `<div style="margin-top:3px;color:#777;">${t('buildQueue.statusWaitingTab')}</div>`;
+                } else if (taskDescription?.state === 'DEFERRED') {
+                    timeHtml = `<div style="margin-top:3px;color:#777;">${t('buildQueue.statusInteractionDeferred')}</div>`;
+                } else if (taskDescription?.state === 'HARD_STOP') {
+                    timeHtml = `<div style="margin-top:3px;color:#a00;">${t('buildQueue.statusHardStop')}</div>`;
+                } else if (execution.state === window.BUILD_QUEUE_STATE?.UNCERTAIN) {
+                    timeHtml = `<div style="margin-top:3px;color:#a60;">${t('buildQueue.statusUncertain')}</div>`;
+                } else if (execution.state === window.BUILD_QUEUE_STATE?.SOFT_PAUSED) {
+                    timeHtml = `<div style="margin-top:3px;color:#a60;">${t('buildQueue.statusSoftPause')}</div>`;
+                } else if (execution.state === window.BUILD_QUEUE_STATE?.WAITING_SLOT) {
+                    timeHtml = `<div style="margin-top:3px;color:#777;">${t('buildQueue.statusWaitingSlot')}</div>`;
+                } else if (execution.state === window.BUILD_QUEUE_STATE?.WAITING_POPULATION) {
+                    timeHtml = `<div style="margin-top:3px;color:#777;">${t('buildQueue.statusWaitingPopulation')}</div>`;
+                } else if (execution.state === window.BUILD_QUEUE_STATE?.WAITING_RESOURCES) {
+                    timeHtml = `<div style="margin-top:3px;color:#777;">${t('buildQueue.statusWaitingResources')}</div>`;
+                } else if (remaining > 0) {
+                    timeHtml = '';
                 } else {
-                    timeHtml = `<div style="margin-top:3px;color:#aaa;">${t('buildQueue.retryingSoon')}</div>`;
+                    timeHtml = `<div style="margin-top:3px;color:#a60;">${t('buildQueue.statusOverdue')}</div>`;
+                }
+                timeHtml += countdownHtml;
+                if (costDecision) {
+                    timeHtml += `<div style="margin-top:2px;color:#777;">${t('buildQueue.effectiveLevel', { level: costDecision.effectiveLevel })} · ${t('buildQueue.costSource', { source: costDecision.source })}</div>`;
                 }
             } else if (fakeIndex > 0) {
                 timeHtml = `<div style="margin-top:3px;border-top:1px solid #c1a264;padding-top:3px;color:#aaa;">${t('buildQueue.positionInQueue', { position: fakeIndex + 1 })}</div>`;
@@ -1079,7 +1141,7 @@ function injectFakeQueueList(queueBuildIdsActive, buildQueueElment, allBuildings
             anchor.setAttribute('data-tooltip-tpl', buildTooltipBody());
             toggleTooltip(event.target, true);
             // Live countdown for the first waiting item only
-            if (fakeIndex === 0 && scheduledEndTime > 0) {
+            if (fakeIndex === 0) {
                 function updateCountdown() {
                     anchor.setAttribute('data-tooltip-tpl', buildTooltipBody());
                     toggleTooltip(event.target, true);
@@ -1340,12 +1402,32 @@ function removeFromBuildQueue(build_index, villageId) {
     return result.record;
 }
 
+function removeBuildQueueItemById(itemId, villageId) {
+    const vId = String(villageId || game_data?.village?.id || '');
+    const state = getBuildQueueStateApi();
+    if (!state || !itemId) return null;
+    initializeBuildQueueStateInfrastructure();
+    const result = state.removeItem(vId, String(itemId));
+    if (!result) return null;
+    showAutoHideBox('[' + getVillageName(vId) + '] ' + t('buildQueue.removedFromWaitingQueue'), false);
+    return result.record;
+}
+
 function moveBuildQueueItem(fromIndex, toIndex, villageId) {
     const vId = String(villageId || game_data?.village?.id || '');
     const state = getBuildQueueStateApi();
     if (!state) return null;
     initializeBuildQueueStateInfrastructure();
     const result = state.move(vId, fromIndex, toIndex);
+    return result?.record || null;
+}
+
+function moveBuildQueueItemById(itemId, villageId, relation) {
+    const vId = String(villageId || game_data?.village?.id || '');
+    const state = getBuildQueueStateApi();
+    if (!state || !itemId) return null;
+    initializeBuildQueueStateInfrastructure();
+    const result = state.moveItem(vId, String(itemId), relation || {});
     return result?.record || null;
 }
 
@@ -1430,15 +1512,79 @@ async function removeFromActiveBuildQueue(build_index, villageId) {
  * @param {string|null} id - Building id to upgrade, or null to trigger a queue cleanup.
  * @param {string|number} [villageId] - Defaults to the currently loaded village.
  */
-function getQueuedBuildCost(villageId, item) {
+function resolveHeadBuildCost(villageId, item, suppliedRecord) {
     if (!item?.buildingId) return null;
+    const vId = String(villageId || game_data?.village?.id || '');
+    const record = suppliedRecord || getBuildQueueStateApi()?.get(vId) || {};
+    const persistedTargetLevel = Number(item.targetLevel) || null;
+    const officialGeneration = Number(record.official?.generation) || 0;
+    const makeDecision = function (offer, source, authoritative) {
+        if (!offer) return null;
+        const effectiveLevel = Number(offer.level);
+        const cost = {
+            wood: Number(offer.wood),
+            stone: Number(offer.stone),
+            iron: Number(offer.iron),
+            pop: Math.max(0, Number(offer.pop) || 0)
+        };
+        if (!Number.isInteger(effectiveLevel) || effectiveLevel <= 0 ||
+            ![cost.wood, cost.stone, cost.iron].every(Number.isFinite)) return null;
+        return {
+            effectiveLevel,
+            cost,
+            source,
+            authoritative: !!authoritative,
+            observedAt: Number(offer.observedAt) || Number(record.official?.fetchedAt) || 0,
+            officialGeneration,
+            persistedTargetLevel
+        };
+    };
+
+    const isCurrentMainVillage = vId === String(game_data?.village?.id || '') &&
+        !!document.querySelector?.('#building_wrapper') && !!document.querySelector?.('#buildings');
+    if (isCurrentMainVillage) {
+        const domOffer = getServerBuildCost(document, item.buildingId);
+        const decision = makeDecision(Object.assign({}, domOffer, { observedAt: Date.now() }), 'SERVER_DOM', true);
+        if (decision) {
+            updateCachedBuildCost(item.buildingId, Object.assign({ level: decision.effectiveLevel }, decision.cost));
+            return decision;
+        }
+    }
+
+    const officialAge = Date.now() - Number(record.official?.fetchedAt || 0);
+    const offer = record.official?.nextBuildOffers?.[item.buildingId];
+    const offerAge = Date.now() - Number(offer?.observedAt || 0);
+    if (offer && officialAge >= 0 && officialAge <= 15000 && offerAge >= 0 && offerAge <= 15000) {
+        const decision = makeDecision(offer, 'SERVER_OBSERVATION', true);
+        if (decision) {
+            updateCachedBuildCost(item.buildingId, Object.assign({ level: decision.effectiveLevel }, decision.cost));
+            return decision;
+        }
+    }
+
     try {
         const allBuildingsData = JSON.parse(localStorage.getItem('buildings_data') || '{}');
-        const targetLevel = Number(item.targetLevel) || getNextBuildLevel(item.buildingId, villageId, false);
-        return allBuildingsData[item.buildingId]?.[targetLevel] || null;
+        if (officialAge >= 0 && officialAge <= 15000 &&
+            Number.isFinite(Number(record.official?.currentLevels?.[item.buildingId]))) {
+            const currentLevel = Number(record.official.currentLevels[item.buildingId]);
+            const activeCount = (record.official.queue || []).filter(function (buildingId) {
+                return String(buildingId).replace(/\d+/g, '') === item.buildingId;
+            }).length;
+            const effectiveLevel = currentLevel + activeCount + 1;
+            const cached = allBuildingsData[item.buildingId]?.[effectiveLevel];
+            const decision = makeDecision(Object.assign({ level: effectiveLevel }, cached), 'DERIVED_OFFICIAL_LEVEL_CACHE_COST', true);
+            if (decision) return decision;
+        }
+        const fallbackLevel = persistedTargetLevel || getNextBuildLevel(item.buildingId, vId, false);
+        const fallback = allBuildingsData[item.buildingId]?.[fallbackLevel];
+        return makeDecision(Object.assign({ level: fallbackLevel }, fallback), 'LOCAL_TARGET_CACHE', false);
     } catch (_error) {
         return null;
     }
+}
+
+function getQueuedBuildCost(villageId, item, record) {
+    return resolveHeadBuildCost(villageId, item, record)?.cost || null;
 }
 
 function createBuildQueueCatalog(doc) {
@@ -1516,8 +1662,9 @@ function executeBuildQueueMutation(villageId, item, context = {}) {
 
     const latest = state.get(vId);
     const latestHead = latest.queue[0];
-    const cost = getQueuedBuildCost(vId, latestHead);
-    if (!latestHead || latestHead.id !== item.id || latest.official?.full || !hasEnoughForBuild(latest.resources, cost)) {
+    const costDecision = resolveHeadBuildCost(vId, latestHead, latest);
+    if (!latestHead || latestHead.id !== item.id || latest.official?.full ||
+        !costDecision?.authoritative || !hasEnoughForBuild(latest.resources, costDecision.cost)) {
         return Promise.resolve({ accepted: false, stale: true });
     }
 
@@ -1556,6 +1703,7 @@ function executeBuildQueueMutation(villageId, item, context = {}) {
                         if (vId == game_data?.village?.id) renderCachedBuildQueueWidget(true);
                         resolve(Object.assign({ accepted }, observed));
                     } catch (error) {
+                        error.afterTransmission = true;
                         reject(error);
                     }
                 },
@@ -1882,11 +2030,16 @@ function checkEarlyBuildOpportunity(villageId) {
     if (state && controller) {
         const record = state.get(vId);
         const head = record.queue[0];
-        if (!head || record.official?.full) return;
+        if (!head) return;
         const resources = buildResourceStateFromDoc(document, 'dom-event');
-        const cost = getQueuedBuildCost(vId, head);
-        if (resources && cost && hasEnoughForBuild(resources, cost)) {
+        const costDecision = resolveHeadBuildCost(vId, head, record);
+        if (resources) {
             state.updateResources(vId, resources);
+        }
+        if (resources && costDecision?.authoritative && hasEnoughForBuild(resources, costDecision.cost)) {
+            // Even when an older official snapshot said "full", new authoritative resources
+            // invalidate the resource decision. The reconcile step will independently re-check
+            // whether the slot is still blocked.
             controller.schedule(String(vId), {
                 delayMs: 0,
                 priority: window.PremiumFeaturesBackgroundScheduler?.PRIORITY?.RECONCILIATION || 2,
@@ -1939,11 +2092,14 @@ function scheduleCompletionNotification(villageId) {
         delete buildCompletionTimeoutsByVillage[vId];
         if (typeof checkAndScheduleBuildInstantFree === 'function') checkAndScheduleBuildInstantFree(vId);
         const record = getBuildQueueStateApi().get(vId);
-        if (record.queue.length && record.official?.full && record.official.nextSlotAt > Date.now()) {
+        if (record.queue.length && record.official?.nextSlotAt > Date.now()) {
             ensureBuildQueueController()?.schedule(String(vId), {
                 dueAt: record.official.nextSlotAt + BUILD_QUEUE_SLOT_MARGIN_MS,
-                state: window.BUILD_QUEUE_STATE.WAITING_SLOT,
-                reason: 'next-official-slot',
+                dueMode: window.PremiumFeaturesBackgroundScheduler?.DUE_MODE?.EARLIEST || 'EARLIEST',
+                state: record.official.full
+                    ? window.BUILD_QUEUE_STATE.WAITING_SLOT
+                    : record.execution?.state || window.BUILD_QUEUE_STATE.RECONCILING,
+                reason: record.official.full ? 'next-official-slot' : 'known-building-completion',
                 immediatePersistence: true
             });
         }
@@ -2085,29 +2241,67 @@ function installBuildQueueResourceObserver() {
     const runtime = window.PremiumFeaturesRuntimeRegistry;
     if (!runtime?.setObserver || typeof MutationObserver !== 'function') return;
     runtime.setObserver('build-queue:resources', function () {
-        const targets = ['wood', 'stone', 'iron'].map(id => document.getElementById(id)).filter(Boolean);
+        const targets = ['wood', 'stone', 'iron', 'pop_current_label', 'pop_max_label']
+            .map(id => document.getElementById(id)).filter(Boolean);
         if (!targets.length) return null;
+        const observeCurrentResources = function (reason) {
+            const vId = String(game_data?.village?.id || '');
+            const state = getBuildQueueStateApi();
+            const before = state?.get(vId);
+            const head = before?.queue?.[0];
+            if (!head) return;
+            const resources = buildResourceStateFromDoc(document, reason);
+            if (!resources) return;
+            const previous = before.resources;
+            const changed = !previous || ['wood', 'stone', 'iron', 'pop', 'popMax'].some(function (field) {
+                const left = Number(previous?.[field]);
+                const right = Number(resources?.[field]);
+                return Number.isFinite(left) !== Number.isFinite(right) || (Number.isFinite(left) && left !== right);
+            });
+            if (!changed) return;
+            state.updateResources(vId, resources);
+            const current = state.get(vId);
+            const costDecision = resolveHeadBuildCost(vId, current.queue[0], current);
+            const waitingForResources = current.execution?.state === window.BUILD_QUEUE_STATE?.WAITING_RESOURCES ||
+                current.execution?.state === window.BUILD_QUEUE_STATE?.WAITING_POPULATION;
+            const enoughNow = costDecision?.authoritative && hasEnoughForBuild(resources, costDecision.cost);
+            if (!enoughNow) {
+                if (!waitingForResources || !costDecision?.authoritative) return;
+                const currentDueAt = Number(current.execution?.nextDueAt) || 0;
+                const overdue = currentDueAt > 0 && currentDueAt <= Date.now();
+                const eta = current.execution?.state === window.BUILD_QUEUE_STATE?.WAITING_RESOURCES
+                    ? state.calculateResourceEta?.(vId, costDecision.cost, Date.now())
+                    : null;
+                const etaDueAt = Number(eta) > Date.now() ? Number(eta) + 350 : null;
+                const etaAdvanced = etaDueAt && (!currentDueAt || etaDueAt + 1000 < currentDueAt);
+                if (!overdue && !etaAdvanced) return;
+                ensureBuildQueueController()?.schedule(vId, {
+                    dueAt: overdue ? Date.now() : etaDueAt,
+                    priority: window.PremiumFeaturesBackgroundScheduler?.PRIORITY?.RECONCILIATION || 2,
+                    state: current.execution.state,
+                    reason: overdue ? 'resources-overdue-recovery' : 'resource-eta-advanced',
+                    dueMode: window.PremiumFeaturesBackgroundScheduler?.DUE_MODE?.REPLACE || 'REPLACE'
+                });
+                return;
+            }
+            ensureBuildQueueController()?.schedule(vId, {
+                delayMs: 0,
+                priority: window.PremiumFeaturesBackgroundScheduler?.PRIORITY?.RECONCILIATION || 2,
+                reason: 'resources-visible',
+                dueMode: window.PremiumFeaturesBackgroundScheduler?.DUE_MODE?.REPLACE || 'REPLACE'
+            });
+        };
         const observer = new MutationObserver(function () {
             runtime.setTimeout('build-queue:resource-dom-coalesce', function () {
-                const vId = String(game_data?.village?.id || '');
-                const state = getBuildQueueStateApi();
-                const record = state?.get(vId);
-                const head = record?.queue?.[0];
-                if (!head || record.execution?.state !== window.BUILD_QUEUE_STATE?.WAITING_RESOURCES) return;
-                const resources = buildResourceStateFromDoc(document, 'dom-event');
-                const cost = getQueuedBuildCost(vId, head);
-                if (!resources || !cost || !hasEnoughForBuild(resources, cost)) return;
-                state.updateResources(vId, resources);
-                ensureBuildQueueController()?.schedule(vId, {
-                    delayMs: 0,
-                    priority: window.PremiumFeaturesBackgroundScheduler?.PRIORITY?.RECONCILIATION || 2,
-                    reason: 'resources-visible'
-                });
+                observeCurrentResources('dom-event');
             }, 200, true);
         });
         targets.forEach(target => observer.observe(target, { childList: true, characterData: true, subtree: true }));
+        // MutationObserver only sees future changes. Seed the shared resource store from the DOM
+        // that already exists at installation time so a loaded page does not require F5/a repaint.
+        observeCurrentResources('dom-initial');
         return observer;
-    });
+    }, true);
 }
 
 function installBuildQueueMutationInvalidation() {

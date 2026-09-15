@@ -93,7 +93,7 @@ var default_settings_cookies = {
         show__auto_build_instant_free: false,
         show__auto_paladin_train: {
             enabled: false,
-            maxLevel: 0,
+            maxLevel: 30,
         },
         show__player_profile_stats: true,
     }
@@ -350,6 +350,24 @@ function prepareLocalStorageItems() {
                 settingsMigrated = true;
             }
         });
+    }
+
+    const paladinSetting = settings_cookies.general.show__auto_paladin_train;
+    if (!paladinSetting || typeof paladinSetting !== 'object') {
+        settings_cookies.general.show__auto_paladin_train = {
+            enabled: paladinSetting === true,
+            maxLevel: 30
+        };
+        settingsMigrated = true;
+    } else {
+        if (typeof paladinSetting.enabled !== 'boolean') {
+            paladinSetting.enabled = false;
+            settingsMigrated = true;
+        }
+        if (!Number.isInteger(Number(paladinSetting.maxLevel)) || Number(paladinSetting.maxLevel) <= 0) {
+            paladinSetting.maxLevel = 30;
+            settingsMigrated = true;
+        }
     }
 
     // Remove legacy Resource Dashboard data from older saved settings/storage.

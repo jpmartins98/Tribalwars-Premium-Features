@@ -348,14 +348,31 @@ async function runResilientTask(options) {
             triggerPremiumFeaturesHardStop(failure);
             return { status: TASK_RESULT.HARD_STOP, failure };
         }
+        if (error?.code === 'STALE_CONFIG' || error?.code === 'STALE_GENERATION') {
+            window.PremiumFeaturesDiagnostics?.record?.({
+                feature: options.feature,
+                taskKey,
+                villageId: options.villageId,
+                logicalResource: options.logicalResource,
+                method: options.method,
+                status: 'SKIPPED',
+                reason: String(error.code).toLowerCase()
+            });
+            return { status: TASK_RESULT.FAILED, failure, stale: true };
+        }
         const breakerState = breaker.recordFailure(taskKey, snapshotHash, failure);
-        if (options.mutation && (failure.timeout || failure.network)) {
+        // A mutating request may have reached and been applied by the server even when its
+        // response is a transient 5xx.  Treat the transmission result as unknown and reconcile;
+        // never turn it into an automatic retry that can duplicate the mutation.
+        if (options.mutation && (error?.afterTransmission || failure.timeout || failure.network ||
+            [500, 502, 503].includes(Number(failure.status)))) {
             const scheduler = options.scheduler || window.PremiumFeaturesBackgroundScheduler;
             if (scheduler && typeof options.reconcile === 'function') {
                 scheduler.enqueue({
                     key: 'reconcile:' + taskKey,
                     priority: scheduler.PRIORITY?.RECONCILIATION || 2,
                     dueAt: breakerState.retryAt,
+                    dueMode: scheduler.DUE_MODE?.EARLIEST || 'EARLIEST',
                     leaseKey: options.leaseKey,
                     snapshotHash,
                     run: options.reconcile

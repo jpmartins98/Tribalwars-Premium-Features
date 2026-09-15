@@ -157,6 +157,7 @@ class TestScheduler {
         this.coordination = coordination;
         this.tasks = new Map();
         this.PRIORITY = { MANUAL: 1, RECONCILIATION: 2, AUTOMATIC: 3, REFRESH: 4, HOUSEKEEPING: 5 };
+        this.DUE_MODE = { REPLACE: 'REPLACE', EARLIEST: 'EARLIEST', LATEST: 'LATEST', KEEP: 'KEEP' };
     }
     enqueue(descriptor) {
         let resolveCompletion;
@@ -171,6 +172,18 @@ class TestScheduler {
         this.tasks.delete(String(key));
         task.resolveCompletion?.({ status: 'CANCELLED' });
         return true;
+    }
+    describe(key) {
+        const task = this.tasks.get(String(key));
+        if (!task) return { taskKey: String(key), state: 'MISSING', wakeArmed: false };
+        return {
+            taskKey: String(key),
+            state: Number(task.dueAt) <= this.clock.now ? 'OVERDUE' : 'QUEUED',
+            dueAt: Number(task.dueAt),
+            wakeArmed: true,
+            wakeAt: Number(task.dueAt),
+            overdueByMs: Math.max(0, this.clock.now - Number(task.dueAt))
+        };
     }
     async runNext() {
         const entry = Array.from(this.tasks.entries())
@@ -331,8 +344,9 @@ function createSystem(options = {}) {
         inspect,
         mutate,
         getCost: options.getCost || (() => ({ wood: 100, stone: 100, iron: 100, pop: 1 })),
+        isEnabled: options.isEnabled,
         runResilientTask: makeResilience(clock),
-        editDebounceMs: 350,
+        editDebounceMs: options.editDebounceMs ?? 350,
         fallbackMs: 300000,
         slotMarginMs: 2000,
         resourceMarginMs: 2000
@@ -606,6 +620,10 @@ test('15. mutation timeout becomes UNCERTAIN and reconciles without blind retry'
         }
     });
     system.store.add('1', 'farm', 25);
+    system.store.updateOfficial('1', {
+        queue: [], levels: [], full: false, currentLevels: { farm: 25 },
+        fetchedAt: system.clock.now, source: 'official-without-offer'
+    });
     await advance(system, 350);
     await system.scheduler.runNext();
     assert.equal(system.store.get('1').execution.state, 'UNCERTAIN');
@@ -723,9 +741,277 @@ test('request metrics: 10 ADD, 10 MOVE, 5 refreshes and 3 tabs stay coalesced', 
     assert.deepEqual(moveSystem.counters, { inspections: 1, mutations: 1 });
 });
 
+test('tail edit burst preserves the executable decision and performs zero network', async () => {
+    const system = createSystem();
+    system.store.add('1', 'farm', 25);
+    for (let index = 1; index < 20; index++) system.store.add('1', 'tail-' + index, index);
+    system.store.updateOfficial('1', {
+        queue: [], levels: [], full: false, nextSlotAt: null,
+        currentLevels: { farm: 24 }, fetchedAt: system.clock.now, source: 'test'
+    });
+    system.store.updateResources('1', {
+        wood: 1, stone: 1, iron: 1, pop: 0, popMax: 100,
+        fetchedAt: system.clock.now, source: 'test'
+    });
+    system.controller.schedule('1', { dueAt: 20000, state: 'WAITING_RESOURCES', reason: 'known-eta' });
+    const before = system.store.get('1');
+    const preservedHash = before.execution.decisionHash;
+    const preservedDueAt = before.execution.nextDueAt;
+    const tailIds = before.queue.slice(-10).map(item => item.id);
+    tailIds.forEach(itemId => system.store.removeItem('1', itemId));
+    for (let index = 0; index < 10; index++) system.store.add('1', 'new-tail-' + index, index + 1);
+    await advance(system, 5000);
+    const after = system.store.get('1');
+    assert.equal(after.queue[0].id, before.queue[0].id);
+    assert.equal(after.execution.state, 'WAITING_RESOURCES');
+    assert.equal(after.execution.decisionHash, preservedHash);
+    assert.equal(after.execution.nextDueAt, preservedDueAt);
+    assert.deepEqual(system.counters, { inspections: 0, mutations: 0 });
+    assert.equal(system.scheduler.tasks.get('build-queue:reconcile:1').dueAt, preservedDueAt);
+});
+
+test('multi-second queue editing extends one quiet scope without intermediate reconciliation', async () => {
+    const system = createSystem({ editDebounceMs: 800 });
+    system.store.add('1', 'farm', 25);
+    for (let index = 0; index < 8; index++) system.store.add('1', 'tail-' + index, index + 1);
+    system.store.updateOfficial('1', {
+        queue: [], levels: [], full: false, nextSlotAt: null,
+        currentLevels: { farm: 24 }, fetchedAt: system.clock.now, source: 'test'
+    });
+    system.store.updateResources('1', {
+        wood: 1, stone: 1, iron: 1, pop: 0, popMax: 100,
+        fetchedAt: system.clock.now, source: 'test'
+    });
+    system.controller.schedule('1', { dueAt: 20000, state: 'WAITING_RESOURCES', reason: 'known-eta' });
+    const headId = system.store.get('1').queue[0].id;
+    for (let index = 0; index < 6; index++) {
+        const queue = system.store.get('1').queue;
+        const item = queue[queue.length - 1];
+        system.store.moveItem('1', item.id, { beforeItemId: queue[1].id });
+        await advance(system, 500);
+        assert.deepEqual(system.counters, { inspections: 0, mutations: 0 });
+    }
+    await advance(system, 800);
+    const after = system.store.get('1');
+    assert.equal(after.queue[0].id, headId);
+    assert.equal(after.execution.state, 'WAITING_RESOURCES');
+    assert.equal(after.execution.nextDueAt, 20000);
+    assert.deepEqual(system.counters, { inspections: 0, mutations: 0 });
+});
+
+test('stable-id MOVE and stale-view REMOVE remain local and preserve exact order', async () => {
+    const system = createSystem();
+    ['A', 'B', 'C', 'D'].forEach((buildingId, index) => system.store.add('9', buildingId, index + 1));
+    const original = system.store.get('9').queue;
+    system.store.moveItem('9', original[3].id, { beforeItemId: original[1].id });
+    assert.deepEqual(system.store.get('9').queue.map(item => item.buildingId), ['A', 'D', 'B', 'C']);
+    system.store.removeItem('9', original[1].id); // another tab removed B
+    system.store.removeItem('9', original[2].id); // stale DOM still identifies C by id
+    assert.deepEqual(system.store.get('9').queue.map(item => item.buildingId), ['A', 'D']);
+    assert.deepEqual(system.counters, { inspections: 0, mutations: 0 });
+    await system.store.compact('9');
+    const restored = createSystem({
+        clock: system.clock, storage: system.storage, sharedRecords: system.sharedRecords,
+        writes: system.writes, bus: system.bus, id: 'restored'
+    });
+    assert.deepEqual(restored.store.get('9').queue.map(item => item.buildingId), ['A', 'D']);
+});
+
+test('countdown due dispatches one mutation without reload and rearms the next occurrence', async () => {
+    const system = createSystem();
+    ['farm', 'storage', 'barracks'].forEach((buildingId, index) => system.store.add('1', buildingId, index + 1));
+    system.controller.schedule('1', { dueAt: 5000, state: 'WAITING_RESOURCES', reason: 'countdown' });
+    await advance(system, 4999);
+    assert.equal(system.counters.mutations, 0);
+    await advance(system, 1);
+    await system.scheduler.runNext();
+    assert.equal(system.counters.mutations, 1);
+    assert.equal(system.store.get('1').queue.length, 2);
+    assert.ok(system.scheduler.tasks.has('build-queue:reconcile:1'));
+});
+
+test('population shortage is distinct and always has a future wake', async () => {
+    const system = createSystem({
+        getCost: () => ({
+            effectiveLevel: 25,
+            cost: { wood: 100, stone: 100, iron: 100, pop: 20 },
+            source: 'SERVER_OBSERVATION', authoritative: true
+        }),
+        server: { queue: [], full: false, resources: { wood: 1000, stone: 1000, iron: 1000, pop: 95, popMax: 100 } }
+    });
+    system.store.add('1', 'farm', 26);
+    await advance(system, 350);
+    await system.scheduler.runNext();
+    const execution = system.store.get('1').execution;
+    assert.equal(execution.state, 'WAITING_POPULATION');
+    assert.equal(execution.reason, 'insufficient-population');
+    assert.ok(execution.nextDueAt > system.clock.now);
+    assert.equal(system.counters.mutations, 0);
+});
+
+test('transient worker exception cannot leave RECONCILING without a retry wake', async () => {
+    const system = createSystem({
+        inspect: async () => {
+            system.counters.inspections++;
+            throw new TypeError('network unavailable');
+        }
+    });
+    system.store.add('1', 'farm', 25);
+    await advance(system, 350);
+    await system.scheduler.runNext();
+    const execution = system.store.get('1').execution;
+    assert.equal(execution.state, 'SOFT_PAUSED');
+    assert.ok(execution.nextDueAt > system.clock.now);
+    assert.ok(system.scheduler.tasks.has('build-queue:reconcile:1'));
+    assert.equal(system.counters.mutations, 0);
+});
+
+test('official next offer rebases stale target metadata without changing intent identity', () => {
+    const system = createSystem();
+    system.store.add('1', 'farm', 26);
+    system.store.add('1', 'farm', 27);
+    const before = system.store.get('1');
+    const ids = before.queue.map(item => item.id);
+    system.store.updateOfficial('1', {
+        queue: [], levels: [], full: false, currentLevels: { farm: 24 },
+        nextBuildOffers: {
+            farm: { level: 25, wood: 800, stone: 900, iron: 700, pop: 5, observedAt: system.clock.now, source: 'SERVER_OBSERVATION' }
+        },
+        fetchedAt: system.clock.now, source: 'test-server'
+    });
+    const after = system.store.get('1');
+    assert.equal(after.revision, before.revision);
+    assert.ok(after.executionGeneration > before.executionGeneration);
+    assert.deepEqual(after.queue.map(item => item.id), ids);
+    assert.deepEqual(after.queue.map(item => item.targetLevel), [25, 26]);
+    assert.deepEqual(system.counters, { inspections: 0, mutations: 0 });
+});
+
+test('known building completion advances an older resource ETA without polling', async () => {
+    const system = createSystem({
+        server: {
+            queue: ['wood'], levels: [20], slots: [61000], nextSlotAt: 61000, full: false,
+            resources: {
+                wood: 0, stone: 0, iron: 0, pop: 0, popMax: 100,
+                production: { wood: 100, stone: 100, iron: 100 }, reliableUntil: 3600000
+            }
+        },
+        getCost: () => ({ wood: 1000, stone: 1000, iron: 1000, pop: 1 })
+    });
+    system.store.add('1', 'farm', 25);
+    await advance(system, 350);
+    await system.scheduler.runNext();
+    const execution = system.store.get('1').execution;
+    assert.equal(execution.state, 'WAITING_RESOURCES');
+    assert.equal(execution.nextDueAt, 63000);
+    assert.match(execution.reason, /known-production-change/);
+    assert.deepEqual(system.counters, { inspections: 1, mutations: 0 });
+});
+
+test('twenty tail MOVE operations preserve a waiting decision and generate zero network', async () => {
+    const system = createSystem();
+    system.store.add('1', 'farm', 25);
+    for (let index = 0; index < 20; index++) system.store.add('1', 'tail-' + index, index + 1);
+    system.store.updateOfficial('1', {
+        queue: [], levels: [], full: false, currentLevels: { farm: 24 },
+        fetchedAt: system.clock.now, source: 'test'
+    });
+    system.store.updateResources('1', {
+        wood: 0, stone: 0, iron: 0, pop: 0, popMax: 100,
+        fetchedAt: system.clock.now, source: 'test'
+    });
+    system.controller.schedule('1', { dueAt: 50000, state: 'WAITING_RESOURCES', reason: 'known-eta' });
+    const before = system.store.get('1');
+    const headId = before.queue[0].id;
+    for (let index = 0; index < 20; index++) {
+        const queue = system.store.get('1').queue;
+        const item = queue[1 + (index % (queue.length - 1))];
+        const anchor = queue[1 + ((index + 7) % (queue.length - 1))];
+        if (item.id !== anchor.id) system.store.moveItem('1', item.id, { beforeItemId: anchor.id });
+    }
+    await advance(system, 5000);
+    const after = system.store.get('1');
+    assert.equal(after.queue[0].id, headId);
+    assert.equal(after.execution.state, 'WAITING_RESOURCES');
+    assert.equal(after.execution.nextDueAt, 50000);
+    assert.deepEqual(system.counters, { inspections: 0, mutations: 0 });
+});
+
+test('official offer rebase moves up, moves down, and skips an already matching target', () => {
+    const system = createSystem();
+    system.store.add('1', 'barracks', 19);
+    system.store.add('1', 'barracks', 20);
+    const initial = system.store.get('1');
+    system.store.updateOfficial('1', {
+        nextBuildOffers: {
+            barracks: { level: 18, wood: 1, stone: 1, iron: 1, observedAt: system.clock.now }
+        }, fetchedAt: system.clock.now
+    });
+    const lowered = system.store.get('1');
+    assert.deepEqual(lowered.queue.map(item => item.targetLevel), [18, 19]);
+    assert.equal(lowered.revision, initial.revision);
+    const generationAfterLower = lowered.executionGeneration;
+    system.store.updateOfficial('1', {
+        nextBuildOffers: {
+            barracks: { level: 18, wood: 1, stone: 1, iron: 1, observedAt: system.clock.now }
+        }, fetchedAt: system.clock.now
+    });
+    assert.equal(system.store.get('1').executionGeneration, generationAfterLower);
+    system.store.updateOfficial('1', {
+        nextBuildOffers: {
+            barracks: { level: 20, wood: 2, stone: 2, iron: 2, observedAt: system.clock.now }
+        }, fetchedAt: system.clock.now
+    });
+    assert.deepEqual(system.store.get('1').queue.map(item => item.targetLevel), [20, 21]);
+    assert.deepEqual(system.counters, { inspections: 0, mutations: 0 });
+});
+
+test('Build Queue diagnostics explain scheduler, lease, cost, resources and interaction state locally', () => {
+    const system = createSystem();
+    system.store.add('1', 'farm', 25);
+    system.controller.schedule('1', { dueAt: 10000, state: 'WAITING_RESOURCES', reason: 'diagnostic-test' });
+    const details = system.controller.diagnostics('1');
+    assert.equal(details.villageId, '1');
+    assert.equal(details.itemId, system.store.get('1').queue[0].id);
+    assert.equal(details.executionState, 'WAITING_RESOURCES');
+    assert.equal(details.nextDueAt, 10000);
+    assert.equal(details.schedulerTaskPresent, true);
+    assert.equal(details.interactionState, 'INACTIVE');
+});
+
+test('missing authoritative offer performs one necessary inspection and never a blind mutation', async () => {
+    const system = createSystem({
+        getCost: (_villageId, head) => ({
+            effectiveLevel: head.targetLevel,
+            cost: { wood: 1, stone: 1, iron: 1, pop: 0 },
+            source: 'LOCAL_TARGET_CACHE', authoritative: false
+        })
+    });
+    system.store.add('1', 'farm', 25);
+    await advance(system, 350);
+    await system.scheduler.runNext();
+    const execution = system.store.get('1').execution;
+    assert.equal(execution.state, 'SOFT_PAUSED');
+    assert.ok(execution.nextDueAt > system.clock.now);
+    assert.deepEqual(system.counters, { inspections: 1, mutations: 0 });
+    assert.equal(system.store.get('1').queue.length, 1, 'stale target metadata cannot consume the intent');
+});
+
+test('disabled Building Queue preserves intent but restores no background task or network work', () => {
+    const system = createSystem({ isEnabled: () => false });
+    system.store.add('1', 'farm', 25);
+    system.controller.bootstrap(['1']);
+    assert.equal(system.store.get('1').queue.length, 1);
+    assert.equal(system.store.get('1').execution.reason, 'disabled');
+    assert.equal(system.scheduler.tasks.size, 0);
+    assert.deepEqual(system.counters, { inspections: 0, mutations: 0 });
+});
+
 (async () => {
     let passed = 0;
-    for (const { name, fn } of tests) {
+    const pattern = process.env.TEST_PATTERN || '';
+    const selectedTests = pattern ? tests.filter(item => item.name.includes(pattern)) : tests;
+    for (const { name, fn } of selectedTests) {
         try {
             await fn();
             passed++;

@@ -12,6 +12,13 @@ const BACKGROUND_TASK_PRIORITY = Object.freeze({
     HOUSEKEEPING: 5
 });
 
+const BACKGROUND_TASK_DUE_MODE = Object.freeze({
+    REPLACE: 'REPLACE',
+    EARLIEST: 'EARLIEST',
+    LATEST: 'LATEST',
+    KEEP: 'KEEP'
+});
+
 function deterministicSpread(key, minimumMs, maximumMs) {
     const low = Math.max(0, Math.floor(Number(minimumMs) || 0));
     const high = Math.max(low, Math.floor(Number(maximumMs) || low));
@@ -34,6 +41,7 @@ function createCooperativeScheduler(options = {}) {
     const concurrency = Math.max(1, Number(options.concurrency) || 1);
     const turnGapMs = Math.max(0, Number(options.turnGapMs) || 250);
     const interactionDeferMs = Math.max(50, Number(options.interactionDeferMs) || 500);
+    const hardStopStorageKey = options.hardStopStorageKey || 'twpf_scheduler_hard_stop_v1';
     const tasks = new Map();
     const activeTasks = new Map();
     const persistentHandlers = new Map();
@@ -41,10 +49,49 @@ function createCooperativeScheduler(options = {}) {
     let sequence = 0;
     let running = 0;
     let wakeTimer = null;
+    let wakeAt = null;
     let nextEligibleAt = 0;
     let paused = false;
     let hardStopped = false;
+    let hardStopReason = null;
     let started = false;
+
+    function record(status, details = {}) {
+        host.PremiumFeaturesDiagnostics?.record?.(Object.assign({
+            feature: 'scheduler',
+            status,
+            timestamp: now()
+        }, details));
+    }
+
+    function normalizeDueAt(value) {
+        const parsed = Number(value);
+        return Number.isFinite(parsed) ? parsed : now();
+    }
+
+    function mergeDueAt(previous, requested, mode) {
+        const next = normalizeDueAt(requested);
+        switch (mode) {
+            case BACKGROUND_TASK_DUE_MODE.REPLACE: return next;
+            case BACKGROUND_TASK_DUE_MODE.LATEST: return Math.max(previous, next);
+            case BACKGROUND_TASK_DUE_MODE.KEEP: return previous;
+            case BACKGROUND_TASK_DUE_MODE.EARLIEST:
+            default: return Math.min(previous, next);
+        }
+    }
+
+    function loadPersistedHardStop() {
+        try {
+            const raw = host.localStorage?.getItem(hardStopStorageKey);
+            if (!raw) return;
+            const persisted = JSON.parse(raw);
+            hardStopped = true;
+            paused = true;
+            hardStopReason = persisted?.reason || 'persisted-hard-stop';
+        } catch (error) {
+            console.warn('[TW Scheduler] Invalid persisted hard-stop', error);
+        }
+    }
 
     function persistentStorageKey(key) {
         return 'twpf_background_task_v1:' + String(key);
@@ -61,7 +108,8 @@ function createCooperativeScheduler(options = {}) {
             leaseKey: task.leaseKey,
             requiresCoordinator: task.requiresCoordinator,
             interactionScope: task.interactionScope,
-            generation: task.generation
+            generation: task.generation,
+            dueMode: BACKGROUND_TASK_DUE_MODE.REPLACE
         };
         const writer = host.PremiumFeaturesWriteBehind;
         if (writer) writer.set(persistentStorageKey(task.key), JSON.stringify(record));
@@ -85,7 +133,8 @@ function createCooperativeScheduler(options = {}) {
             handlerName,
             args: descriptor.args || [],
             priority: Math.min(5, Math.max(1, Number(descriptor.priority) || BACKGROUND_TASK_PRIORITY.REFRESH)),
-            dueAt: Number(descriptor.dueAt) || now(),
+            dueAt: normalizeDueAt(descriptor.dueAt),
+            dueMode: descriptor.dueMode || BACKGROUND_TASK_DUE_MODE.EARLIEST,
             leaseKey: descriptor.leaseKey || null,
             leaseTtlMs: Number(descriptor.leaseTtlMs) || 30000,
             requiresCoordinator: !!descriptor.requiresCoordinator,
@@ -94,6 +143,7 @@ function createCooperativeScheduler(options = {}) {
             persist: !!descriptor.persist,
             generation: Number(descriptor.generation) || 1,
             sequence: sequence++,
+            blockingReason: descriptor.blockingReason || null,
             promise,
             resolve: resolvePromise
         };
@@ -106,21 +156,31 @@ function createCooperativeScheduler(options = {}) {
         if (active && !descriptor.rerunWhileActive) return active.promise;
         const existing = tasks.get(key);
         if (existing) {
+            const previousDueAt = existing.dueAt;
+            const dueMode = descriptor.dueMode || BACKGROUND_TASK_DUE_MODE.EARLIEST;
             existing.run = descriptor.run || existing.run;
             existing.handlerName = descriptor.handlerName || existing.handlerName;
             existing.args = descriptor.args || existing.args;
             existing.priority = Math.min(existing.priority, Number(descriptor.priority) || existing.priority);
-            existing.dueAt = Math.min(existing.dueAt, Number(descriptor.dueAt) || now());
+            existing.dueAt = mergeDueAt(existing.dueAt, descriptor.dueAt, dueMode);
+            existing.dueMode = dueMode;
             existing.leaseKey = descriptor.leaseKey || existing.leaseKey;
             existing.requiresCoordinator = descriptor.requiresCoordinator ?? existing.requiresCoordinator;
             existing.interactionScope = descriptor.interactionScope || existing.interactionScope;
             existing.snapshotHash = descriptor.snapshotHash || existing.snapshotHash;
             existing.persist = descriptor.persist ?? existing.persist;
             existing.generation = Math.max(existing.generation + 1, Number(descriptor.generation) || 0);
+            existing.blockingReason = null;
             if (!existing.run && existing.handlerName && persistentHandlers.has(existing.handlerName)) {
                 existing.run = guard => persistentHandlers.get(existing.handlerName)(existing.args || [], guard);
             }
             persistDescriptor(existing);
+            record(previousDueAt === existing.dueAt ? 'TASK_ENQUEUE' : 'TASK_REPLACE_DUE', {
+                taskKey: key,
+                dueAt: existing.dueAt,
+                previousDueAt,
+                dueMode
+            });
             scheduleWake();
             return existing.promise;
         }
@@ -131,6 +191,7 @@ function createCooperativeScheduler(options = {}) {
         }
         tasks.set(key, task);
         persistDescriptor(task);
+        record('TASK_ENQUEUE', { taskKey: key, dueAt: task.dueAt, dueMode: task.dueMode, priority: task.priority });
         scheduleWake();
         return task.promise;
     }
@@ -141,6 +202,7 @@ function createCooperativeScheduler(options = {}) {
         tasks.delete(String(key));
         removePersistedDescriptor(String(key));
         task.resolve({ status: 'CANCELLED', reason, key: String(key) });
+        record('TASK_CANCEL', { taskKey: String(key), reason });
         scheduleWake();
         return true;
     }
@@ -156,6 +218,7 @@ function createCooperativeScheduler(options = {}) {
         if (wakeTimer === null) return;
         clock.clearTimeout(wakeTimer);
         wakeTimer = null;
+        wakeAt = null;
     }
 
     function scheduleWake() {
@@ -167,8 +230,12 @@ function createCooperativeScheduler(options = {}) {
             taskPauses.get(task.key) || 0,
             nextEligibleAt
         )));
+        wakeAt = earliestDue;
+        record('TASK_WAKE_ARMED', { dueAt: earliestDue, queued: tasks.size });
         wakeTimer = clock.setTimeout(function () {
             wakeTimer = null;
+            wakeAt = null;
+            record('TASK_WAKE_FIRED', { dueAt: earliestDue });
             pump();
         }, Math.max(0, earliestDue - timestamp));
     }
@@ -176,13 +243,17 @@ function createCooperativeScheduler(options = {}) {
     function rescheduleAfterLeaseContention(task, error) {
         const leaseExpiry = Number(error?.currentLease?.expiresAt) || now();
         task.dueAt = Math.max(now() + turnGapMs, leaseExpiry + deterministicSpread(task.key, 25, 250));
+        task.blockingReason = 'lease';
         tasks.set(task.key, task);
         persistDescriptor(task);
+        record('TASK_DEFER_LEASE', { taskKey: task.key, dueAt: task.dueAt, leaseExpiry });
     }
 
     async function execute(task) {
         tasks.delete(task.key);
         activeTasks.set(task.key, task);
+        task.blockingReason = null;
+        record('TASK_DISPATCH', { taskKey: task.key, dueAt: task.dueAt, priority: task.priority });
         const capturedGeneration = task.generation;
         try {
             let value;
@@ -207,6 +278,7 @@ function createCooperativeScheduler(options = {}) {
             if (tasks.has(task.key)) persistDescriptor(tasks.get(task.key));
             else removePersistedDescriptor(task.key);
             task.resolve({ status: 'COMPLETED', key: task.key, value });
+            record('TASK_COMPLETE', { taskKey: task.key });
         } catch (error) {
             if (error?.code === 'LEASE_UNAVAILABLE' || error?.code === 'LEASE_LOST') {
                 activeTasks.delete(task.key);
@@ -221,6 +293,7 @@ function createCooperativeScheduler(options = {}) {
                 if (tasks.has(task.key)) persistDescriptor(tasks.get(task.key));
                 else removePersistedDescriptor(task.key);
                 task.resolve({ status: 'FAILED', key: task.key, error });
+                record('TASK_ERROR', { taskKey: task.key, reason: error?.message || String(error) });
                 console.error('[TW Scheduler] Task failed:', task.key, error);
             }
         } finally {
@@ -243,7 +316,9 @@ function createCooperativeScheduler(options = {}) {
             let task = candidates[0];
             if (task.interactionScope && runtime?.isInteractionActive?.(task.interactionScope)) {
                 task.dueAt = timestamp + interactionDeferMs;
+                task.blockingReason = 'interaction';
                 persistDescriptor(task);
+                record('TASK_DEFER_INTERACTION', { taskKey: task.key, dueAt: task.dueAt, interactionScope: task.interactionScope });
                 const alternative = candidates.find(candidate => candidate !== task &&
                     (!candidate.interactionScope || !runtime?.isInteractionActive?.(candidate.interactionScope)));
                 if (!alternative) break;
@@ -261,9 +336,11 @@ function createCooperativeScheduler(options = {}) {
         clearWake();
     }
 
-    function resume() {
+    function resume(reason = 'resume') {
         if (hardStopped) return;
         paused = false;
+        const overdue = Array.from(tasks.values()).filter(task => task.dueAt <= now()).length;
+        if (overdue) record('TASK_OVERDUE_RESUME', { reason, overdue });
         scheduleWake();
     }
 
@@ -275,8 +352,22 @@ function createCooperativeScheduler(options = {}) {
     function hardStop(reason) {
         hardStopped = true;
         paused = true;
+        hardStopReason = reason || 'hard-stop';
+        try {
+            host.localStorage?.setItem(hardStopStorageKey, JSON.stringify({ reason: hardStopReason, stoppedAt: now() }));
+        } catch (error) {
+            console.warn('[TW Scheduler] Failed to persist hard-stop', error);
+        }
         clearWake();
         return reason;
+    }
+
+    function clearHardStop() {
+        hardStopped = false;
+        paused = false;
+        hardStopReason = null;
+        try { host.localStorage?.removeItem(hardStopStorageKey); } catch (_error) { /* manual recovery remains in memory */ }
+        scheduleWake();
     }
 
     function registerHandler(name, handler) {
@@ -303,24 +394,70 @@ function createCooperativeScheduler(options = {}) {
     function start() {
         if (started) return;
         started = true;
+        loadPersistedHardStop();
         if (runtime) {
             runtime.addEventListener('scheduler:visibility', host.document, 'visibilitychange', function () {
-                if (host.document.hidden) pause();
-                else resume();
+                // Hidden documents may still execute JavaScript. Visibility is only a useful
+                // resume signal; background automation must not be globally paused here.
+                if (!host.document.hidden) resume('visibility');
             });
-            runtime.addEventListener('scheduler:pageshow', host, 'pageshow', resume);
-            runtime.addEventListener('scheduler:online', host, 'online', resume);
+            runtime.addEventListener('scheduler:pageshow', host, 'pageshow', function () { resume('pageshow'); });
+            runtime.addEventListener('scheduler:online', host, 'online', function () { resume('online'); });
+            runtime.onInteractionChange?.(function (scope, active) {
+                if (active) return;
+                let changed = false;
+                tasks.forEach(function (task) {
+                    if (task.interactionScope !== scope || task.blockingReason !== 'interaction') return;
+                    task.dueAt = Math.min(task.dueAt, now());
+                    task.blockingReason = null;
+                    persistDescriptor(task);
+                    record('TASK_REARM', { taskKey: task.key, reason: 'interaction-ended', dueAt: task.dueAt });
+                    changed = true;
+                });
+                if (changed) scheduleWake();
+            });
         }
         restorePersistedTasks();
         scheduleWake();
     }
 
+    function describe(key) {
+        const stringKey = String(key);
+        const active = activeTasks.get(stringKey);
+        if (active) return { taskKey: stringKey, state: 'RUNNING', running: true, dueAt: active.dueAt, hardStopped, hardStopReason };
+        const task = tasks.get(stringKey);
+        if (!task) return { taskKey: stringKey, state: hardStopped ? 'HARD_STOP' : 'MISSING', hardStopped, hardStopReason };
+        const timestamp = now();
+        let state = task.blockingReason === 'lease' ? 'WAITING_LEASE' :
+            task.blockingReason === 'interaction' ? 'DEFERRED' :
+                task.dueAt <= timestamp ? 'OVERDUE' : 'QUEUED';
+        if (hardStopped) state = 'HARD_STOP';
+        return {
+            taskKey: stringKey,
+            state,
+            dueAt: task.dueAt,
+            overdueByMs: Math.max(0, timestamp - task.dueAt),
+            blockingReason: task.blockingReason,
+            wakeArmed: wakeTimer !== null,
+            wakeAt,
+            hardStopped,
+            hardStopReason
+        };
+    }
+
+    function hasPendingHigherPriority(priorityValue) {
+        const threshold = Number(priorityValue) || BACKGROUND_TASK_PRIORITY.HOUSEKEEPING;
+        return Array.from(tasks.values()).some(task => task.priority < threshold && task.dueAt <= now()) ||
+            Array.from(activeTasks.values()).some(task => task.priority < threshold);
+    }
+
     function stats() {
-        return { started, queued: tasks.size, running, paused, hardStopped, wakeTimerActive: wakeTimer !== null };
+        return { started, queued: tasks.size, running, paused, hardStopped, hardStopReason, wakeTimerActive: wakeTimer !== null, wakeAt };
     }
 
     const api = {
         PRIORITY: BACKGROUND_TASK_PRIORITY,
+        DUE_MODE: BACKGROUND_TASK_DUE_MODE,
         enqueue,
         cancel,
         pump,
@@ -328,9 +465,12 @@ function createCooperativeScheduler(options = {}) {
         resume,
         pauseTask,
         hardStop,
+        clearHardStop,
         registerHandler,
         restorePersistedTasks,
         start,
+        describe,
+        hasPendingHigherPriority,
         stats
     };
     if (options.autoStart !== false) start();
@@ -351,6 +491,9 @@ function registerTimeoutHandler(name, fn) {
 // core_utils loads before the scheduler so it cannot register this handler at evaluation time.
 if (typeof runKeepAwakeCheck === 'function') {
     registerTimeoutHandler('keepAwakeCheck', runKeepAwakeCheck);
+    if (typeof runKeepAwakeConfirmation === 'function') {
+        registerTimeoutHandler('keepAwakeConfirmation', runKeepAwakeConfirmation);
+    }
 }
 
 function timeoutGenerationKey(id) {
@@ -395,7 +538,9 @@ function getPersistentTaskPolicy(id, args) {
     if (match) return { priority: BACKGROUND_TASK_PRIORITY.AUTOMATIC, requiresCoordinator: true, leaseKey: 'build-instant:' + match[1] };
     if (id === 'auto_trainer_paladin') return { priority: BACKGROUND_TASK_PRIORITY.AUTOMATIC, requiresCoordinator: true, leaseKey: 'paladin' };
     if (id === 'daily_bonus') return { priority: BACKGROUND_TASK_PRIORITY.AUTOMATIC, requiresCoordinator: true, leaseKey: 'daily-bonus' };
-    if (id === 'keep-awake') return { priority: BACKGROUND_TASK_PRIORITY.HOUSEKEEPING, requiresCoordinator: true, leaseKey: 'keep-awake' };
+    if (id === 'keep-awake' || id === 'keep-awake-confirm') {
+        return { priority: BACKGROUND_TASK_PRIORITY.HOUSEKEEPING, requiresCoordinator: true, leaseKey: 'keep-awake' };
+    }
     if (String(id).startsWith('scavenging')) {
         const villageId = args?.[0] || window.game_data?.village?.id || 'unknown';
         return { priority: BACKGROUND_TASK_PRIORITY.AUTOMATIC, requiresCoordinator: true, leaseKey: 'scavenging:' + villageId };
@@ -476,6 +621,8 @@ function dispatchPersistedTimeout(id, generation, endTime) {
     BackgroundScheduler.enqueue({
         key: 'persistent-timeout:' + id,
         priority: policy.priority,
+        dueAt: endTime,
+        dueMode: BackgroundScheduler.DUE_MODE?.REPLACE || 'REPLACE',
         requiresCoordinator: policy.requiresCoordinator,
         leaseKey: policy.leaseKey,
         generation,

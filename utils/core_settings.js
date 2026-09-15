@@ -494,7 +494,6 @@ function createTabContent(groupName, index) {
 
     // Filter and build rows
     availableSettings.forEach(setting => {
-        if (!window.PremiumFeaturesPrivateAutomations && setting.name === 'show__auto_paladin_train') return;
         if (!currentGroup.includes(setting.name)) return;
 
         // 1. Create Main Setting Row
@@ -935,4 +934,3 @@ function getSettingsGroups() {
 
     return groups;
 }
-

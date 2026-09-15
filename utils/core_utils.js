@@ -62,9 +62,27 @@ function _keepAwakeLeaseActive() {
         lease.instanceId === coordinator.instanceId && lease.expiresAt > Date.now());
 }
 
+function _deferKeepAwakeForLease(handlerName, minutes) {
+    const coordinator = window.PremiumFeaturesCoordination;
+    const lease = coordinator?.readLease?.('keep-awake');
+    const dueAt = Math.max(Date.now() + 1000, Number(lease?.expiresAt) + 50 || 0);
+    setHandlerOnTimeOut(
+        handlerName === 'keepAwakeConfirmation' ? 'keep-awake-confirm' : 'keep-awake',
+        handlerName,
+        [Number(minutes) || 8],
+        dueAt - Date.now()
+    );
+    window.PremiumFeaturesDiagnostics?.record?.({
+        feature: 'keep-awake', taskKey: 'keep-awake', status: 'LEASE',
+        reason: 'lease-deferred', dueAt
+    });
+    return { status: 'WAITING_LEASE', dueAt };
+}
+
 function scheduleKeepAwakeCheck(minutes = 8) {
     if (!settings_cookies?.general?.keep_awake) {
         if (typeof clearPersistedTimeout === 'function') clearPersistedTimeout('keep-awake');
+        if (typeof clearPersistedTimeout === 'function') clearPersistedTimeout('keep-awake-confirm');
         return { status: 'DISABLED' };
     }
     const thresholdMs = Math.max(1, Number(minutes) || 8) * 60 * 1000;
@@ -79,18 +97,32 @@ async function runKeepAwakeCheck(minutes = 8) {
         if (typeof clearPersistedTimeout === 'function') clearPersistedTimeout('keep-awake');
         return { status: 'DISABLED' };
     }
-    if (!_keepAwakeLeaseActive()) return { status: 'LEASE_LOST' };
+    if (!_keepAwakeLeaseActive()) return _deferKeepAwakeForLease('keepAwakeCheck', minutes);
     const thresholdMs = Math.max(1, Number(minutes) || 8) * 60 * 1000;
     if ((Number(TribalWars?.getIdleTime?.()) || 0) < thresholdMs) {
         return scheduleKeepAwakeCheck(minutes);
     }
     showAutoHideBox(t('core.inactivityReload'));
-    await wait(5);
-    if (!_keepAwakeLeaseActive()) return { status: 'LEASE_LOST' };
-    // Recheck after the notice: local activity may have reset the game's own idle counter.
+    setHandlerOnTimeOut('keep-awake-confirm', 'keepAwakeConfirmation', [Number(minutes) || 8], 5000);
+    return { status: 'CONFIRMATION_SCHEDULED', dueAt: Date.now() + 5000 };
+}
+
+async function runKeepAwakeConfirmation(minutes = 8) {
+    if (!settings_cookies?.general?.keep_awake) {
+        if (typeof clearPersistedTimeout === 'function') clearPersistedTimeout('keep-awake-confirm');
+        return { status: 'DISABLED' };
+    }
+    if (!_keepAwakeLeaseActive()) return _deferKeepAwakeForLease('keepAwakeConfirmation', minutes);
+    const thresholdMs = Math.max(1, Number(minutes) || 8) * 60 * 1000;
     if ((Number(TribalWars?.getIdleTime?.()) || 0) < thresholdMs) {
         return scheduleKeepAwakeCheck(minutes);
     }
+    const scheduler = window.PremiumFeaturesBackgroundScheduler;
+    if (scheduler?.hasPendingHigherPriority?.(scheduler.PRIORITY?.HOUSEKEEPING || 5)) {
+        setHandlerOnTimeOut('keep-awake-confirm', 'keepAwakeConfirmation', [Number(minutes) || 8], 5000);
+        return { status: 'DEFERRED_FOR_BACKGROUND_WORK', dueAt: Date.now() + 5000 };
+    }
+    if (!_keepAwakeLeaseActive()) return _deferKeepAwakeForLease('keepAwakeConfirmation', minutes);
     location.reload();
     return { status: 'RELOADING' };
 }
@@ -158,12 +190,24 @@ function start() {
                 Promise.resolve().then(run).catch(error => console.error('[TW] Background task failed:', key, error));
             }
         };
-        registerBackground('world-settings-and-map-data', async function (guard) {
+        registerBackground('world-settings', async function (guard) {
             guard?.assertActive?.();
             await fetchAndCacheWorldSettings();
-            guard?.assertActive?.();
-            await updateAllMapData();
         }, { priority: BACKGROUND_TASK_PRIORITY.REFRESH, leaseKey: 'world-data-refresh' });
+        // Map dumps remain independently TTL-gated.  Their pacing is represented as future
+        // cooperative occurrences so the scheduler slot is free while merely waiting.
+        registerBackground('map-villages', function (guard) {
+            guard?.assertActive?.();
+            return updateMapInfoVillages();
+        }, { priority: BACKGROUND_TASK_PRIORITY.REFRESH, leaseKey: 'world-data-refresh', delayMs: 0 });
+        registerBackground('map-players', function (guard) {
+            guard?.assertActive?.();
+            return updateMapInfoPlayers();
+        }, { priority: BACKGROUND_TASK_PRIORITY.REFRESH, leaseKey: 'world-data-refresh', delayMs: 1000 });
+        registerBackground('map-allies', function (guard) {
+            guard?.assertActive?.();
+            return updateMapInfoAllies();
+        }, { priority: BACKGROUND_TASK_PRIORITY.REFRESH, leaseKey: 'world-data-refresh', delayMs: 2000 });
         prepareVillageList();
         villageList = localStorage.getItem('villages_info') ? JSON.parse(localStorage.getItem('villages_info')) : [];
         settings_cookies = localStorage.getItem('settings_cookies') ? JSON.parse(localStorage.getItem('settings_cookies')) : settings_cookies;
@@ -290,6 +334,7 @@ function start() {
         } else if (runtime) {
             runtime.clearInterval('keep-awake:check');
             if (typeof clearPersistedTimeout === 'function') clearPersistedTimeout('keep-awake');
+            if (typeof clearPersistedTimeout === 'function') clearPersistedTimeout('keep-awake-confirm');
         }
 
         const table = $("#overviewtable");
