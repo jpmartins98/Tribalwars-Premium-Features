@@ -109,14 +109,15 @@ const installedSource = requires.map(relativePath => {
 }).join('') + '\n// source: main.user.js\n' + main;
 vm.runInContext(installedSource, context, { filename: 'installed-userscript.js' });
 assert.ok(context.PremiumFeaturesRuntimeRegistry, 'runtime registry was not installed');
-const bootTimer = timers.find(timer => timer.delay === 500);
-assert.ok(bootTimer, 'main boot timer was not armed');
+assert.ok(context.PremiumFeaturesBootLifecycle, 'main boot lifecycle was not installed');
 
 (async function () {
-    bootTimer.fn();
-    for (let round = 0; round < 50; round++) await Promise.resolve();
+    context.PremiumFeaturesBootLifecycle.bootNow();
+    for (let round = 0; round < 80; round++) await Promise.resolve();
     assert.equal(context.PremiumFeaturesRuntimeRegistry.stats().claimedFeatures, 1, 'start() did not claim its lifecycle');
     assert.equal(bootErrors.some(args => String(args[0]).includes('[TW] Boot failed')), false, 'boot lifecycle threw before UI setup completed');
+    assert.ok(context.PremiumFeaturesDiagnostics.getEntries().some(entry => entry.status === 'BOOT_UI_MOUNT'),
+        'early TWPF UI mount was not diagnosed');
     console.log('ok - browser userscript graph evaluated and completed its boot lifecycle');
 })().catch(error => {
     console.error(error);

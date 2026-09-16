@@ -1063,11 +1063,15 @@ function injectScavengeConfigPanel() {
     function refreshAutomationStatus() {
         const saved = getScavengeConfig();
         const dueAt = Number(localStorage.getItem('endTime_' + _scavengingTimerId())) || 0;
-        statusCell.textContent = saved.enabled
-            ? t('scavenge.statusActive') + (dueAt > Date.now()
+        if (saved.enabled) {
+            statusCell.textContent = t('scavenge.statusActive') + (dueAt > Date.now()
                 ? ' · ' + t('scavenge.nextRunAt', { time: new Date(dueAt).toLocaleTimeString() })
-                : '')
-            : t('scavenge.statusOff');
+                : '');
+        } else {
+            statusCell.textContent = enableCheckbox.checked
+                ? t('scavenge.statusPendingEnable')
+                : t('scavenge.statusOff');
+        }
     }
     refreshAutomationStatus();
 

@@ -150,13 +150,14 @@ var currentVillageIndex;
  * Initialises required localStorage keys with defaults and migrates saved settings
  * to include any new keys added since the user last saved.
  */
-function prepareLocalStorageItems() {
+function prepareLocalStorageItems(options = {}) {
     if (unsafeWindow.lang) {
         safeLocalStorageSet('tw_lang', JSON.stringify(unsafeWindow.lang));
     }
 
-    bqSet('waiting_for_queue', undefined, bqGet('waiting_for_queue') ?? {});
-    bqSet('building_queue', undefined, bqGet('building_queue') ?? []);
+    // The per-village IndexedDB mirror must be hydrated before any bqGet/bqSet access. Settings
+    // and other synchronous defaults can safely be prepared earlier for a fast UI shell.
+    if (!options.skipBuildQueue) prepareBuildQueueStorageDefaults();
     safeLocalStorageSet('villages_info', localStorage.getItem('villages_info') ?? '[]');
     safeLocalStorageSet('full_storage_times', localStorage.getItem('full_storage_times') ?? '[]');
     safeLocalStorageSet('mapConfig', localStorage.getItem('mapConfig') ?? '{}');
@@ -408,6 +409,11 @@ function prepareLocalStorageItems() {
         // Store on Tampermonkey storage
         GM_setValue("current_world", game_data?.world);
     }
+}
+
+function prepareBuildQueueStorageDefaults() {
+    bqSet('waiting_for_queue', undefined, bqGet('waiting_for_queue') ?? {});
+    bqSet('building_queue', undefined, bqGet('building_queue') ?? []);
 }
 
 /**

@@ -89,6 +89,40 @@ function setWidgetLoading(container, isLoading, minHeight = '44px') {
 }
 
 /**
+ * Updates a widget without replacing its outer node. The stable root prevents an asynchronous
+ * refresh from creating a visible remove/insert gap and keeps the widget's layout position and
+ * collapsed state intact.
+ */
+function patchExistingWidget(currentElement, replacement, contents, elemName, title, description, loading) {
+    if (!currentElement) return null;
+    const currentContent = document.getElementById('widget_content_' + elemName);
+    const currentHeader = Array.from(currentElement.children || []).find(function (child) {
+        return String(child.tagName || '').toLowerCase() === 'h4';
+    });
+    if (!currentContent || !currentHeader) {
+        currentElement.replaceWith(replacement);
+        return replacement;
+    }
+
+    currentElement.className = replacement.className;
+    currentElement.setAttribute('data-title', description || title);
+    const headerButton = document.getElementById('mini_' + elemName);
+    const titleNodes = Array.from(currentHeader.childNodes || []).filter(function (node) {
+        return node !== headerButton && node.nodeType === 3;
+    });
+    if (titleNodes.length) {
+        titleNodes[0].textContent = title;
+        titleNodes.slice(1).forEach(function (node) { currentHeader.removeChild(node); });
+    } else {
+        currentHeader.insertBefore(document.createTextNode(title), headerButton || currentHeader.firstChild || null);
+    }
+    currentHeader.setAttribute('data-title', description || title);
+    currentContent.replaceChildren(contents);
+    currentContent.setAttribute('aria-busy', String(loading));
+    return currentElement;
+}
+
+/**
  * Builds a collapsible widget container and inserts it into the specified column
  * at the position saved in settings_cookies. Replaces the existing widget if update is true.
  * @param {Object} options
@@ -150,10 +184,22 @@ function createWidgetElement({ identifier, contents, columnToUse, update, extra_
         contentDiv.appendChild(contents);
         containerDiv.appendChild(header);
         containerDiv.appendChild(contentDiv);
-        // A partial reload may reconcile the same logical widget again. Replace by stable id
-        // regardless of the caller's update flag so no duplicate UI can survive.
+        // A partial reload may reconcile the same logical widget again. Patch the existing root
+        // in place so no duplicate UI survives and async refreshes never expose a blank interval.
         var currentElement = document.getElementById('show_' + elemName);
-        if (currentElement) currentElement.remove();
+        if (currentElement) {
+            const patched = patchExistingWidget(
+                currentElement,
+                containerDiv,
+                contents,
+                elemName,
+                title,
+                description,
+                loading
+            );
+            if (patched.parentNode !== columnElement) columnElement.appendChild(patched);
+            return patched;
+        }
 
         // Insert at the saved position if valid, otherwise append to the column
         var widgetIndex = settings_cookies.widgets.find(widget => widget.name === elemName).pos;
@@ -164,8 +210,10 @@ function createWidgetElement({ identifier, contents, columnToUse, update, extra_
         } else {
             columnElement.appendChild(containerDiv);
         }
+        return containerDiv;
     }
 
+    return null;
 }
 
 /**

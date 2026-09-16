@@ -194,20 +194,32 @@ function start() {
             guard?.assertActive?.();
             await fetchAndCacheWorldSettings();
         }, { priority: BACKGROUND_TASK_PRIORITY.REFRESH, leaseKey: 'world-data-refresh' });
-        // Map dumps remain independently TTL-gated.  Their pacing is represented as future
-        // cooperative occurrences so the scheduler slot is free while merely waiting.
-        registerBackground('map-villages', function (guard) {
-            guard?.assertActive?.();
-            return updateMapInfoVillages();
-        }, { priority: BACKGROUND_TASK_PRIORITY.REFRESH, leaseKey: 'world-data-refresh', delayMs: 0 });
-        registerBackground('map-players', function (guard) {
-            guard?.assertActive?.();
-            return updateMapInfoPlayers();
-        }, { priority: BACKGROUND_TASK_PRIORITY.REFRESH, leaseKey: 'world-data-refresh', delayMs: 1000 });
-        registerBackground('map-allies', function (guard) {
-            guard?.assertActive?.();
-            return updateMapInfoAllies();
-        }, { priority: BACKGROUND_TASK_PRIORITY.REFRESH, leaseKey: 'world-data-refresh', delayMs: 2000 });
+        // Map player/ally TTL checks consult the hydrated raw cache. Register these jobs only
+        // after that feature-specific hydration settles; otherwise a slow cache load would look
+        // like a cache miss and create redundant GETs. The scheduler slot is not held meanwhile.
+        const registerMapBackground = function () {
+            if ((runtime?.currentGeneration?.() || 1) !== startGeneration) return;
+            registerBackground('map-villages', function (guard) {
+                guard?.assertActive?.();
+                return updateMapInfoVillages();
+            }, { priority: BACKGROUND_TASK_PRIORITY.REFRESH, leaseKey: 'world-data-refresh', delayMs: 0 });
+            registerBackground('map-players', function (guard) {
+                guard?.assertActive?.();
+                return updateMapInfoPlayers();
+            }, { priority: BACKGROUND_TASK_PRIORITY.REFRESH, leaseKey: 'world-data-refresh', delayMs: 1000 });
+            registerBackground('map-allies', function (guard) {
+                guard?.assertActive?.();
+                return updateMapInfoAllies();
+            }, { priority: BACKGROUND_TASK_PRIORITY.REFRESH, leaseKey: 'world-data-refresh', delayMs: 2000 });
+        };
+        const mapHydration = window.PremiumFeaturesHydration?.mapData;
+        if (mapHydration?.status === 'PENDING' && mapHydration.promise) {
+            mapHydration.promise.then(registerMapBackground).catch(function (error) {
+                console.error('[TW] Could not register map refresh work', error);
+            });
+        } else {
+            registerMapBackground();
+        }
         prepareVillageList();
         villageList = localStorage.getItem('villages_info') ? JSON.parse(localStorage.getItem('villages_info')) : [];
         settings_cookies = localStorage.getItem('settings_cookies') ? JSON.parse(localStorage.getItem('settings_cookies')) : settings_cookies;
@@ -321,7 +333,7 @@ function start() {
         insertListVillagesPopup();
         injectNavigationBar();
         defineKeyboardShortcuts();
-        injectScriptSettingsPopUp();
+        if (!document.getElementById('settings_popup')) injectScriptSettingsPopUp();
         if (typeof registerWidgetPopupSidebarShortcuts === 'function') registerWidgetPopupSidebarShortcuts();
 
         if (settings_cookies.general['keep_awake']) {

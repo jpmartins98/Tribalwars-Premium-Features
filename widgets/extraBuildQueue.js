@@ -914,7 +914,11 @@ function injectAtiveQueueList(queueBuildIdsActive, buildQueueElment, villageId, 
                     t('buildQueue.cancelConfirm', { name: escapeHtml(buildingName) }),
                     [{
                         text: t('button.ok'),
-                        callback: function () { removeFromActiveBuildQueue(index, vId).then(() => { if (onAction) onAction(); }); },
+                        callback: function () {
+                            removeFromActiveBuildQueue(index, vId).then(function (result) {
+                                if ((result?.status === 'CONFIRMED_SUCCESS' || result?.status === 'APPLIED') && onAction) onAction();
+                            });
+                        },
                         confirm: true
                     }],
                     'tw_cancel_active_build_' + index,
@@ -1465,9 +1469,24 @@ function removeFromBuildQueueLegacy(build_index, villageId) {
  */
 async function removeFromActiveBuildQueue(build_index, villageId) {
     const vId = villageId || game_data?.village?.id;
-    const cancelIds = bqGet('queue_cancelIds', vId);
+    const cancelIds = bqGet('queue_cancelIds', vId) || [];
+    const targetCancelId = String(cancelIds[build_index] || '');
+    if (!targetCancelId) return { status: 'CONFIRMED_FAILURE', reason: 'missing-cancel-id' };
+    const uncertainKey = 'twpf_cancel_uncertain:' + String(vId) + ':' + targetCancelId;
+    if (localStorage.getItem(uncertainKey)) {
+        const priorResolution = await reconcileUncertainBuildCancel(targetCancelId, vId);
+        if (priorResolution !== 'UNKNOWN') localStorage.removeItem(uncertainKey);
+        if (priorResolution === 'APPLIED' && String(vId) === String(game_data?.village?.id)) {
+            renderCachedBuildQueueWidget(true);
+        }
+        return { status: priorResolution, uncertain: priorResolution === 'UNKNOWN' };
+    }
     try {
-        const cancelResponse = await callRemoveFromActiveBuildingQueue(cancelIds[build_index], vId);
+        // Persist the transmission boundary before sending: a reload during an in-flight
+        // cancellation must reconcile, never offer a duplicate cancel as a fresh action.
+        localStorage.setItem(uncertainKey, JSON.stringify({ at: Date.now(), targetCancelId, phase: 'transmitting' }));
+        await callRemoveFromActiveBuildingQueue(targetCancelId, vId);
+        localStorage.removeItem(uncertainKey);
 
         var building_active_queue = bqGet('building_queue_active', vId);
         building_active_queue.splice(build_index, 1);
@@ -1498,9 +1517,58 @@ async function removeFromActiveBuildQueue(build_index, villageId) {
         } else {
             fetchBuildQueueWidget(true);
         }
+        showAutoHideBox('[' + getVillageName(vId) + '] ' + t('buildQueue.activeBuildCancelled'), false);
+        return { status: 'CONFIRMED_SUCCESS' };
     } catch (error) {
+        if (error?.code === 'CANCEL_UNCERTAIN') {
+            localStorage.setItem(uncertainKey, JSON.stringify({ at: Date.now(), targetCancelId }));
+            window.PremiumFeaturesDiagnostics?.record?.({
+                feature: 'build-queue',
+                taskKey: 'cancel-build:' + vId + ':' + targetCancelId,
+                villageId: String(vId),
+                logicalResource: 'village-main:' + vId,
+                method: 'POST',
+                status: 'UNCERTAIN',
+                reason: error.reason || 'cancel-outcome-unknown'
+            });
+            const resolution = await reconcileUncertainBuildCancel(targetCancelId, vId);
+            if (resolution !== 'UNKNOWN') localStorage.removeItem(uncertainKey);
+            if (resolution === 'APPLIED') {
+                showAutoHideBox('[' + getVillageName(vId) + '] ' + t('buildQueue.activeBuildCancelled'), false);
+                const state = getBuildQueueStateApi();
+                if (state?.get(vId)?.queue?.length) ensureBuildQueueController()?.schedule(String(vId), {
+                    delayMs: BUILD_QUEUE_EDIT_DEBOUNCE_MS,
+                    priority: window.PremiumFeaturesBackgroundScheduler?.PRIORITY?.MANUAL || 1,
+                    reason: 'manual-slot-change-reconciled'
+                });
+                if (String(vId) === String(game_data?.village?.id)) renderCachedBuildQueueWidget(true);
+                return { status: 'APPLIED', reconciled: true };
+            }
+            showAutoHideBox('[' + getVillageName(vId) + '] ' + t('buildQueue.cancelOutcomeUncertain'), true);
+            return { status: resolution, uncertain: resolution === 'UNKNOWN' };
+        }
+        localStorage.removeItem(uncertainKey);
         showAutoHideBox('[' + getVillageName(vId) + '] ' + t('buildQueue.errorRemoving'), error);
         console.error('Error removing building:', error);
+        return { status: 'CONFIRMED_FAILURE', error };
+    }
+}
+
+async function reconcileUncertainBuildCancel(targetCancelId, villageId) {
+    const vId = String(villageId || game_data?.village?.id || '');
+    try {
+        const result = await fetchVillageMainPage(vId);
+        if (!result?.doc?.querySelector?.('#building_wrapper')) return 'UNKNOWN';
+        const official = result?.buildStateObservation?.official || getBuildQueueStateApi()?.get(vId)?.official;
+        if (!official || !Array.isArray(official.cancelIds)) return 'UNKNOWN';
+        return official.cancelIds.map(String).includes(String(targetCancelId)) ? 'NOT_APPLIED' : 'APPLIED';
+    } catch (error) {
+        window.PremiumFeaturesDiagnostics?.record?.({
+            feature: 'build-queue', taskKey: 'cancel-build:' + vId + ':' + targetCancelId,
+            villageId: vId, logicalResource: 'village-main:' + vId, method: 'GET',
+            status: 'SOFT_PAUSE', reason: 'cancel-reconcile-failed'
+        });
+        return 'UNKNOWN';
     }
 }
 
@@ -1572,7 +1640,9 @@ function resolveHeadBuildCost(villageId, item, suppliedRecord) {
             }).length;
             const effectiveLevel = currentLevel + activeCount + 1;
             const cached = allBuildingsData[item.buildingId]?.[effectiveLevel];
-            const decision = makeDecision(Object.assign({ level: effectiveLevel }, cached), 'DERIVED_OFFICIAL_LEVEL_CACHE_COST', true);
+            // The level is derived from official state, but the price still comes from the local
+            // buildings_data cache. It is useful for display/ETA only and can never authorize POST.
+            const decision = makeDecision(Object.assign({ level: effectiveLevel }, cached), 'DERIVED_OFFICIAL_LEVEL_CACHE_COST', false);
             if (decision) return decision;
         }
         const fallbackLevel = persistedTargetLevel || getNextBuildLevel(item.buildingId, vId, false);
@@ -1860,6 +1930,21 @@ function callRemoveFromActiveBuildingQueue(idToRemove, villageId) {
     const vId = villageId || game_data?.village?.id;
     return new Promise((resolve, reject) => {
         var xhr = new XMLHttpRequest();
+        let settled = false;
+        let transmitted = false;
+        const finish = function (callback, value) {
+            if (settled) return;
+            settled = true;
+            callback(value);
+        };
+        const rejectUncertain = function (reason, originalError) {
+            const error = originalError instanceof Error ? originalError : new Error(reason);
+            error.code = 'CANCEL_UNCERTAIN';
+            error.reason = reason;
+            error.afterTransmission = transmitted;
+            error.status = Number(xhr.status) || Number(error.status) || 0;
+            finish(reject, error);
+        };
         xhr.open('POST', getVillageLinkBase(villageId) + 'main&ajaxaction=cancel_order&type=main', true);
         xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded; charset=UTF-8');
         xhr.setRequestHeader('Tribalwars-Ajax', '1');
@@ -1868,28 +1953,43 @@ function callRemoveFromActiveBuildingQueue(idToRemove, villageId) {
         xhr.onreadystatechange = function () {
             if (xhr.readyState === 4) {
                 if (xhr.status === 200) {
+                    let data;
                     try {
-                        const data = JSON.parse(xhr.responseText);
-                        if (data?.response?.success) {
-                            showAutoHideBox('[' + getVillageName(vId) + '] ' + t('buildQueue.activeBuildCancelled'), false);
-                            resolve(data.response);
-                        } else {
-                            reject(new Error('Server reported cancel failure'));
-                        }
+                        data = JSON.parse(xhr.responseText);
                     } catch (e) {
-                        // JSON parse failed — treat as success, no response data
-                        showAutoHideBox('[' + getVillageName(vId) + '] ' + t('buildQueue.activeBuildCancelled'), false);
-                        resolve(null);
+                        rejectUncertain('unusable-cancel-response', e);
+                        return;
                     }
+                    if (data?.response?.success) {
+                        finish(resolve, data.response);
+                    } else {
+                        const error = new Error('Server reported cancel failure');
+                        error.code = 'CANCEL_FAILED';
+                        finish(reject, error);
+                    }
+                } else if ([500, 502, 503].includes(Number(xhr.status))) {
+                    rejectUncertain('cancel-http-' + xhr.status);
                 } else {
-                    showAutoHideBox('[' + getVillageName(vId) + '] ' + t('buildQueue.errorRemoving'), xhr.status, xhr.statusText);
-                    reject(new Error('HTTP error: ' + xhr.status));
+                    const error = new Error('HTTP error: ' + xhr.status);
+                    error.status = xhr.status;
+                    error.code = 'CANCEL_FAILED';
+                    finish(reject, error);
                 }
             }
         };
+        xhr.onerror = function () { rejectUncertain('cancel-network-error'); };
+        xhr.ontimeout = function () { rejectUncertain('cancel-timeout'); };
+        xhr.timeout = 15000;
 
         var body = 'id=' + idToRemove + '&destroy=0&h=' + game_data.csrf;
-        xhr.send(body);
+        try {
+            transmitted = true;
+            xhr.send(body);
+        } catch (error) {
+            transmitted = false;
+            error.code = 'CANCEL_FAILED';
+            finish(reject, error);
+        }
     });
 }
 

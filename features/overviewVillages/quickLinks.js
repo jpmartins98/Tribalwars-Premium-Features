@@ -210,6 +210,8 @@ function createOverlayRecruitContext(villageId, containerEl) {
         isLive: false,
         pendingDeduction: { wood: 0, stone: 0, iron: 0 },
         calcDebounceTimer: null,
+        recruitUncertain: loadRecruitUncertain(villageId),
+        recruitMutationState: loadRecruitUncertain(villageId) ? 'UNCERTAIN' : null,
         getResources: () => {
             const snap = villageResourceSnapshots[villageId];
             if (!snap) return null;

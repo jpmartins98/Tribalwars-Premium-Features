@@ -891,14 +891,20 @@ test('individual Auto Scavenging UI is usable without private automation mode', 
     assert.equal(toggle.disabled, false);
     assert.equal(toggle.checked, false);
     assert.ok(start, 'Save & Start action was not rendered');
+    const statusCell = ui.elements.find(element => element.textContent === 'scavenge.statusOff');
+    assert.ok(statusCell, 'OFF status must reflect persisted disabled state');
     toggle.checked = true;
     toggle.onchange();
+    assert.equal(statusCell.textContent, 'scavenge.statusPendingEnable');
+    assert.equal(context.getScavengeConfig('1').enabled, false);
     await start.onclick();
     assert.equal(context.getScavengeConfig('1').enabled, true);
+    assert.ok(statusCell.textContent.includes('scavenge.statusActive'));
     assert.ok(timers.has('scavenging-auto:1'));
     toggle.checked = false;
     toggle.onchange();
     assert.equal(context.getScavengeConfig('1').enabled, false);
+    assert.equal(statusCell.textContent, 'scavenge.statusOff');
     assert.equal(timers.has('scavenging-auto:1'), false);
 });
 
