@@ -85,8 +85,10 @@
         });
     }
 
+    // A vertical scroll cannot make more horizontal room for the sidebar. Repositioning on
+    // scroll could move the Settings control between its normal parent and the fixed portal,
+    // and also used to remount icons. A real viewport/layout resize remains the relevant signal.
     window.addEventListener('resize', schedulePositionUpdate);
-    window.addEventListener('scroll', schedulePositionUpdate, true);
 
     function createIconElement(config) {
         if (typeof config.createIcon === 'function') {

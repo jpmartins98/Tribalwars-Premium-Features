@@ -107,8 +107,27 @@ function _scavSpreadDelayMs() {
     return 0;
 }
 
+function _scavengingReturnAtMs(value) {
+    if (value == null || value === '') return null;
+    const numeric = Number(value);
+    if (Number.isFinite(numeric) && numeric > 0) return numeric < 1e12 ? numeric * 1000 : numeric;
+    const parsed = new Date(String(value).replace(' ', 'T')).getTime();
+    return Number.isFinite(parsed) ? parsed : null;
+}
+
 function _scavengingTimerId(villageId) {
     return 'scavenging-auto:' + _getScavengeVillageId(villageId);
+}
+
+function _scavengingScheduledDueAt(villageId) {
+    const timerId = _scavengingTimerId(villageId);
+    try {
+        const handler = JSON.parse(localStorage.getItem('handler_' + timerId) || 'null');
+        if (handler?.handlerName !== 'scavengingAutoCheck') return 0;
+        return Number(localStorage.getItem('endTime_' + timerId)) || 0;
+    } catch (_error) {
+        return 0;
+    }
 }
 
 function _scheduleScavengingAuto(waitMs, villageId) {
@@ -124,6 +143,33 @@ function _scheduleScavengingAuto(waitMs, villageId) {
         clearPersistedTimeout('scavenging-auto');
     }
     setHandlerOnTimeOut(_scavengingTimerId(vId), 'scavengingAutoCheck', [vId], effectiveWaitMs);
+}
+
+function _ensureScavengingAutoWake(villageId) {
+    const vId = _getScavengeVillageId(villageId);
+    const config = getScavengeConfig(vId);
+    if (!config.enabled && !config.uncertain) return false;
+    if (_scavengingScheduledDueAt(vId) > Date.now()) return false;
+    // A partly persisted/legacy deadline can still be useful even if its handler disappeared.
+    // Repair the handler without moving a known future return forward to page-load time.
+    const retainedDueAt = Number(localStorage.getItem('endTime_' + _scavengingTimerId(vId))) || 0;
+    _scheduleScavengingAuto(Math.max(0, retainedDueAt - Date.now()), vId);
+    return true;
+}
+
+function restoreScavengingAutoWakes() {
+    let configs;
+    try { configs = JSON.parse(localStorage.getItem('scavenge_configs') || '{}'); }
+    catch (_error) { return; }
+    Object.keys(configs || {}).forEach(villageId => {
+        try { _ensureScavengingAutoWake(villageId); }
+        catch (error) {
+            window.PremiumFeaturesDiagnostics?.record?.({
+                feature: 'scavenging', villageId, status: 'SKIPPED',
+                reason: 'wake-restore-failed', error: String(error?.message || error)
+            });
+        }
+    });
 }
 
 const SCAVENGING_BACKOFF_MS = [30000, 60000, 120000, 300000, 600000];
@@ -422,6 +468,7 @@ async function runOptimizedScavenge(forceRun = false) {
     const distribution = config.distributionByOption;
     if (!distribution || !Object.keys(distribution).length) {
         console.warn('[AutoScavenge] Optimize: no distribution stored — save config first.');
+        _scheduleScavengingAuto(30 * 60 * 1000);
         return;
     }
 
@@ -445,6 +492,7 @@ async function runOptimizedScavenge(forceRun = false) {
     const optionsState = villageData.options || {};
     const optionIds = Object.keys(distribution).map(Number).sort((a, b) => b - a); // highest first
     let earliestReturn = null;
+    const homeRemaining = villageData.unit_counts_home ? { ...villageData.unit_counts_home } : null;
 
     for (const optionId of optionIds) {
         const optState = Object.values(optionsState).find(o => o.base_id === optionId);
@@ -453,13 +501,20 @@ async function runOptimizedScavenge(forceRun = false) {
         if (optState.scavenging_squad) {
             const rt = optState.scavenging_squad.return_time;
             if (rt) {
-                const rtMs = typeof rt === 'number' ? rt * 1000 : new Date(String(rt).replace(' ', 'T')).getTime();
-                if (earliestReturn === null || rtMs < earliestReturn) earliestReturn = rtMs;
+                const rtMs = _scavengingReturnAtMs(rt);
+                if (rtMs && (earliestReturn === null || rtMs < earliestReturn)) earliestReturn = rtMs;
             }
             continue;
         }
 
         const { units, carryMax } = distribution[optionId];
+        if (homeRemaining && Object.entries(units || {}).some(([unit, count]) =>
+            Number(count) > Number(homeRemaining[unit] || 0))) {
+            console.warn(`[AutoScavenge] Optimize: optionId=${optionId} needs troops no longer at home.`);
+            _scheduleScavengingAuto(earliestReturn && earliestReturn > Date.now()
+                ? earliestReturn - Date.now() : 30 * 60 * 1000);
+            return;
+        }
         console.log(`[AutoScavenge] Optimize: sending optionId=${optionId} | carryMax=${carryMax}`);
         const result = await sendScavengeSquadApi(
             units, optionId, carryMax, _getScavengeVillageId(), decisionHash
@@ -468,13 +523,17 @@ async function runOptimizedScavenge(forceRun = false) {
         if (result.uncertain || result.paused) return;
 
         if (!result.success) {
-            console.error(`[AutoScavenge] Optimize: failed for optionId=${optionId}. Disabling auto-scavenge.`);
-            saveScavengeConfig({ ...getScavengeConfig(), enabled: false });
-            if (typeof showAutoHideBox === 'function') showAutoHideBox(t('scavenge.disabledSendFailed', { optionId }), true);
+            // A rejected squad may reflect changing home troops or an already occupied option.
+            // This is not evidence that the user's persisted automation intent was revoked.
+            console.warn(`[AutoScavenge] Optimize: optionId=${optionId} rejected; deferring the next observation.`);
+            _scheduleScavengingAuto(30 * 60 * 1000);
             return;
         }
 
         console.log(`[AutoScavenge] Optimize: optionId=${optionId} sent | returnMs=${result.returnMs}`);
+        if (homeRemaining) Object.entries(units || {}).forEach(([unit, count]) => {
+            homeRemaining[unit] = Math.max(0, Number(homeRemaining[unit] || 0) - Number(count));
+        });
         if (result.returnMs > 0) {
             const retTime = Date.now() + result.returnMs;
             if (earliestReturn === null || retTime < earliestReturn) earliestReturn = retTime;
@@ -484,7 +543,6 @@ async function runOptimizedScavenge(forceRun = false) {
     if (earliestReturn) {
         const spreadMs = _scavSpreadDelayMs();
         const waitMs = Math.max(0, earliestReturn - Date.now()) + spreadMs;
-        localStorage.setItem('endTime_' + _scavengingTimerId(), String(earliestReturn + spreadMs));
         _scheduleScavengingAuto(waitMs);
         console.log(`[AutoScavenge] Optimize: next check in ${Math.round(waitMs / 60000)} min (incl. ${Math.round(spreadMs / 60000)} min deterministic spread).`);
     } else {
@@ -750,8 +808,8 @@ async function sendScavengeSquadApi(unitCounts, optionId, carryMax, explicitVill
         if (rt && (earliestRt === null || rt < earliestRt)) earliestRt = rt;
     }
     if (earliestRt) {
-        const epoch = typeof earliestRt === 'number' ? earliestRt * 1000 : new Date(String(earliestRt).replace(' ', 'T')).getTime();
-        returnMs = Math.max(0, epoch - Date.now());
+        const epoch = _scavengingReturnAtMs(earliestRt);
+        if (epoch) returnMs = Math.max(0, epoch - Date.now());
     }
 
     if (typeof showAutoHideBox === 'function') showAutoHideBox(notificationText, !success);
@@ -781,10 +839,12 @@ async function triggerScavengingAuto(villageId) {
 }
 
 async function _triggerScavengingAutoForActiveVillage() {
+    const initialConfig = getScavengeConfig();
+    if (!initialConfig.enabled && !initialConfig.uncertain) return { status: 'DISABLED' };
     if (!_scavengingLeaseActive()) return _deferScavengingForLease();
 
     // Skip if a timer is already scheduled and still in the future — avoids redundant API calls.
-    const existingEndTime = parseInt(localStorage.getItem('endTime_' + _scavengingTimerId()), 10);
+    const existingEndTime = _scavengingScheduledDueAt();
     if (existingEndTime && existingEndTime > Date.now()) {
         console.log('[AutoScavenge] Timer already active, skipping redundant call.');
         return;
@@ -863,16 +923,18 @@ async function _triggerScavengingAutoForActiveVillage() {
                 Object.entries(home).filter(([unit, count]) => count > 0 && unit !== 'militia' && unit !== 'knight')
             );
             console.log('[AutoScavenge] level=0: unit counts from unit_counts_home:', JSON.stringify(fetchedUnitCounts));
-            if (Object.keys(fetchedUnitCounts).length === 0 && config.lastUnitCounts) {
-                console.warn('[AutoScavenge] level=0: no units at home — falling back to lastUnitCounts.');
-                fetchedUnitCounts = config.lastUnitCounts;
-            }
         } else {
             fetchedUnitCounts = config.units || {};
         }
 
         if (Object.keys(fetchedUnitCounts).length === 0) {
             console.warn('[AutoScavenge] level=0: no unit counts available; retrying in 30 min.');
+            _scheduleScavengingAuto(30 * 60 * 1000);
+            return;
+        }
+        if (Object.entries(fetchedUnitCounts).some(([unit, count]) =>
+            Number(count) > Number(fetchedVillage.unit_counts_home?.[unit] || 0))) {
+            console.warn('[AutoScavenge] level=0: requested troops are not at home.');
             _scheduleScavengingAuto(30 * 60 * 1000);
             return;
         }
@@ -905,62 +967,46 @@ async function _triggerScavengingAutoForActiveVillage() {
         return;
     }
 
-    let unitCounts = config.allUnits !== false ? config.lastUnitCounts : config.units;
-    let optionId = config.optionId;
-
-    // Config not yet seeded for this fixed level — fetch the scavenge page once to extract optionId and unit counts
-    if (!optionId || !unitCounts || Object.keys(unitCounts).length === 0) {
-        console.log('[AutoScavenge] Config not seeded for level', config.level, '— fetching scavenge page.');
-        let seedVillage;
-        try {
-            seedVillage = await _fetchScavengingVillageData('configuration-seed');
-            console.log('[AutoScavenge] Scavenge page fetched for seeding.');
-        } catch (e) {
-            console.error('[AutoScavenge] Failed to fetch scavenge page for seeding:', e);
-            _softPauseScavenging(e, 'configuration-seed');
-            return;
-        }
-        if (!_scavengingDecisionIsCurrent(_getScavengeVillageId(), decisionHash, 'config-changed-during-seed-read')) return;
-        _resetScavengingFailures();
-        console.log('[AutoScavenge] Seed: village data parsed | options:', Object.keys(seedVillage.options || {}));
-
-        const seedAllOpts = Object.values(seedVillage.options || {}).sort((a, b) => a.base_id - b.base_id);
-        const seedUnlocked = seedAllOpts.filter(opt => !opt.is_locked);
-        const seedTarget = seedUnlocked[config.level - 1] || null;
-        console.log('[AutoScavenge] Seed: unlocked options:', seedUnlocked.map(o => o.base_id), '| target index:', config.level - 1, '| found base_id:', seedTarget?.base_id ?? 'none');
-
-        if (!seedTarget) {
-            console.warn('[AutoScavenge] Level', config.level, 'not available; retrying in 30 min.');
-            _scheduleScavengingAuto(30 * 60 * 1000);
-            return;
-        }
-
-        optionId = seedTarget.base_id;
-        console.log('[AutoScavenge] Seeded optionId:', optionId);
-
-        if (config.allUnits !== false) {
-            const home = seedVillage.unit_counts_home || {};
-            const seedCounts = Object.fromEntries(
-                Object.entries(home).filter(([unit, count]) => count > 0 && unit !== 'militia' && unit !== 'knight')
-            );
-            console.log('[AutoScavenge] Seeded unit counts from unit_counts_home:', JSON.stringify(seedCounts));
-            if (Object.keys(seedCounts).length > 0) {
-                unitCounts = seedCounts;
-            } else {
-                console.warn('[AutoScavenge] No units at home in fetched data; retrying in 30 min.');
-                _scheduleScavengingAuto(30 * 60 * 1000);
-                return;
-            }
-        } else {
-            unitCounts = config.units || {};
-        }
-        saveScavengeConfig({ ...getScavengeConfig(), optionId, lastUnitCounts: unitCounts });
+    // A due return is a reason for one fresh official observation. Saved unit counts describe
+    // the previous send, not troops presently at home, and cannot authorize another POST.
+    let fixedVillage;
+    try {
+        fixedVillage = await _fetchScavengingVillageData('fixed-level-due');
+    } catch (error) {
+        _softPauseScavenging(error, 'fixed-level-due');
+        return;
     }
-
-    if (!unitCounts || Object.keys(unitCounts).length === 0) {
-        console.warn('[AutoScavenge] No unit counts for level', config.level, '; retrying in 30 min.');
+    if (!_scavengingDecisionIsCurrent(_getScavengeVillageId(), decisionHash, 'config-changed-during-fixed-read')) return;
+    _resetScavengingFailures();
+    const unlockedOptions = Object.values(fixedVillage.options || {})
+        .filter(option => !option.is_locked)
+        .sort((first, second) => Number(first.base_id) - Number(second.base_id));
+    const targetOption = unlockedOptions[Number(config.level) - 1];
+    if (!targetOption) {
         _scheduleScavengingAuto(30 * 60 * 1000);
         return;
+    }
+    const optionId = targetOption.base_id;
+    if (targetOption.scavenging_squad) {
+        const returnAt = _scavengingReturnAtMs(targetOption.scavenging_squad.return_time);
+        _scheduleScavengingAuto(returnAt && returnAt > Date.now() ? returnAt - Date.now() : 30 * 60 * 1000);
+        return;
+    }
+    const home = fixedVillage.unit_counts_home || {};
+    const unitCounts = config.allUnits !== false
+        ? Object.fromEntries(Object.entries(home).filter(([unit, count]) =>
+            Number(count) > 0 && unit !== 'militia' && unit !== 'knight'))
+        : Object.fromEntries(Object.entries(config.units || {}).filter(([, count]) => Number(count) > 0));
+    if (!Object.keys(unitCounts).length || Object.entries(unitCounts).some(([unit, count]) =>
+        Number(count) > Number(home[unit] || 0))) {
+        console.warn('[AutoScavenge] Required troops are not at home; deferring the next observation.');
+        _scheduleScavengingAuto(30 * 60 * 1000);
+        return;
+    }
+    const currentConfig = getScavengeConfig();
+    if (Number(currentConfig.optionId) !== Number(optionId) ||
+        JSON.stringify(currentConfig.lastUnitCounts || {}) !== JSON.stringify(unitCounts)) {
+        saveScavengeConfig({ ...currentConfig, optionId, lastUnitCounts: unitCounts });
     }
 
     console.log('[AutoScavenge] Sending level', config.level, '| optionId:', optionId, '| units:', JSON.stringify(unitCounts));
@@ -973,7 +1019,7 @@ async function _triggerScavengingAutoForActiveVillage() {
         optionId,
         carryMax,
         _getScavengeVillageId(),
-        _scavengingDecisionHash({ ...config, optionId, lastUnitCounts: unitCounts })
+        _scavengingDecisionHash({ ...getScavengeConfig(), optionId, lastUnitCounts: unitCounts })
     );
     if (result.uncertain || result.paused) return;
     console.log('[AutoScavenge] Result — success:', result.success, '| returnMs:', result.returnMs);
@@ -1062,7 +1108,7 @@ function injectScavengeConfigPanel() {
     const statusCell = statusRow.insertCell(1);
     function refreshAutomationStatus() {
         const saved = getScavengeConfig();
-        const dueAt = Number(localStorage.getItem('endTime_' + _scavengingTimerId())) || 0;
+        const dueAt = _scavengingScheduledDueAt();
         if (saved.enabled) {
             statusCell.textContent = t('scavenge.statusActive') + (dueAt > Date.now()
                 ? ' · ' + t('scavenge.nextRunAt', { time: new Date(dueAt).toLocaleTimeString() })
@@ -1567,9 +1613,7 @@ function injectScavengeConfigPanel() {
  */
 function injectAutoScavengingOption() {
     injectScavengeConfigPanel();
-    if (getScavengeConfig().enabled) {
-        _scheduleScavengingAuto(0);
-    }
+    _ensureScavengingAutoWake();
 }
 
 /**
@@ -1579,7 +1623,7 @@ function injectAutoScavengingOption() {
  */
 async function runAutoScavengingAll() {
     // Skip if a timer is already scheduled and still in the future — avoids redundant API calls on every page visit.
-    const existingEndTime = parseInt(localStorage.getItem('endTime_' + _scavengingTimerId()), 10);
+    const existingEndTime = _scavengingScheduledDueAt();
     if (existingEndTime && existingEndTime > Date.now()) {
         console.log('[AutoScavenge] Timer already active, skipping run.');
         return;

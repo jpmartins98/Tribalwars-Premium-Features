@@ -148,6 +148,18 @@ function installTimerHarness(context) {
     return timers;
 }
 
+function installScavengingPageParser(context) {
+    context.DOMParser = class {
+        parseFromString(html) {
+            return { querySelectorAll: () => [{ textContent: html }] };
+        }
+    };
+}
+
+function scavengingPage(village) {
+    return 'var village = ' + JSON.stringify(village) + ';';
+}
+
 test('diagnostics is bounded and counts local outcomes without network', () => {
     const context = createContext();
     load(context, 'utils/core_diagnostics.js');
@@ -851,6 +863,192 @@ test('Scavenging uses distinct village task keys and exact known return scheduli
     assert.ok(timers.get('scavenging-auto:11').waitMs > 50000);
 });
 
+test('Scavenging fixed-level second cycle observes returned troops instead of reusing first send counts', async () => {
+    const sends = [];
+    let reads = 0;
+    const context = createContext({
+        PremiumFeaturesCoordination: {
+            tabId: 'B', instanceId: 'B1',
+            readLease: () => ({ owner: 'B', instanceId: 'B1', expiresAt: Date.now() + 60000 })
+        },
+        fetch: async (_url, options) => {
+            if (!options?.method) {
+                reads++;
+                return { ok: true, status: 200, text: async () => scavengingPage({
+                    options: { 1: { base_id: 1, is_locked: false, scavenging_squad: null } },
+                    unit_counts_home: { spear: reads === 1 ? 10 : 6 }
+                }) };
+            }
+            assert.equal(options.method, 'POST');
+            sends.push(new URLSearchParams(options.body).get('squad_requests[0][candidate_squad][unit_counts][spear]'));
+            return {
+                ok: true, status: 200,
+                json: async () => ({ response: {
+                    squad_responses: [{ success: true }],
+                    villages: { '1': { options: {
+                        1: { scavenging_squad: { return_time: Math.floor(Date.now() / 1000) + 60 } }
+                    } } }
+                } })
+            };
+        }
+    });
+    const timers = installTimerHarness(context);
+    installScavengingPageParser(context);
+    load(context, 'bots/scavenging.js');
+    context.saveScavengeConfig({ enabled: true, level: 1, allUnits: true, units: {} }, '1');
+    await context.triggerScavengingAuto('1');
+    assert.deepEqual(sends, ['10']);
+    assert.ok(timers.has('scavenging-auto:1'));
+    context.localStorage.setItem('endTime_scavenging-auto:1', String(Date.now() - 1));
+    await context.triggerScavengingAuto('1');
+    assert.equal(reads, 2, 'a fresh official observation is needed when the known return becomes due');
+    assert.deepEqual(sends, ['10', '6']);
+    assert.ok(timers.has('scavenging-auto:1'));
+});
+
+test('Scavenging fixed-level return wake defers a still-busy option without another POST', async () => {
+    let posts = 0;
+    let gets = 0;
+    const returnTime = Math.floor(Date.now() / 1000) + 120;
+    const context = createContext({
+        PremiumFeaturesCoordination: {
+            tabId: 'B', instanceId: 'B1',
+            readLease: () => ({ owner: 'B', instanceId: 'B1', expiresAt: Date.now() + 60000 })
+        },
+        fetch: async (_url, options) => {
+            if (options?.method === 'POST') { posts++; throw new Error('still-busy option must not be sent'); }
+            gets++;
+            return { ok: true, status: 200, text: async () => scavengingPage({
+                options: { 1: { base_id: 1, is_locked: false, scavenging_squad: { return_time: String(returnTime) } } },
+                unit_counts_home: { spear: 10 }
+            }) };
+        }
+    });
+    const timers = installTimerHarness(context);
+    installScavengingPageParser(context);
+    load(context, 'bots/scavenging.js');
+    context.saveScavengeConfig({ enabled: true, level: 1, allUnits: true, units: {}, optionId: 1, lastUnitCounts: { spear: 10 } }, '1');
+    await context.triggerScavengingAuto('1');
+    assert.equal(posts, 0);
+    assert.equal(gets, 1);
+    assert.ok(timers.get('scavenging-auto:1').dueAt >= returnTime * 1000);
+});
+
+test('opening the Scavenging page preserves a known future auto return wake', () => {
+    const ui = createUiDocument();
+    const container = ui.makeElement('div');
+    ui.document.querySelector = selector => selector === '.scavenge-screen-main-widget' ? container : null;
+    ui.document.querySelectorAll = () => [];
+    const context = createContext({ document: ui.document });
+    const timers = installTimerHarness(context);
+    load(context, 'bots/scavenging.js');
+    context.saveScavengeConfig({ enabled: true, level: 1, allUnits: true, units: {}, optionId: 1 }, '1');
+    context._scheduleScavengingAuto(120000, '1');
+    const dueAt = timers.get('scavenging-auto:1').dueAt;
+    context.injectAutoScavengingOption();
+    assert.equal(timers.get('scavenging-auto:1').dueAt, dueAt);
+});
+
+test('Scavenging repairs a persisted dueAt with no handler instead of waiting forever', () => {
+    const ui = createUiDocument();
+    const container = ui.makeElement('div');
+    ui.document.querySelector = selector => selector === '.scavenge-screen-main-widget' ? container : null;
+    ui.document.querySelectorAll = () => [];
+    const context = createContext({ document: ui.document });
+    const timers = installTimerHarness(context);
+    load(context, 'bots/scavenging.js');
+    context.saveScavengeConfig({ enabled: true, level: 1, allUnits: true, units: {} }, '1');
+    const retainedDueAt = Date.now() + 120000;
+    context.localStorage.setItem('endTime_scavenging-auto:1', String(retainedDueAt));
+    context.injectAutoScavengingOption();
+    assert.ok(timers.has('scavenging-auto:1'), 'a live handler must be rearmed');
+    assert.equal(timers.get('scavenging-auto:1').dueAt, retainedDueAt);
+});
+
+test('background-page bootstrap restores missing Scavenging wakes for enabled villages only', () => {
+    let requests = 0;
+    const context = createContext({
+        fetch: async () => { requests++; throw new Error('restore must stay local'); }
+    });
+    const timers = installTimerHarness(context);
+    load(context, 'bots/scavenging.js');
+    context.saveScavengeConfig({ enabled: true, level: 1, units: {} }, '11');
+    context.saveScavengeConfig({ enabled: false, level: 1, units: {} }, '22');
+    const dueAt = Date.now() + 120000;
+    context.localStorage.setItem('endTime_scavenging-auto:11', String(dueAt));
+    context.restoreScavengingAutoWakes();
+    context.restoreScavengingAutoWakes();
+    assert.deepEqual(Array.from(timers.keys()), ['scavenging-auto:11']);
+    assert.equal(timers.get('scavenging-auto:11').dueAt, dueAt);
+    assert.equal(requests, 0);
+});
+
+test('optimized Scavenging does not permanently disable after an explicit gameplay send rejection', async () => {
+    const context = createContext({
+        PremiumFeaturesCoordination: {
+            tabId: 'B', instanceId: 'B1',
+            readLease: () => ({ owner: 'B', instanceId: 'B1', expiresAt: Date.now() + 60000 })
+        }
+    });
+    const timers = installTimerHarness(context);
+    load(context, 'bots/scavenging.js');
+    context.saveScavengeConfig({
+        enabled: true, optimizeMode: true, level: 0,
+        distributionByOption: { 1: { units: { spear: 10 }, carryMax: 250 } }
+    }, '1');
+    context._fetchScavengingVillageData = async () => ({
+        options: { 1: { base_id: 1, is_locked: false, scavenging_squad: null } },
+        unit_counts_home: { spear: 10 }
+    });
+    context.sendScavengeSquadApi = async () => ({ success: false, returnMs: 0 });
+    await context.triggerScavengingAuto('1');
+    assert.equal(context.getScavengeConfig('1').enabled, true);
+    assert.ok(timers.has('scavenging-auto:1'), 'a future eligibility path is required after a rejected send');
+});
+
+test('optimized Scavenging with an empty distribution keeps a future retry path', async () => {
+    const context = createContext({
+        PremiumFeaturesCoordination: {
+            tabId: 'B', instanceId: 'B1',
+            readLease: () => ({ owner: 'B', instanceId: 'B1', expiresAt: Date.now() + 60000 })
+        }
+    });
+    const timers = installTimerHarness(context);
+    load(context, 'bots/scavenging.js');
+    context.saveScavengeConfig({ enabled: true, optimizeMode: true, level: 0, distributionByOption: {} }, '1');
+    await context.triggerScavengingAuto('1');
+    assert.ok(timers.has('scavenging-auto:1'));
+});
+
+test('highest-available Scavenging does not send previous-cycle troops when none are home', async () => {
+    let posts = 0;
+    let gets = 0;
+    const context = createContext({
+        PremiumFeaturesCoordination: {
+            tabId: 'B', instanceId: 'B1',
+            readLease: () => ({ owner: 'B', instanceId: 'B1', expiresAt: Date.now() + 60000 })
+        },
+        fetch: async (_url, options) => {
+            if (options?.method === 'POST') { posts++; throw new Error('no available troops must not produce a POST'); }
+            gets++;
+            return { ok: true, status: 200, text: async () => scavengingPage({
+                options: { 1: { base_id: 1, is_locked: false, scavenging_squad: null } },
+                unit_counts_home: {}
+            }) };
+        }
+    });
+    const timers = installTimerHarness(context);
+    installScavengingPageParser(context);
+    load(context, 'bots/scavenging.js');
+    context.saveScavengeConfig({
+        enabled: true, level: 0, allUnits: true, units: {}, lastUnitCounts: { spear: 10 }
+    }, '1');
+    await context.triggerScavengingAuto('1');
+    assert.equal(posts, 0);
+    assert.equal(gets, 1);
+    assert.ok(timers.has('scavenging-auto:1'));
+});
+
 test('Scavenging lease contention creates an explicit expiry wake with zero network', async () => {
     let requests = 0;
     const leaseExpiresAt = Date.now() + 15000;
@@ -869,6 +1067,23 @@ test('Scavenging lease contention creates an explicit expiry wake with zero netw
     assert.ok(result.dueAt >= leaseExpiresAt);
     assert.equal(timers.get('scavenging-auto:11').handlerName, 'scavengingAutoCheck');
     assert.ok(timers.get('scavenging-auto:11').dueAt >= leaseExpiresAt);
+    assert.equal(requests, 0);
+});
+
+test('disabled Scavenging ignores a stale callback even when another tab owns the lease', async () => {
+    let requests = 0;
+    const context = createContext({
+        fetch: async () => { requests++; throw new Error('disabled task must stay idle'); },
+        PremiumFeaturesCoordination: {
+            tabId: 'B', instanceId: 'B1',
+            readLease: () => ({ owner: 'A', instanceId: 'A1', expiresAt: Date.now() + 60000 })
+        }
+    });
+    const timers = installTimerHarness(context);
+    load(context, 'bots/scavenging.js');
+    context.saveScavengeConfig({ enabled: false, level: 1, units: {} }, '11');
+    await context.triggerScavengingAuto('11');
+    assert.equal(timers.size, 0);
     assert.equal(requests, 0);
 });
 

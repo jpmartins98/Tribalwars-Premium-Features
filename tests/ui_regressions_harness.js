@@ -231,10 +231,11 @@ test('vertical questlog scroll keeps Settings icon anchored without recreating i
     const firstX = quest.getBoundingClientRect().left;
     for (const y of [600, 0, 900]) {
         scrollY = y;
-        listeners.scroll();
+        listeners.scroll?.();
         assert.equal(quest.getBoundingClientRect().left, firstX);
         assert.equal(quest.parentNode, normal);
     }
+    assert.equal(listeners.scroll, undefined, 'vertical scroll must not trigger sidebar repositioning');
 });
 
 function recruitContext(extra = {}) {

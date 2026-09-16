@@ -265,6 +265,24 @@ test('persisted timeout remains recoverable until its asynchronous callback sett
     assert.equal(env.context.localStorage.getItem('endTime_recoverable'), null);
 });
 
+test('a persisted auto worker can arm its next cycle while the first callback is still active', async () => {
+    const env = createContext();
+    env.context.events = [];
+    loadCore(env.context);
+    vm.runInContext(`
+        registerTimeoutHandler('auto-cycle', async function () {
+            events.push('run');
+            if (events.length === 1) {
+                setHandlerOnTimeOut('auto-cycle', 'auto-cycle', [], 100, 0, 0);
+            }
+        });
+        setHandlerOnTimeOut('auto-cycle', 'auto-cycle', [], 100, 0, 0);
+    `, env.context);
+    await drainTimers(env.clock);
+    assert.deepEqual(Array.from(env.context.events), ['run', 'run']);
+    assert.equal(env.storage.getItem('endTime_auto-cycle'), null);
+});
+
 test('start called five times installs one logical lifecycle', () => {
     const env = createContext();
     load(env.context, 'utils/core_runtime.js');
