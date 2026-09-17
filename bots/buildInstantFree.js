@@ -3,6 +3,80 @@
 const BUILD_INSTANT_FREE_WINDOW_SEC = 180;
 const BUILD_INSTANT_COMPLETION_MARGIN_MS = 2000;
 const BUILD_INSTANT_FALLBACK_MS = 5 * 60 * 1000;
+const BUILD_INSTANT_CONFIRMATION_LEAD_MS = 60 * 1000;
+let buildInstantObservedRoot = null;
+
+function _observeBuildInstantActionDom(villageId) {
+    const runtime = window.PremiumFeaturesRuntimeRegistry;
+    if (!runtime?.setObserver || typeof MutationObserver !== 'function' ||
+        String(villageId) !== String(game_data?.village?.id || '')) return;
+    const root = document.querySelector('#building_wrapper');
+    if (!root) {
+        runtime.clearObserver?.('build-instant:current-action');
+        buildInstantObservedRoot = null;
+        return;
+    }
+    if (root === buildInstantObservedRoot) return;
+    buildInstantObservedRoot = root;
+    let lastCandidate = null;
+    runtime.setObserver('build-instant:current-action', function () {
+        const observer = new MutationObserver(function () {
+            const button = root.querySelector?.('.btn-instant-free');
+            const orderId = (button?.getAttribute('onclick') || '').match(/change_order\((\d+)/)?.[1] || null;
+            if (!orderId) { lastCandidate = null; return; }
+            if (lastCandidate === orderId) return;
+            lastCandidate = orderId;
+            if (String(_buildInstantStateApi()?.get(villageId)?.official?.instantFree?.orderId || '') === orderId) return;
+            if (typeof observeBuildQueueDocument === 'function') {
+                observeBuildQueueDocument(document, villageId, 'dom');
+                checkAndScheduleBuildInstantFree(villageId, { observeDom: false });
+            }
+        });
+        observer.observe(root, { childList: true, subtree: true, attributes: true, attributeFilter: ['class', 'onclick'] });
+        return observer;
+    }, true);
+}
+
+function _buildInstantHardStopped() {
+    return Boolean(window.PremiumFeaturesBotProtection?.isActive?.() ||
+        window.PremiumFeaturesBackgroundScheduler?.stats?.().hardStopped);
+}
+
+function _parkBuildInstantHardStop(villageId, official, uncertain) {
+    if (window.PremiumFeaturesBotProtection?.isActive?.() &&
+        !window.PremiumFeaturesBackgroundScheduler?.stats?.().hardStopped) {
+        window.PremiumFeaturesBackgroundScheduler?.hardStop?.('bot-protection');
+    }
+    const vId = String(villageId);
+    _scheduleBuildInstantWorker(vId, Date.now(), 'hard-stop-reconcile', official || {}, {
+        orderId: uncertain?.orderId || null,
+        uncertain: uncertain || null,
+        statePatch: { state: uncertain ? 'UNCERTAIN' : 'STALE' }
+    });
+    return { status: 'HARD_STOP' };
+}
+
+// One confirmation tied to the known free window, never a repeating short poll.
+function _buildInstantConfirmationAt(nextSlotAt, now) {
+    const remaining = Number(nextSlotAt) - now;
+    if (remaining <= 2000) return null;
+    const preferred = Math.max(now + 30000, Number(nextSlotAt) - BUILD_INSTANT_CONFIRMATION_LEAD_MS);
+    return preferred < Number(nextSlotAt) - 5000
+        ? preferred
+        : now + Math.floor(remaining / 2);
+}
+
+function _buildInstantActionProof(record, orderId, now) {
+    const official = record?.official || {};
+    const action = official.instantFree;
+    const nextSlotAt = Number(official.nextSlotAt) || 0;
+    return Boolean(action?.orderId && String(action.orderId) === String(orderId) &&
+        (official.queue || []).length > 0 &&
+        official.cancelIds?.some(id => String(id) === String(orderId)) &&
+        nextSlotAt > now && now >= nextSlotAt - BUILD_INSTANT_FREE_WINDOW_SEC * 1000 &&
+        (!action.availableFrom || now >= Number(action.availableFrom)) &&
+        (!action.availableTo || now < Number(action.availableTo)));
+}
 
 function _buildInstantStateApi() {
     return window.PremiumFeaturesBuildState;
@@ -98,17 +172,25 @@ function checkAndScheduleBuildInstantFree(villageId, options = {}) {
     const vId = String(villageId || game_data?.village?.id || '');
     if (!vId) return { status: 'NO_VILLAGE' };
     if (!_buildInstantEnabled()) {
+        if (vId === String(game_data?.village?.id || '')) {
+            window.PremiumFeaturesRuntimeRegistry?.clearObserver?.('build-instant:current-action');
+            buildInstantObservedRoot = null;
+        }
         _clearBuildInstantFreeTimeout(vId);
         _setBuildInstantState(vId, { state: 'IDLE', nextDueAt: null, reason: 'disabled', uncertain: null }, true);
         return { status: 'DISABLED' };
     }
 
     const state = _buildInstantStateApi();
+    _observeBuildInstantActionDom(vId);
     if (vId == String(game_data?.village?.id || '') &&
         document.querySelector('#building_wrapper') && document.querySelector('#buildings') &&
         typeof observeBuildQueueDocument === 'function' && options.observeDom !== false) {
         const cached = state?.get(vId);
-        if (cached?.official?.source !== 'dom' || Date.now() - Number(cached.official.fetchedAt || 0) > 1000) {
+        const liveButton = document.querySelector('.btn-instant-free');
+        const liveOrderId = (liveButton?.getAttribute('onclick') || '').match(/change_order\((\d+)/)?.[1] || null;
+        if (cached?.official?.source !== 'dom' || Date.now() - Number(cached.official.fetchedAt || 0) > 1000 ||
+            (liveOrderId && String(cached?.official?.instantFree?.orderId || '') !== String(liveOrderId))) {
             observeBuildQueueDocument(document, vId, 'dom');
         }
     }
@@ -141,13 +223,37 @@ function checkAndScheduleBuildInstantFree(villageId, options = {}) {
 
     const freeAt = nextSlotAt - BUILD_INSTANT_FREE_WINDOW_SEC * 1000;
     if (Date.now() < freeAt) {
-        _scheduleBuildInstantWorker(vId, freeAt, 'known-free-window', official);
+        _scheduleBuildInstantWorker(vId, freeAt, 'known-free-window', official, {
+            statePatch: { confirmationAttempted: false }
+        });
         return { status: 'WAITING_WINDOW', dueAt: freeAt };
     }
 
     const snapshotHash = _buildInstantSnapshot(vId, official);
+    if (instant.state === 'WAITING_FREE_CONFIRMATION' && instant.snapshotHash === snapshotHash &&
+        Number(instant.checkedOfficialGeneration) === Number(official.generation) &&
+        Number(instant.nextDueAt) < nextSlotAt) {
+        const dueAt = Math.max(Date.now(), Number(instant.nextDueAt) || Date.now());
+        if (!localStorage.getItem('endTime_' + _buildInstantTaskId(vId))) {
+            _scheduleBuildInstantWorker(vId, dueAt, 'free-confirmation', official, {
+                checkedOfficialGeneration: official.generation,
+                statePatch: { state: 'WAITING_FREE_CONFIRMATION', confirmationAttempted: true }
+            });
+        }
+        return { status: 'WAITING_FREE_CONFIRMATION', dueAt };
+    }
     if (instant.state === 'STALE' && instant.snapshotHash === snapshotHash &&
         Number(instant.checkedOfficialGeneration) === Number(official.generation)) {
+        if (instant.reason === 'button-absent' && !instant.confirmationAttempted) {
+            const confirmationAt = _buildInstantConfirmationAt(nextSlotAt, Date.now());
+            if (confirmationAt) {
+                _scheduleBuildInstantWorker(vId, confirmationAt, 'free-confirmation', official, {
+                    checkedOfficialGeneration: official.generation,
+                    statePatch: { state: 'WAITING_FREE_CONFIRMATION', confirmationAttempted: true }
+                });
+                return { status: 'WAITING_FREE_CONFIRMATION', dueAt: confirmationAt };
+            }
+        }
         const dueAt = Math.max(Date.now(), nextSlotAt + BUILD_INSTANT_COMPLETION_MARGIN_MS);
         if (!localStorage.getItem('endTime_' + _buildInstantTaskId(vId))) {
             _scheduleBuildInstantWorker(vId, dueAt, 'known-completion', official, {
@@ -162,7 +268,9 @@ function checkAndScheduleBuildInstantFree(villageId, options = {}) {
         return { status: 'STALE', dueAt };
     }
 
-    _scheduleBuildInstantWorker(vId, Date.now(), 'window-open', official);
+    _scheduleBuildInstantWorker(vId, Date.now(), 'window-open', official, {
+        statePatch: { confirmationAttempted: false }
+    });
     return { status: 'CHECKING', dueAt: Date.now() };
 }
 
@@ -181,13 +289,18 @@ function scheduleBuildInstantReconciliation(villageId, delayMs = 200) {
     if (!vId || !_buildInstantEnabled()) return { status: 'DISABLED' };
     const official = _buildInstantStateApi()?.get(vId)?.official || {};
     _scheduleBuildInstantWorker(vId, Date.now() + Math.max(0, Number(delayMs) || 0), 'known-build-mutation', official, {
-        statePatch: { state: 'STALE' }
+        statePatch: { state: 'STALE', confirmationAttempted: false }
     });
     return { status: 'RECONCILING' };
 }
 
 async function _inspectBuildInstant(villageId, reason) {
     const vId = String(villageId);
+    if (_buildInstantHardStopped()) {
+        const error = new Error('Build Instant hard stop before state inspection');
+        error.code = 'HARD_STOP';
+        throw error;
+    }
     if (vId == String(game_data?.village?.id || '') &&
         document.querySelector('#building_wrapper') && document.querySelector('#buildings') &&
         typeof observeBuildQueueDocument === 'function') {
@@ -210,15 +323,16 @@ async function _inspectBuildInstant(villageId, reason) {
 
 function _buildInstantButtonData(observed) {
     const fromState = observed?.official?.instantFree;
-    if (fromState?.orderId) return fromState;
     const button = observed?.doc?.querySelector?.('.btn-instant-free');
-    if (!button) return null;
-    const match = (button.getAttribute('onclick') || '').match(/change_order\((\d+)/);
-    return {
-        orderId: match?.[1] || null,
-        availableFrom: (parseInt(button.getAttribute('data-available-from'), 10) || 0) * 1000 || null,
-        availableTo: (parseInt(button.getAttribute('data-available-to'), 10) || 0) * 1000 || null
-    };
+    const match = (button?.getAttribute('onclick') || '').match(/change_order\((\d+)/);
+    const domOrderId = match?.[1] || null;
+    if (fromState?.orderId && domOrderId && String(fromState.orderId) !== String(domOrderId)) {
+        return { conflict: true };
+    }
+    if (fromState?.orderId) return fromState;
+    // A DOM-only button is useful evidence for reconciliation, but cannot authorize a mutation
+    // until the official BuildState observation agrees on its order ID.
+    return domOrderId ? { conflict: true } : null;
 }
 
 async function runBuildInstantFreeWorker(villageId, expectedGeneration, expectedHash, reason, uncertainOrderId) {
@@ -226,6 +340,7 @@ async function runBuildInstantFreeWorker(villageId, expectedGeneration, expected
     if (!_buildInstantEnabled() || !vId) return { status: 'DISABLED' };
     const state = _buildInstantStateApi();
     let record = state?.get(vId);
+    if (_buildInstantHardStopped()) return _parkBuildInstantHardStop(vId, record?.official, record?.instant?.uncertain);
     if (!_buildInstantLeaseActive(vId)) return _deferBuildInstantLease(vId, 'lease-before-check');
     if (Number(record?.official?.generation) !== Number(expectedGeneration) ||
         _buildInstantSnapshot(vId, record?.official) !== expectedHash) {
@@ -247,39 +362,87 @@ async function runBuildInstantFreeWorker(villageId, expectedGeneration, expected
         run: () => _inspectBuildInstant(vId, reason)
     });
     if (result.status !== 'SUCCESS') {
-        if (result.status !== 'HARD_STOP') {
+        if (result.status === 'HARD_STOP') {
+            _parkBuildInstantHardStop(vId, state?.get(vId)?.official, record?.instant?.uncertain);
+        } else {
             const retryAt = Number(result.retryAt) || Date.now() + BUILD_INSTANT_FALLBACK_MS;
-            _scheduleBuildInstantWorker(vId, retryAt, 'soft-pause', record?.official, {
-                statePatch: { state: 'SOFT_PAUSED' }
-            });
+            const stillUncertain = Boolean(uncertainOrderId || record?.instant?.uncertain);
+            _scheduleBuildInstantWorker(vId, retryAt,
+                stillUncertain ? 'uncertain-reconcile' : 'soft-pause', record?.official, {
+                    orderId: uncertainOrderId || record?.instant?.uncertain?.orderId || null,
+                    uncertain: stillUncertain ? record?.instant?.uncertain : null,
+                    statePatch: { state: stillUncertain ? 'UNCERTAIN' : 'SOFT_PAUSED' }
+                });
         }
         return result;
     }
 
     if (!_buildInstantLeaseActive(vId)) return _deferBuildInstantLease(vId, 'lease-after-check');
     record = state?.get(vId);
+    const inspectedGeneration = Number(record?.official?.generation) || 0;
+    const inspectedHash = _buildInstantSnapshot(vId, record?.official);
     const button = _buildInstantButtonData(result.value);
-    if (uncertainOrderId && String(button?.orderId || '') !== String(uncertainOrderId) &&
-        !record?.official?.cancelIds?.some(id => String(id) === String(uncertainOrderId))) {
-        _setBuildInstantState(vId, { state: 'IDLE', uncertain: null, reason: 'uncertain-confirmed-complete' }, true);
+    if (Number(state?.get(vId)?.official?.generation) !== inspectedGeneration ||
+        _buildInstantSnapshot(vId, state?.get(vId)?.official) !== inspectedHash) {
         return checkAndScheduleBuildInstantFree(vId, { observeDom: false });
     }
-    if (!button?.orderId) {
+    if (uncertainOrderId) {
+        if (String(button?.orderId || '') !== String(uncertainOrderId) &&
+            !record?.official?.cancelIds?.some(id => String(id) === String(uncertainOrderId))) {
+            _setBuildInstantState(vId, { state: 'IDLE', uncertain: null, reason: 'uncertain-confirmed-complete' }, true);
+            return checkAndScheduleBuildInstantFree(vId, { observeDom: false });
+        }
+        // A still-visible order after a lost response is not proof that the mutation was never
+        // applied. Wait for another legitimate official state change; never repeat reduce blindly.
+        const dueAt = Number(record.official.nextSlotAt) > Date.now()
+            ? Number(record.official.nextSlotAt) + BUILD_INSTANT_COMPLETION_MARGIN_MS
+            : Date.now() + BUILD_INSTANT_FALLBACK_MS;
+        _scheduleBuildInstantWorker(vId, dueAt, 'uncertain-reconcile', record.official, {
+            orderId: String(uncertainOrderId),
+            uncertain: record.instant?.uncertain || { orderId: String(uncertainOrderId), at: Date.now() },
+            statePatch: { state: 'UNCERTAIN' }
+        });
+        return { status: 'UNCERTAIN', dueAt };
+    }
+    if (!button?.orderId || button.conflict) {
         const snapshotHash = _buildInstantSnapshot(vId, record?.official);
         const hasOfficialWork = (record?.official?.queue || []).length > 0;
-        const dueAt = Number(record?.official?.nextSlotAt) > Date.now()
-            ? Number(record.official.nextSlotAt) + BUILD_INSTANT_COMPLETION_MARGIN_MS
-            : hasOfficialWork ? Date.now() + BUILD_INSTANT_FALLBACK_MS : null;
+        const nextSlotAt = Number(record?.official?.nextSlotAt) || 0;
+        if (!hasOfficialWork) {
+            _clearBuildInstantFreeTimeout(vId);
+            _setBuildInstantState(vId, {
+                state: 'IDLE', nextDueAt: null, reason: 'no-active-build', uncertain: null,
+                confirmationAttempted: false
+            }, true);
+            return { status: 'IDLE' };
+        }
+        const alreadyConfirmed = Boolean(record?.instant?.confirmationAttempted) || reason === 'free-confirmation';
+        const confirmationAt = !alreadyConfirmed && nextSlotAt > Date.now()
+            ? _buildInstantConfirmationAt(nextSlotAt, Date.now()) : null;
+        if (confirmationAt) {
+            _scheduleBuildInstantWorker(vId, confirmationAt, 'free-confirmation', record.official, {
+                checkedOfficialGeneration: record.official.generation,
+                statePatch: {
+                    state: 'WAITING_FREE_CONFIRMATION', confirmationAttempted: true,
+                    reason: button?.conflict ? 'action-conflict' : 'button-absent'
+                }
+            });
+            return { status: 'WAITING_FREE_CONFIRMATION', dueAt: confirmationAt };
+        }
+        const dueAt = nextSlotAt > Date.now()
+            ? nextSlotAt + BUILD_INSTANT_COMPLETION_MARGIN_MS
+            : Date.now() + BUILD_INSTANT_FALLBACK_MS;
         _setBuildInstantState(vId, {
             state: 'STALE', nextDueAt: dueAt,
             checkedOfficialGeneration: record?.official?.generation || 0,
-            snapshotHash, reason: 'button-absent', uncertain: null
+            snapshotHash, reason: button?.conflict ? 'action-conflict' : 'button-absent', uncertain: null,
+            confirmationAttempted: true
         }, true);
-        if (dueAt) _scheduleBuildInstantWorker(vId, dueAt, record?.official?.nextSlotAt ? 'known-completion' : 'stale-fallback', record.official, {
+        _scheduleBuildInstantWorker(vId, dueAt, nextSlotAt ? 'known-completion' : 'stale-fallback', record.official, {
             checkedOfficialGeneration: record.official.generation,
-            statePatch: { state: 'STALE' }
+            statePatch: { state: 'STALE', confirmationAttempted: true }
         });
-        return { status: 'STALE' };
+        return { status: 'STALE', dueAt };
     }
 
     const now = Date.now();
@@ -304,7 +467,7 @@ async function runBuildInstantFreeWorker(villageId, expectedGeneration, expected
         });
         return { status: 'STALE', dueAt };
     }
-    return buildInstantFreeApiCall(button.orderId, vId, record.official.generation, _buildInstantSnapshot(vId, record.official));
+    return buildInstantFreeApiCall(button.orderId, vId, inspectedGeneration, inspectedHash);
 }
 
 async function buildInstantFreeApiCall(orderId, villageId, expectedGeneration, expectedHash) {
@@ -317,15 +480,27 @@ async function buildInstantFreeApiCall(orderId, villageId, expectedGeneration, e
         _clearBuildInstantFreeTimeout(vId);
         return { status: 'DISABLED' };
     }
+    if (_buildInstantHardStopped()) return _parkBuildInstantHardStop(vId, record?.official, record?.instant?.uncertain);
     if (!_buildInstantLeaseActive(vId)) return _deferBuildInstantLease(vId, 'lease-before-mutation');
     if (Number(record?.official?.generation) !== Number(expectedGeneration) ||
-        _buildInstantSnapshot(vId, record?.official) !== expectedHash ||
-        !record?.official?.cancelIds?.some(id => String(id) === String(orderId))) {
+        _buildInstantSnapshot(vId, record?.official) !== expectedHash) {
         window.PremiumFeaturesDiagnostics?.record?.({
             feature: 'build-instant', villageId: vId, taskKey: 'build-instant:' + vId,
             status: 'SKIPPED', reason: 'mutation-precondition'
         });
-        return { status: 'STALE_GENERATION' };
+        return checkAndScheduleBuildInstantFree(vId, { observeDom: false });
+    }
+    if (!_buildInstantActionProof(record, orderId, Date.now())) {
+        window.PremiumFeaturesDiagnostics?.record?.({
+            feature: 'build-instant', villageId: vId, taskKey: 'build-instant:' + vId,
+            status: 'SKIPPED', reason: 'official-free-action-not-proven'
+        });
+        _setBuildInstantState(vId, {
+            state: 'STALE', checkedOfficialGeneration: record.official.generation,
+            snapshotHash: expectedHash, reason: 'official-free-action-not-proven',
+            confirmationAttempted: true
+        }, true);
+        return checkAndScheduleBuildInstantFree(vId, { observeDom: false });
     }
 
     _setBuildInstantState(vId, { state: 'EXECUTING', orderId: String(orderId), reason: 'free-window' }, true);
@@ -335,14 +510,10 @@ async function buildInstantFreeApiCall(orderId, villageId, expectedGeneration, e
         key: 'build-instant:mutation:' + vId,
         feature: 'build-instant', villageId: vId, logicalResource: 'build-instant:' + vId,
         method: 'GET', url, mutation: true, leaseKey: 'build-instant:' + vId,
-        snapshotHash: expectedHash, scheduler: window.PremiumFeaturesBackgroundScheduler,
-        reconcile: function () {
-            const latest = state?.get(vId)?.official || {};
-            _scheduleBuildInstantWorker(vId, Date.now(), 'uncertain-reconcile', latest, { orderId: String(orderId) });
-        },
+        snapshotHash: expectedHash,
         run: async function () {
             if (!_buildInstantEnabled()) return Promise.reject(Object.assign(new Error('Build Instant disabled before mutation'), { code: 'STALE_CONFIG' }));
-            if (window.PremiumFeaturesBotProtection?.isActive?.()) {
+            if (_buildInstantHardStopped()) {
                 return Promise.reject(Object.assign(new Error('Bot protection active'), { code: 'HARD_STOP' }));
             }
             if (!_buildInstantLeaseActive(vId)) {
@@ -350,14 +521,42 @@ async function buildInstantFreeApiCall(orderId, villageId, expectedGeneration, e
                 error.code = 'LEASE_LOST';
                 throw error;
             }
+            const latest = state?.get(vId);
+            if (Number(latest?.official?.generation) !== Number(expectedGeneration) ||
+                _buildInstantSnapshot(vId, latest?.official) !== expectedHash ||
+                !_buildInstantActionProof(latest, orderId, Date.now())) {
+                const error = new Error('Build Instant official action changed before network');
+                error.code = 'STALE_GENERATION';
+                throw error;
+            }
             const response = await _buildInstantRequest({
                 feature: 'build-instant', villageId: vId, logicalResource: 'build-instant:' + vId,
                 method: 'GET', reason: 'instant-free-mutation'
-            }, () => fetch(url, {
-                method: 'GET',
-                headers: { accept: 'application/json, text/javascript, */*; q=0.01', 'tribalwars-ajax': '1', 'x-requested-with': 'XMLHttpRequest' },
-                credentials: 'include'
-            }));
+            }, () => {
+                const atNetwork = state?.get(vId);
+                if (!_buildInstantEnabled() || _buildInstantHardStopped()) {
+                    const error = new Error('Build Instant disabled or hard-stopped before network');
+                    error.code = _buildInstantHardStopped() ? 'HARD_STOP' : 'STALE_CONFIG';
+                    throw error;
+                }
+                if (!_buildInstantLeaseActive(vId)) {
+                    const error = new Error('Build Instant lease lost immediately before network');
+                    error.code = 'LEASE_LOST';
+                    throw error;
+                }
+                if (Number(atNetwork?.official?.generation) !== Number(expectedGeneration) ||
+                    _buildInstantSnapshot(vId, atNetwork?.official) !== expectedHash ||
+                    !_buildInstantActionProof(atNetwork, orderId, Date.now())) {
+                    const error = new Error('Build Instant action invalid immediately before network');
+                    error.code = 'STALE_GENERATION';
+                    throw error;
+                }
+                return fetch(url, {
+                    method: 'GET',
+                    headers: { accept: 'application/json, text/javascript, */*; q=0.01', 'tribalwars-ajax': '1', 'x-requested-with': 'XMLHttpRequest' },
+                    credentials: 'include'
+                });
+            });
             _throwBuildInstantResponse(response, url);
             try {
                 return await response.json();
@@ -369,9 +568,14 @@ async function buildInstantFreeApiCall(orderId, villageId, expectedGeneration, e
     });
 
     if (resilient.status === 'UNCERTAIN') {
+        const uncertain = { orderId: String(orderId), snapshotHash: expectedHash, at: Date.now() };
+        const dueAt = Number(resilient.retryAt) || Date.now() + 30000;
+        _scheduleBuildInstantWorker(vId, dueAt, 'uncertain-reconcile', state?.get(vId)?.official || {}, {
+            orderId: String(orderId), uncertain,
+            statePatch: { state: 'UNCERTAIN', orderId: String(orderId) }
+        });
         _setBuildInstantState(vId, {
-            state: 'UNCERTAIN', uncertain: { orderId: String(orderId), snapshotHash: expectedHash, at: Date.now() },
-            nextDueAt: resilient.retryAt, reason: 'mutation-uncertain'
+            state: 'UNCERTAIN', uncertain, nextDueAt: dueAt, reason: 'mutation-uncertain'
         }, true);
         return resilient;
     }
@@ -381,13 +585,23 @@ async function buildInstantFreeApiCall(orderId, villageId, expectedGeneration, e
         });
         return resilient;
     }
+    if (resilient.failure?.error?.code === 'STALE_GENERATION') {
+        return checkAndScheduleBuildInstantFree(vId, { observeDom: false });
+    }
+    if (resilient.failure?.error?.code === 'LEASE_LOST') {
+        return _deferBuildInstantLease(vId, 'lease-immediately-before-network');
+    }
     if (resilient.stale || resilient.failure?.error?.code === 'STALE_CONFIG') {
         _clearBuildInstantFreeTimeout(vId);
         _setBuildInstantState(vId, { state: 'IDLE', nextDueAt: null, reason: 'disabled-before-mutation', uncertain: null }, true);
         return { status: 'DISABLED' };
     }
     if (resilient.status !== 'SUCCESS') {
-        if (resilient.status !== 'HARD_STOP') {
+        if (resilient.status === 'HARD_STOP') {
+            _parkBuildInstantHardStop(vId, state?.get(vId)?.official, {
+                orderId: String(orderId), snapshotHash: expectedHash, at: Date.now()
+            });
+        } else {
             const dueAt = Number(record.official?.nextSlotAt) > Date.now()
                 ? Number(record.official.nextSlotAt) + BUILD_INSTANT_COMPLETION_MARGIN_MS
                 : Date.now() + BUILD_INSTANT_FALLBACK_MS;

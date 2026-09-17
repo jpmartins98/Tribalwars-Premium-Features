@@ -51,6 +51,7 @@ function createUiDocument() {
             insertBefore(node) { this.children.unshift(node); node.parentElement = this; return node; },
             addEventListener(type, listener) { listeners.set(type, listener); },
             removeEventListener() {},
+            dispatchEvent(event) { listeners.get(event?.type)?.({ target: this }); return true; },
             dispatch(type) { listeners.get(type)?.({ target: this }); },
             setAttribute(name, value) { this[name] = String(value); },
             getAttribute(name) { return this[name] ?? null; },
@@ -132,6 +133,7 @@ function load(context, relativePath) {
 
 function installTimerHarness(context) {
     const timers = new Map();
+    const handlers = new Map();
     context.setHandlerOnTimeOut = function (id, handlerName, args, waitMs) {
         const descriptor = { id, handlerName, args: Array.from(args || []), waitMs: Number(waitMs) || 0, dueAt: Date.now() + (Number(waitMs) || 0) };
         timers.set(String(id), descriptor);
@@ -144,7 +146,17 @@ function installTimerHarness(context) {
         context.localStorage.removeItem('endTime_' + id);
         context.localStorage.removeItem('handler_' + id);
     };
-    context.registerTimeoutHandler = function () {};
+    context.registerTimeoutHandler = function (name, handler) { handlers.set(name, handler); };
+    timers.fire = async function (id) {
+        const descriptor = timers.get(String(id));
+        assert.ok(descriptor, 'expected an armed timer: ' + id);
+        const handler = handlers.get(descriptor.handlerName);
+        assert.equal(typeof handler, 'function', 'persistent handler must resolve');
+        timers.delete(String(id));
+        context.localStorage.removeItem('endTime_' + id);
+        context.localStorage.removeItem('handler_' + id);
+        return handler(...descriptor.args);
+    };
     return timers;
 }
 
@@ -383,17 +395,128 @@ function createBuildInstantSystem(buttonFactory) {
     return { context, record, timers };
 }
 
-test('Build Instant button absent marks one snapshot STALE and never refetches it immediately', async () => {
+test('Build Instant at 181 seconds waits for the known 180-second window', () => {
     const { context, record, timers } = createBuildInstantSystem(() => null);
+    record.official.nextSlotAt = Date.now() + 181000;
+    record.official.slots = [record.official.nextSlotAt];
+    const result = context.checkAndScheduleBuildInstantFree('1', { observeDom: false });
+    assert.equal(result.status, 'WAITING_WINDOW');
+    assert.ok(timers.get('build_instant_free_1').dueAt >= Date.now());
+    assert.ok(timers.get('build_instant_free_1').dueAt <= Date.now() + 1500);
+    assert.equal(context.inspections, 0);
+});
+
+test('Build Instant button absent inside the free window retains one bounded confirmation wake', async () => {
+    const { context, record, timers } = createBuildInstantSystem(() => null);
+    record.official.nextSlotAt = Date.now() + 179000;
+    record.official.slots = [record.official.nextSlotAt];
     context.checkAndScheduleBuildInstantFree('1', { observeDom: false });
     const first = timers.get('build_instant_free_1');
     await context.runBuildInstantFreeWorker(...first.args);
-    assert.equal(record.instant.state, 'STALE');
+    assert.equal(record.instant.state, 'WAITING_FREE_CONFIRMATION');
     assert.equal(context.inspections, 1);
     for (let index = 0; index < 5; index++) context.checkAndScheduleBuildInstantFree('1', { observeDom: false });
     assert.equal(context.inspections, 1);
     assert.equal(timers.size, 1);
-    assert.ok(timers.get('build_instant_free_1').dueAt >= record.official.nextSlotAt);
+    assert.ok(timers.get('build_instant_free_1').dueAt < record.official.nextSlotAt);
+});
+
+test('Build Instant recovers a persisted old STALE button-absent state inside the window', () => {
+    const { context, record, timers } = createBuildInstantSystem(() => null);
+    record.official.nextSlotAt = Date.now() + 179000;
+    record.official.slots = [record.official.nextSlotAt];
+    record.instant = {
+        state: 'STALE', reason: 'button-absent',
+        snapshotHash: context._buildInstantSnapshot('1', record.official),
+        checkedOfficialGeneration: record.official.generation,
+        nextDueAt: record.official.nextSlotAt + 2000
+    };
+    const result = context.checkAndScheduleBuildInstantFree('1', { observeDom: false });
+    assert.equal(result.status, 'WAITING_FREE_CONFIRMATION');
+    assert.ok(timers.get('build_instant_free_1').dueAt < record.official.nextSlotAt);
+    assert.equal(context.inspections, 0);
+});
+
+test('Build Instant second official observation can confirm the action inside the free window', async () => {
+    let available = false;
+    const { context, record, timers } = createBuildInstantSystem(() => available ? ({
+        orderId: '44', availableFrom: Date.now() - 1000, availableTo: Date.now() + 179000
+    }) : null);
+    record.official.nextSlotAt = Date.now() + 179000;
+    record.official.slots = [record.official.nextSlotAt];
+    vm.runInContext(`
+        var instantMutations = 0;
+        buildInstantFreeApiCall = async function () { instantMutations++; return { status: 'SUCCESS' }; };
+    `, context);
+    context.checkAndScheduleBuildInstantFree('1', { observeDom: false });
+    await context.runBuildInstantFreeWorker(...timers.get('build_instant_free_1').args);
+    assert.equal(context.instantMutations, 0);
+    assert.ok(timers.get('build_instant_free_1').dueAt < record.official.nextSlotAt,
+        'confirmation must be scheduled before normal completion');
+    available = true;
+    await context.runBuildInstantFreeWorker(...timers.get('build_instant_free_1').args);
+    assert.equal(context.inspections, 2);
+    assert.equal(context.instantMutations, 1);
+});
+
+test('Build Instant reload re-arms a known confirmation without inspecting early', async () => {
+    const { context, record, timers } = createBuildInstantSystem(() => null);
+    record.official.nextSlotAt = Date.now() + 179000;
+    record.official.slots = [record.official.nextSlotAt];
+    context.checkAndScheduleBuildInstantFree('1', { observeDom: false });
+    await context.runBuildInstantFreeWorker(...timers.get('build_instant_free_1').args);
+    const dueAt = record.instant.nextDueAt;
+    timers.delete('build_instant_free_1');
+    context.localStorage.removeItem('endTime_build_instant_free_1');
+    const result = context.checkAndScheduleBuildInstantFree('1', { observeDom: false });
+    assert.equal(result.status, 'WAITING_FREE_CONFIRMATION');
+    assert.equal(context.inspections, 1);
+    assert.equal(timers.get('build_instant_free_1').dueAt, dueAt);
+});
+
+test('Build Instant current-village DOM action event wakes without a network poll and rebinds after partial reload', () => {
+    const { context, record, timers } = createBuildInstantSystem(() => null);
+    record.official.nextSlotAt = Date.now() + 179000;
+    record.official.slots = [record.official.nextSlotAt];
+    const observers = [];
+    let action = null;
+    let root = { querySelector: () => action };
+    let activeObserver;
+    let requests = 0;
+    context.fetch = async () => { requests++; throw new Error('DOM event must not fetch'); };
+    context.document.querySelector = selector => selector === '#building_wrapper' ? root :
+        selector === '#buildings' ? {} : selector === '.btn-instant-free' ? action : null;
+    context.MutationObserver = class {
+        constructor(callback) { this.callback = callback; observers.push(this); }
+        observe() {}
+        disconnect() { this.disconnected = true; }
+    };
+    context.PremiumFeaturesRuntimeRegistry = {
+        setObserver(_key, factory, replace) {
+            if (replace) activeObserver?.disconnect();
+            activeObserver = factory();
+            return activeObserver;
+        },
+        clearObserver() { activeObserver?.disconnect(); activeObserver = null; }
+    };
+    context.observeBuildQueueDocument = () => {
+        record.official = { ...record.official, generation: record.official.generation + 1,
+            instantFree: action ? { orderId: '44', availableFrom: Date.now() - 1000,
+                availableTo: record.official.nextSlotAt } : null,
+            source: 'dom', fetchedAt: Date.now() };
+        return { official: record.official, doc: context.document };
+    };
+    context.checkAndScheduleBuildInstantFree('1');
+    assert.equal(observers.length, 1);
+    action = { getAttribute: () => 'change_order(44)' };
+    observers[0].callback();
+    assert.equal(record.official.instantFree.orderId, '44');
+    assert.ok(timers.has('build_instant_free_1'));
+    assert.equal(requests, 0);
+    root = { querySelector: () => action };
+    context.checkAndScheduleBuildInstantFree('1');
+    assert.equal(observers.length, 2);
+    assert.equal(observers[0].disconnected, true);
 });
 
 test('Build Instant button present reaches exactly one mutation with the observed generation', async () => {
@@ -408,6 +531,217 @@ test('Build Instant button present reaches exactly one mutation with the observe
     await context.runBuildInstantFreeWorker(...timers.get('build_instant_free_1').args);
     assert.equal(context.instantMutations, 1);
     assert.equal(context.inspections, 1);
+});
+
+test('Build Instant inside 179 seconds uses one confirmed free reduce request', async () => {
+    const { context, record, timers } = createBuildInstantSystem(() => ({
+        orderId: '44', availableFrom: Date.now() - 1000, availableTo: Date.now() + 179000
+    }));
+    record.official.nextSlotAt = Date.now() + 179000;
+    record.official.slots = [record.official.nextSlotAt];
+    let mutations = 0;
+    context.fetch = async () => {
+        mutations++;
+        return { ok: true, status: 200, json: async () => ({ response: { success: true } }) };
+    };
+    context.checkAndScheduleBuildInstantFree('1', { observeDom: false });
+    await context.runBuildInstantFreeWorker(...timers.get('build_instant_free_1').args);
+    assert.equal(context.inspections, 1);
+    assert.equal(mutations, 1);
+    assert.equal(record.instant.state, 'IDLE');
+});
+
+test('Build Instant absent twice waits for normal completion without a request loop', async () => {
+    const { context, record, timers } = createBuildInstantSystem(() => null);
+    record.official.nextSlotAt = Date.now() + 179000;
+    record.official.slots = [record.official.nextSlotAt];
+    let mutations = 0;
+    context.fetch = async () => { mutations++; throw new Error('no action proof'); };
+    context.checkAndScheduleBuildInstantFree('1', { observeDom: false });
+    await context.runBuildInstantFreeWorker(...timers.get('build_instant_free_1').args);
+    await context.runBuildInstantFreeWorker(...timers.get('build_instant_free_1').args);
+    assert.equal(context.inspections, 2);
+    assert.equal(mutations, 0);
+    assert.equal(record.instant.state, 'STALE');
+    assert.ok(timers.get('build_instant_free_1').dueAt >= record.official.nextSlotAt);
+    vm.runInContext(`_inspectBuildInstant = async function () {
+        inspections++;
+        var current = window.PremiumFeaturesBuildState.get('1').official;
+        var completed = Object.assign({}, current, { generation: current.generation + 1,
+            queue: [], slots: [], cancelIds: [], nextSlotAt: null, instantFree: null });
+        window.PremiumFeaturesBuildState.get('1').official = completed;
+        return { official: completed, doc: { querySelector: function () { return null; } } };
+    };`, context);
+    await context.runBuildInstantFreeWorker(...timers.get('build_instant_free_1').args);
+    assert.equal(record.instant.state, 'IDLE');
+    assert.equal(timers.has('build_instant_free_1'), false);
+    assert.equal(context.inspections, 3);
+    assert.equal(mutations, 0);
+});
+
+test('Build Instant generation change or wrong order ID blocks final mutation', async () => {
+    for (const scenario of ['generation', 'order-id']) {
+        const { context, record, timers } = createBuildInstantSystem(() => ({
+            orderId: scenario === 'order-id' ? '45' : '44',
+            availableFrom: Date.now() - 1000, availableTo: Date.now() + 179000
+        }));
+        record.official.nextSlotAt = Date.now() + 179000;
+        record.official.slots = [record.official.nextSlotAt];
+        let mutations = 0;
+        context.fetch = async () => { mutations++; throw new Error('stale action must not mutate'); };
+        if (scenario === 'generation') {
+            vm.runInContext(`_buildInstantButtonData = function (observed) {
+                window.PremiumFeaturesBuildState.get('1').official.generation++;
+                return observed.official.instantFree;
+            };`, context);
+        }
+        context.checkAndScheduleBuildInstantFree('1', { observeDom: false });
+        await context.runBuildInstantFreeWorker(...timers.get('build_instant_free_1').args);
+        assert.equal(mutations, 0, scenario);
+        assert.ok(timers.has('build_instant_free_1'), scenario + ' must retain a future recovery path');
+    }
+});
+
+test('Build Instant generation change at transmission boundary keeps a future wake', async () => {
+    const { context, record, timers } = createBuildInstantSystem(() => null);
+    record.official.nextSlotAt = Date.now() + 179000;
+    record.official.slots = [record.official.nextSlotAt];
+    record.official.instantFree = {
+        orderId: '44', availableFrom: Date.now() - 1000, availableTo: record.official.nextSlotAt
+    };
+    let mutations = 0;
+    context.fetch = async () => { mutations++; throw new Error('stale proof must not transmit'); };
+    context.PremiumFeaturesDiagnostics = {
+        request: async (_fields, run) => { record.official.generation++; return run(); }
+    };
+    await context.buildInstantFreeApiCall(
+        '44', '1', record.official.generation, context._buildInstantSnapshot('1', record.official)
+    );
+    assert.equal(mutations, 0);
+    assert.ok(timers.has('build_instant_free_1'), 'stale generation must schedule a fresh occurrence');
+    assert.notEqual(record.instant.reason, 'disabled-before-mutation');
+});
+
+test('Build Instant lease takeover at transmission boundary blocks network and rearms', async () => {
+    const { context, record, timers } = createBuildInstantSystem(() => null);
+    record.official.nextSlotAt = Date.now() + 179000;
+    record.official.slots = [record.official.nextSlotAt];
+    record.official.instantFree = {
+        orderId: '44', availableFrom: Date.now() - 1000, availableTo: record.official.nextSlotAt
+    };
+    const leaseExpiresAt = Date.now() + 10000;
+    let owner = 'A';
+    context.PremiumFeaturesCoordination = {
+        tabId: 'A', instanceId: 'A1',
+        readLease: () => ({ owner, instanceId: owner + '1', expiresAt: leaseExpiresAt })
+    };
+    let mutations = 0;
+    context.fetch = async () => { mutations++; throw new Error('lost lease must not transmit'); };
+    context.PremiumFeaturesDiagnostics = {
+        request: async (_fields, run) => { owner = 'B'; return run(); }
+    };
+    const result = await context.buildInstantFreeApiCall(
+        '44', '1', record.official.generation, context._buildInstantSnapshot('1', record.official)
+    );
+    assert.equal(result.status, 'WAITING_LEASE');
+    assert.equal(mutations, 0);
+    assert.ok(timers.get('build_instant_free_1').dueAt >= leaseExpiresAt);
+});
+
+test('Build Instant three tabs allow one lease owner to reduce the order', async () => {
+    const systems = ['A', 'B', 'C'].map(() => createBuildInstantSystem(() => ({
+        orderId: '44', availableFrom: Date.now() - 1000, availableTo: Date.now() + 179000
+    })));
+    let mutations = 0;
+    for (const [index, system] of systems.entries()) {
+        system.record.official.nextSlotAt = Date.now() + 179000;
+        system.record.official.slots = [system.record.official.nextSlotAt];
+        const tabId = ['A', 'B', 'C'][index];
+        system.context.PremiumFeaturesCoordination = {
+            tabId, instanceId: tabId + '1',
+            readLease: () => ({ owner: 'A', instanceId: 'A1', expiresAt: Date.now() + 60000 })
+        };
+        system.context.fetch = async () => {
+            mutations++;
+            return { ok: true, status: 200, json: async () => ({ response: { success: true } }) };
+        };
+        system.context.checkAndScheduleBuildInstantFree('1', { observeDom: false });
+    }
+    for (const system of systems) {
+        await system.context.runBuildInstantFreeWorker(...system.timers.get('build_instant_free_1').args);
+    }
+    assert.equal(mutations, 1);
+    assert.equal(systems[1].context.inspections, 0);
+    assert.equal(systems[2].context.inspections, 0);
+});
+
+test('Build Instant protection activated while waiting blocks due inspection and mutation', async () => {
+    const { context, timers } = createBuildInstantSystem(() => ({
+        orderId: '44', availableFrom: Date.now() - 1000, availableTo: Date.now() + 179000
+    }));
+    context.checkAndScheduleBuildInstantFree('1', { observeDom: false });
+    context.PremiumFeaturesBotProtection = { isActive: () => true };
+    let mutations = 0;
+    context.fetch = async () => { mutations++; throw new Error('hard stop must block network'); };
+    const result = await context.runBuildInstantFreeWorker(...timers.get('build_instant_free_1').args);
+    assert.equal(result.status, 'HARD_STOP');
+    assert.equal(context.inspections, 0);
+    assert.equal(mutations, 0);
+});
+
+test('Build Instant protection activated at the network boundary blocks mutation and parks the wake', async () => {
+    const { context, record, timers } = createBuildInstantSystem(() => null);
+    record.official.nextSlotAt = Date.now() + 179000;
+    record.official.slots = [record.official.nextSlotAt];
+    record.official.instantFree = {
+        orderId: '44', availableFrom: Date.now() - 1000, availableTo: record.official.nextSlotAt
+    };
+    let protectedNow = false;
+    let hardStops = 0;
+    let mutations = 0;
+    context.PremiumFeaturesBotProtection = { isActive: () => protectedNow };
+    context.PremiumFeaturesBackgroundScheduler = {
+        stats: () => ({ hardStopped: hardStops > 0 }), hardStop() { hardStops++; }
+    };
+    context.PremiumFeaturesDiagnostics = {
+        request: async (_fields, run) => { protectedNow = true; return run(); }
+    };
+    context.fetch = async () => { mutations++; throw new Error('hard stop must block transmission'); };
+    const result = await context.buildInstantFreeApiCall(
+        '44', '1', record.official.generation, context._buildInstantSnapshot('1', record.official)
+    );
+    assert.equal(result.status, 'HARD_STOP');
+    assert.equal(mutations, 0);
+    assert.equal(hardStops, 1);
+    assert.ok(timers.has('build_instant_free_1'));
+});
+
+test('Build Instant same-origin 403/429 hard-stop with zero retry', async () => {
+    for (const status of [403, 429]) {
+        const { context, record } = createBuildInstantSystem(() => null);
+        record.official.nextSlotAt = Date.now() + 179000;
+        record.official.slots = [record.official.nextSlotAt];
+        record.official.instantFree = {
+            orderId: '44', availableFrom: Date.now() - 1000, availableTo: record.official.nextSlotAt
+        };
+        let requests = 0;
+        let hardStops = 0;
+        context.PremiumFeaturesBackgroundScheduler = {
+            stats: () => ({ hardStopped: hardStops > 0 }),
+            hardStop() { hardStops++; }
+        };
+        context.fetch = async () => {
+            requests++;
+            return { ok: false, status, url: 'https://en1.tribalwars.net/game.php' };
+        };
+        const result = await context.buildInstantFreeApiCall(
+            '44', '1', record.official.generation, context._buildInstantSnapshot('1', record.official)
+        );
+        assert.equal(result.status, 'HARD_STOP');
+        assert.equal(requests, 1);
+        assert.equal(hardStops, 1);
+        assert.equal(record.instant.state, 'UNCERTAIN');
+    }
 });
 
 test('Build Instant old generation and lost lease abort before inspection', async () => {
@@ -447,6 +781,47 @@ test('Build Instant confirmed read failure becomes a soft pause with a future wa
     const result = await context.runBuildInstantFreeWorker(...initial.args);
     assert.equal(result.status, 'FAILED');
     assert.equal(record.instant.state, 'SOFT_PAUSED');
+    assert.ok(timers.get('build_instant_free_1').dueAt > Date.now());
+});
+
+test('Build Instant lost mutation response reconciles without a second reduce request', async () => {
+    const { context, record, timers } = createBuildInstantSystem(() => ({
+        orderId: '44', availableFrom: Date.now() - 1000, availableTo: Date.now() + 179000
+    }));
+    record.official.nextSlotAt = Date.now() + 179000;
+    record.official.slots = [record.official.nextSlotAt];
+    record.official.instantFree = {
+        orderId: '44', availableFrom: Date.now() - 1000, availableTo: record.official.nextSlotAt
+    };
+    let mutations = 0;
+    context.fetch = async () => {
+        mutations++;
+        const error = new Error('response lost after send');
+        error.code = 'ETIMEDOUT';
+        throw error;
+    };
+    const first = await context.buildInstantFreeApiCall(
+        '44', '1', record.official.generation, context._buildInstantSnapshot('1', record.official)
+    );
+    assert.equal(first.status, 'UNCERTAIN');
+    assert.equal(mutations, 1);
+    assert.equal(record.instant.state, 'UNCERTAIN');
+    await context.runBuildInstantFreeWorker(...timers.get('build_instant_free_1').args);
+    assert.equal(mutations, 1, 'uncertain reconciliation must not blindly repeat build_order_reduce');
+    assert.equal(record.instant.state, 'UNCERTAIN');
+});
+
+test('Build Instant uncertain reconciliation read failure retains uncertainty and a wake', async () => {
+    const { context, record, timers } = createBuildInstantSystem(() => null);
+    record.instant = {
+        state: 'UNCERTAIN', nextDueAt: Date.now(), orderId: '44',
+        uncertain: { orderId: '44', at: Date.now() }
+    };
+    context.PremiumFeaturesAsync.runResilientTask = async () => ({ status: 'FAILED', retryAt: Date.now() + 30000 });
+    context.checkAndScheduleBuildInstantFree('1', { observeDom: false });
+    await context.runBuildInstantFreeWorker(...timers.get('build_instant_free_1').args);
+    assert.equal(record.instant.state, 'UNCERTAIN');
+    assert.equal(record.instant.uncertain.orderId, '44');
     assert.ok(timers.get('build_instant_free_1').dueAt > Date.now());
 });
 
@@ -624,6 +999,80 @@ test('ordinary insufficient DOM resource ticks update local state without reconc
     context.installBuildQueueResourceObserver();
     assert.equal(record.resources.wood, 2);
     assert.equal(schedules, 0);
+});
+
+test('cached BQ cost becoming affordable coalesces ten resource ticks into one fresh reconciliation', () => {
+    const document = createDocument();
+    const targets = new Map(['wood', 'stone', 'iron', 'pop_current_label', 'pop_max_label'].map(id => [id, { id }]));
+    document.getElementById = id => targets.get(id) || null;
+    let observeMutations;
+    let resources = { wood: 1, stone: 1, iron: 1, pop: 0, popMax: 100, source: 'dom-initial' };
+    let record = {
+        queue: [{ id: 'head', buildingId: 'farm', targetLevel: 25 }],
+        official: { full: false, generation: 1 },
+        resources: { ...resources, generation: 1 },
+        execution: { state: 'WAITING_RESOURCES', nextDueAt: Date.now() + 300000 }
+    };
+    const pending = new Map();
+    const schedules = [];
+    const context = createContext({
+        document,
+        BUILD_QUEUE_STATE: { WAITING_RESOURCES: 'WAITING_RESOURCES', WAITING_POPULATION: 'WAITING_POPULATION' },
+        MutationObserver: class { constructor(callback) { observeMutations = callback; } observe() {} disconnect() {} },
+        PremiumFeaturesBuildState: {
+            get: () => record,
+            updateResources(_villageId, next) { record = { ...record, resources: { ...next, generation: record.resources.generation + 1 } }; }
+        },
+        PremiumFeaturesRuntimeRegistry: {
+            setObserver(_key, factory) { return factory(); },
+            setTimeout(key, callback) { pending.set(key, callback); }
+        },
+        bqGet: () => null
+    });
+    load(context, 'widgets/extraBuildQueue.js');
+    context.buildResourceStateFromDoc = () => resources;
+    context.resolveHeadBuildCost = () => ({
+        effectiveLevel: 25, cost: { wood: 800, stone: 800, iron: 800, pop: 5 },
+        source: 'DERIVED_OFFICIAL_LEVEL_CACHE_COST', authoritative: false
+    });
+    context.ensureBuildQueueController = () => ({ schedule(_villageId, options) { schedules.push(options); } });
+    context.installBuildQueueResourceObserver();
+    resources = { wood: 1000, stone: 1000, iron: 1000, pop: 0, popMax: 100, source: 'dom-event' };
+    for (let index = 0; index < 10; index++) observeMutations();
+    assert.equal(pending.size, 1);
+    pending.get('build-queue:resource-dom-coalesce')();
+    assert.equal(schedules.length, 1);
+    assert.equal(schedules[0].forceFresh, true);
+    assert.equal(schedules[0].reason, 'cached-cost-possibly-affordable');
+});
+
+test('Building Queue shell waits for its own hydration without starting a stale controller', async () => {
+    let resolveHydration;
+    const hydration = { status: 'PENDING', promise: new Promise(resolve => { resolveHydration = resolve; }) };
+    const document = createDocument();
+    document.querySelector = selector => selector === '#building_wrapper' || selector === '#buildings' ? {} : null;
+    let injections = 0;
+    let starts = 0;
+    const context = createContext({
+        document,
+        PremiumFeaturesHydration: { buildQueue: hydration },
+        settings_cookies: { general: { show__building_queue: true }, widgets: [] },
+        PremiumFeaturesBuildState: { start() { starts++; }, subscribe() {}, get: () => ({ queue: [] }) },
+        fetch: async () => { throw new Error('BQ network before hydration'); }
+    });
+    load(context, 'widgets/extraBuildQueue.js');
+    context.ensureBuildQueueController = () => ({ bootstrap() {} });
+    context.installBuildQueueResourceObserver = () => {};
+    context.installBuildQueueMutationInvalidation = () => {};
+    context.injectQueues = () => { injections++; };
+    const rendered = context.fetchBuildQueueWidget(false);
+    assert.equal(starts, 0);
+    assert.equal(injections, 0);
+    hydration.status = 'READY';
+    resolveHydration();
+    await rendered;
+    assert.equal(starts, 1);
+    assert.equal(injections, 1);
 });
 
 test('a known production change advances an older resource ETA without immediate network', () => {
@@ -906,6 +1355,175 @@ test('Scavenging fixed-level second cycle observes returned troops instead of re
     assert.ok(timers.has('scavenging-auto:1'));
 });
 
+test('fixed tier schedules its own option return instead of another tier returning first', async () => {
+    const nowSeconds = Math.floor(Date.now() / 1000);
+    const context = createContext({
+        PremiumFeaturesCoordination: {
+            tabId: 'B', instanceId: 'B1',
+            readLease: () => ({ owner: 'B', instanceId: 'B1', expiresAt: Date.now() + 60000 })
+        },
+        fetch: async (_url, options) => options?.method === 'POST'
+            ? { ok: true, status: 200, json: async () => ({ response: {
+                squad_responses: [{ success: true }], villages: { '1': { options: {
+                    1: { scavenging_squad: { return_time: nowSeconds + 300 } },
+                    4: { scavenging_squad: { return_time: nowSeconds + 1800 } }
+                } } }
+            } }) }
+            : { ok: true, status: 200, text: async () => scavengingPage({
+                options: Object.fromEntries([1, 2, 3, 4].map(id => [id, {
+                    base_id: id, is_locked: false, scavenging_squad: null
+                }])),
+                unit_counts_home: { spear: 10 }
+            }) }
+    });
+    const timers = installTimerHarness(context);
+    installScavengingPageParser(context);
+    load(context, 'bots/scavenging.js');
+    context.saveScavengeConfig({ enabled: true, level: 4, allUnits: true, units: {} }, '1');
+    await context.triggerScavengingAuto('1');
+    assert.ok(timers.get('scavenging-auto:1').dueAt >= (nowSeconds + 1800) * 1000);
+});
+
+test('optimized Scavenging recomputes a stale saved distribution from current home troops', async () => {
+    let gets = 0;
+    const posts = [];
+    const context = createContext({
+        PremiumFeaturesCoordination: {
+            tabId: 'B', instanceId: 'B1',
+            readLease: () => ({ owner: 'B', instanceId: 'B1', expiresAt: Date.now() + 60000 })
+        },
+        fetch: async (_url, options) => {
+            if (options?.method === 'POST') {
+                posts.push(new URLSearchParams(options.body));
+                return { ok: true, status: 200, json: async () => ({ response: {
+                    squad_responses: [{ success: true }], villages: { '1': { options: {} } }
+                } }) };
+            }
+            gets++;
+            return { ok: true, status: 200, text: async () => scavengingPage({
+                options: { 1: { base_id: 1, is_locked: false, scavenging_squad: null } },
+                unit_counts_home: { spear: 40, sword: 10 }
+            }) };
+        }
+    });
+    installTimerHarness(context);
+    installScavengingPageParser(context);
+    load(context, 'bots/scavenging.js');
+    context.saveScavengeConfig({
+        enabled: true, optimizeMode: true, level: 0,
+        units: { spear: 100, sword: 20 }, selectedLevelIndices: [1],
+        optimizeCalculationMode: 'balanced',
+        distributionByOption: { 1: { units: { spear: 100, sword: 20 }, carryMax: 2800 } }
+    }, '1');
+    await context.triggerScavengingAuto('1');
+    assert.equal(gets, 1);
+    assert.equal(posts.length, 1, 'stale preview must not defer the eligible cycle for 30 minutes');
+    assert.ok(Number(posts[0].get('squad_requests[0][candidate_squad][unit_counts][spear]')) <= 40);
+    assert.ok(Number(posts[0].get('squad_requests[0][candidate_squad][unit_counts][sword]')) <= 10);
+});
+
+test('automatic all-units Scavenging uses a positive troop allowlist', async () => {
+    let body;
+    const context = createContext({
+        PremiumFeaturesCoordination: {
+            tabId: 'B', instanceId: 'B1',
+            readLease: () => ({ owner: 'B', instanceId: 'B1', expiresAt: Date.now() + 60000 })
+        },
+        fetch: async (_url, options) => options?.method === 'POST'
+            ? (body = new URLSearchParams(options.body), {
+                ok: true, status: 200, json: async () => ({ response: {
+                    squad_responses: [{ success: true }], villages: { '1': { options: {} } }
+                } })
+            })
+            : { ok: true, status: 200, text: async () => scavengingPage({
+                options: { 1: { base_id: 1, is_locked: false, scavenging_squad: null } },
+                unit_counts_home: { spear: 100, spy: 20, ram: 10, catapult: 10, snob: 1, knight: 1, militia: 2 }
+            }) }
+    });
+    installTimerHarness(context);
+    installScavengingPageParser(context);
+    load(context, 'bots/scavenging.js');
+    context.saveScavengeConfig({ enabled: true, level: 0, allUnits: true, units: {} }, '1');
+    await context.triggerScavengingAuto('1');
+    assert.ok(body);
+    for (const unit of ['spy', 'ram', 'catapult', 'snob', 'knight', 'militia']) {
+        assert.equal(body.has('squad_requests[0][candidate_squad][unit_counts][' + unit + ']'), false);
+    }
+    assert.equal(body.get('squad_requests[0][candidate_squad][unit_counts][spear]'), '100');
+});
+
+test('Scavenging protection active before wake blocks its official GET', async () => {
+    let requests = 0;
+    const context = createContext({
+        PremiumFeaturesBotProtection: { isActive: () => true },
+        PremiumFeaturesCoordination: {
+            tabId: 'B', instanceId: 'B1',
+            readLease: () => ({ owner: 'B', instanceId: 'B1', expiresAt: Date.now() + 60000 })
+        },
+        fetch: async () => { requests++; throw new Error('protected worker must not fetch'); }
+    });
+    installTimerHarness(context);
+    load(context, 'bots/scavenging.js');
+    context.saveScavengeConfig({ enabled: true, level: 1, allUnits: true, units: {} }, '1');
+    await context.triggerScavengingAuto('1');
+    assert.equal(requests, 0);
+});
+
+test('Scavenging official GET 429 hard-stops without a retry request', async () => {
+    let gets = 0;
+    let posts = 0;
+    let stopped = false;
+    const context = createContext({
+        PremiumFeaturesCoordination: {
+            tabId: 'B', instanceId: 'B1',
+            readLease: () => ({ owner: 'B', instanceId: 'B1', expiresAt: Date.now() + 60000 })
+        },
+        PremiumFeaturesBackgroundScheduler: {
+            stats: () => ({ hardStopped: stopped }),
+            hardStop() { stopped = true; }
+        },
+        PremiumFeaturesAsync: { classifyRequestFailure: error => ({ hardStop: Number(error.status) === 429 }) },
+        fetch: async (_url, options) => {
+            if (options?.method === 'POST') posts++;
+            else gets++;
+            return { ok: false, status: 429, url: 'https://en1.tribalwars.net/game.php' };
+        }
+    });
+    installTimerHarness(context);
+    load(context, 'bots/scavenging.js');
+    context.saveScavengeConfig({ enabled: true, level: 0, allUnits: true, units: {} }, '1');
+    await context.triggerScavengingAuto('1');
+    assert.equal(gets, 1);
+    assert.equal(posts, 0);
+    assert.equal(stopped, true);
+    await context.triggerScavengingAuto('1');
+    assert.equal(gets, 1, 'hard stop must suppress future state GETs');
+});
+
+test('Overview Scavenging countdown reads only the displayed village timer', () => {
+    const now = Date.now();
+    const storage = createStorage({
+        'endTime_scavenging-auto:123': String(now + 600000),
+        'endTime_scavenging-auto:456': String(now + 1200000)
+    });
+    const labels = [];
+    const context = createContext({
+        localStorage: storage,
+        game_data: { village: { id: 123 } },
+        endTimeToTimer: endTime => [Math.floor((endTime * 1000 - now) / 3600000), 10, 0],
+        addToVisualLabelExtra: (_key, _label, _countdown, endTime) => labels.push(endTime)
+    });
+    const source = fs.readFileSync(path.join(ROOT, 'features/overview.js'), 'utf8');
+    const match = source.match(/function getPlaceInfo\(\) \{[\s\S]*?\n\}/);
+    assert.ok(match);
+    vm.runInContext(match[0], context);
+    context.getPlaceInfo();
+    assert.deepEqual(labels, [Math.floor((now + 600000) / 1000)]);
+    context.game_data.village.id = 456;
+    context.getPlaceInfo();
+    assert.deepEqual(labels, [Math.floor((now + 600000) / 1000), Math.floor((now + 1200000) / 1000)]);
+});
+
 test('Scavenging fixed-level return wake defers a still-busy option without another POST', async () => {
     let posts = 0;
     let gets = 0;
@@ -1067,6 +1685,7 @@ test('Scavenging lease contention creates an explicit expiry wake with zero netw
     assert.ok(result.dueAt >= leaseExpiresAt);
     assert.equal(timers.get('scavenging-auto:11').handlerName, 'scavengingAutoCheck');
     assert.ok(timers.get('scavenging-auto:11').dueAt >= leaseExpiresAt);
+    assert.equal(context._scavengingOperationalStatus('11'), 'WAITING_LEASE');
     assert.equal(requests, 0);
 });
 
@@ -1114,13 +1733,134 @@ test('individual Auto Scavenging UI is usable without private automation mode', 
     assert.equal(context.getScavengeConfig('1').enabled, false);
     await start.onclick();
     assert.equal(context.getScavengeConfig('1').enabled, true);
-    assert.ok(statusCell.textContent.includes('scavenge.statusActive'));
+    assert.ok(statusCell.textContent.includes('scavenge.statusStarting'));
     assert.ok(timers.has('scavenging-auto:1'));
     toggle.checked = false;
     toggle.onchange();
     assert.equal(context.getScavengeConfig('1').enabled, false);
     assert.equal(statusCell.textContent, 'scavenge.statusOff');
     assert.equal(timers.has('scavenging-auto:1'), false);
+});
+
+test('confirmed manual Send Now updates its page in place without partial reload', async () => {
+    const ui = createUiDocument();
+    const container = ui.makeElement('div');
+    const option = ui.makeElement('div');
+    option.className = 'scavenge-option';
+    option.dataset.optionId = '1';
+    const nativeButton = ui.makeElement('button');
+    option.querySelector = selector => selector === '.locked-view' ? null :
+        selector === '.inactive-view .free_send_button' ? nativeButton : null;
+    option.querySelectorAll = selector => selector === '.free_send_button' ? [nativeButton] : [];
+    const originalWidget = ui.makeElement('div');
+    const spearInput = ui.makeElement('input');
+    spearInput.name = 'spear';
+    spearInput.dataset.allCount = '10';
+    originalWidget.querySelectorAll = selector => selector === 'input[name]' ? [spearInput] : [];
+    ui.document.querySelector = selector => selector === '.scavenge-screen-main-widget' ? container : null;
+    ui.document.querySelectorAll = selector => selector === '.scavenge-option' ? [option] :
+        selector === '.candidate-squad-widget' ? [originalWidget] : [];
+    let posts = 0;
+    let reloads = 0;
+    const context = createContext({
+        document: ui.document,
+        Event: class { constructor(type) { this.type = type; } },
+        partialReload() { reloads++; },
+        fetch: async (_url, options) => {
+            if (options?.method === 'POST') {
+                posts++;
+                return { ok: true, status: 200, json: async () => ({ response: {
+                    squad_responses: [{ success: true }],
+                    villages: { '1': { options: { 1: {
+                        base_id: 1, scavenging_squad: { return_time: String(Math.floor(Date.now() / 1000) + 300) }
+                    } } } }
+                } }) };
+            }
+            throw new Error('manual send unexpectedly fetched official state');
+        }
+    });
+    load(context, 'bots/scavenging.js');
+    context.injectScavengeConfigPanel();
+    const sendNow = ui.elements.find(element => element.textContent === 'scavenge.sendNow');
+    assert.ok(sendNow);
+    await sendNow.onclick();
+    assert.equal(posts, 1);
+    assert.equal(reloads, 0);
+    assert.equal(sendNow.disabled, false);
+    assert.ok(Number(option.dataset.twpfReturnAt) > Date.now());
+    assert.equal(nativeButton['aria-disabled'], 'true');
+});
+
+test('Save & Start reaches the registered Scavenging worker and one eligible GET/POST', async () => {
+    const ui = createUiDocument();
+    const container = ui.makeElement('div');
+    ui.document.querySelector = selector => selector === '.scavenge-screen-main-widget' ? container : null;
+    ui.document.querySelectorAll = () => [];
+    let gets = 0;
+    let posts = 0;
+    const context = createContext({
+        document: ui.document,
+        PremiumFeaturesCoordination: {
+            tabId: 'B', instanceId: 'B1',
+            readLease: () => ({ owner: 'B', instanceId: 'B1', expiresAt: Date.now() + 60000 })
+        },
+        fetch: async (_url, options) => {
+            if (options?.method === 'POST') {
+                posts++;
+                return { ok: true, status: 200, json: async () => ({ response: {
+                    squad_responses: [{ success: true }], villages: { '1': { options: {} } }
+                } }) };
+            }
+            gets++;
+            return { ok: true, status: 200, text: async () => scavengingPage({
+                options: { 1: { base_id: 1, is_locked: false, scavenging_squad: null } },
+                unit_counts_home: { spear: 10 }
+            }) };
+        }
+    });
+    const timers = installTimerHarness(context);
+    installScavengingPageParser(context);
+    load(context, 'bots/scavenging.js');
+    context.injectScavengeConfigPanel();
+    const toggle = ui.document.getElementById('scavenge_config_enabled');
+    const start = ui.elements.find(element => element.textContent === 'scavenge.saveAndStart');
+    toggle.checked = true;
+    toggle.onchange();
+    await start.onclick();
+    assert.equal(context.getScavengeConfig('1').enabled, true);
+    assert.deepEqual(Array.from(timers.keys()), ['scavenging-auto:1']);
+    assert.equal(gets + posts, 0);
+    await timers.fire('scavenging-auto:1');
+    assert.equal(gets, 1);
+    assert.equal(posts, 1);
+    assert.ok(timers.has('scavenging-auto:1'), 'confirmed send must arm its successor');
+});
+
+test('Save & Start under HARD_STOP stores intent but shows pause and sends no request', async () => {
+    const ui = createUiDocument();
+    const container = ui.makeElement('div');
+    ui.document.querySelector = selector => selector === '.scavenge-screen-main-widget' ? container : null;
+    ui.document.querySelectorAll = () => [];
+    let requests = 0;
+    const context = createContext({
+        document: ui.document,
+        PremiumFeaturesBotProtection: { isActive: () => true },
+        PremiumFeaturesBackgroundScheduler: { stats: () => ({ hardStopped: true }) },
+        fetch: async () => { requests++; throw new Error('hard-stop must prevent GET and POST'); }
+    });
+    const timers = installTimerHarness(context);
+    load(context, 'bots/scavenging.js');
+    context.injectScavengeConfigPanel();
+    const toggle = ui.document.getElementById('scavenge_config_enabled');
+    const status = ui.elements.find(element => element.textContent === 'scavenge.statusOff');
+    const start = ui.elements.find(element => element.textContent === 'scavenge.saveAndStart');
+    toggle.checked = true;
+    toggle.onchange();
+    await start.onclick();
+    assert.equal(context.getScavengeConfig('1').enabled, true);
+    assert.ok(status.textContent.includes('scavenge.statusHardStop'));
+    await timers.fire('scavenging-auto:1');
+    assert.equal(requests, 0);
 });
 
 test('Scavenging manual network loss persists UNCERTAIN and schedules one read reconciliation', async () => {

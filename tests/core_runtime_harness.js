@@ -100,6 +100,40 @@ function createEventTarget() {
     };
 }
 
+function createScavengeUiDocument() {
+    const elements = [];
+    function element(tagName = 'div') {
+        const node = {
+            tagName: tagName.toUpperCase(), style: {}, dataset: {}, children: [], childNodes: [],
+            className: '', id: '', name: '', value: '', checked: false, disabled: false, textContent: '',
+            classList: { add() {}, remove() {}, contains() { return false; } },
+            append(...children) { children.forEach(child => this.appendChild(child)); },
+            appendChild(child) { this.children.push(child); child.parentElement = this; return child; },
+            insertBefore(child) { this.children.unshift(child); child.parentElement = this; return child; },
+            addEventListener() {}, removeEventListener() {}, dispatchEvent() {},
+            setAttribute(name, value) { this[name] = String(value); },
+            getAttribute(name) { return this[name] ?? null; },
+            closest() { return null; }, querySelector() { return null; }, querySelectorAll() { return []; },
+            insertRow() { return this.appendChild(element('tr')); },
+            insertCell() { return this.appendChild(element('td')); }
+        };
+        elements.push(node);
+        return node;
+    }
+    const container = element('div');
+    const document = {
+        hidden: false, body: element('body'), location: {
+            href: 'https://pt99.tribalwars.com.pt/game.php?village=1&screen=place&mode=scavenge'
+        },
+        createElement: element, createTextNode: text => ({ textContent: String(text) }),
+        getElementById: id => elements.find(node => node.id === id) || null,
+        querySelector: selector => selector === '.scavenge-screen-main-widget' ? container : null,
+        querySelectorAll: () => [],
+        addEventListener() {}, removeEventListener() {}
+    };
+    return { document, elements };
+}
+
 function jqueryStub() {
     function makeCollection() {
         return {
@@ -231,6 +265,58 @@ test('restore persisted A/B dispatches the correct handlers', async () => {
     await drainTimers(restored.clock);
     assert.deepEqual(Array.from(restored.context.events), ['A', 'B']);
     assert.equal(Object.keys(restored.context.activeTimeouts).length, 0);
+});
+
+test('a persisted Scavenging wake crosses the real scheduler and lease into its worker', async () => {
+    const ui = createScavengeUiDocument();
+    const env = createContext({ clock: new FakeClock(1000000), overrides: {
+        document: ui.document,
+        game_data: { world: 'pt99', csrf: 'csrf', village: { id: 1 }, player: { id: 7 } },
+        settings_cookies: { general: {} },
+        t: key => key,
+        showAutoHideBox() {}
+    } });
+    loadCore(env.context);
+    load(env.context, 'bots/scavenging.js');
+    env.context.reads = 0;
+    env.context.posts = 0;
+    vm.runInContext(`
+        _fetchScavengingVillageData = async function () {
+            reads++;
+            return { options: { 1: { base_id: 1, is_locked: false, scavenging_squad: null } },
+                unit_counts_home: { spear: 10 } };
+        };
+        sendScavengeSquadApi = async function () {
+            posts++;
+            return { success: true, returnMs: 300000, returnAtByOption: { 1: Date.now() + 300000 } };
+        };
+        PremiumFeaturesCoordination.start();
+        PremiumFeaturesBackgroundScheduler.start();
+        injectScavengeConfigPanel();
+    `, env.context);
+    const toggle = ui.document.getElementById('scavenge_config_enabled');
+    const start = ui.elements.find(node => node.textContent === 'scavenge.saveAndStart');
+    assert.ok(toggle && start);
+    toggle.checked = true;
+    toggle.onchange();
+    await start.onclick();
+    assert.equal(env.context.getScavengeConfig('1').enabled, true);
+    assert.equal(JSON.parse(env.storage.getItem('handler_scavenging-auto:1')).handlerName, 'scavengingAutoCheck');
+    assert.equal(env.context.reads, 0);
+    for (let i = 0; i < 8; i++) {
+        env.clock.tick(0);
+        await flushMicrotasks(8);
+    }
+    assert.equal(env.context.reads, 1);
+    assert.equal(env.context.posts, 1);
+    assert.ok(Number(env.storage.getItem('endTime_scavenging-auto:1')) > env.clock.now);
+    vm.runInContext(`
+        clearPersistedTimeout('scavenging-auto:1');
+        restoreScavengingAutoWakes();
+        restoreScavengingAutoWakes();
+    `, env.context);
+    assert.equal(Object.keys(env.context.activeTimeouts).filter(id => id === 'scavenging-auto:1').length, 1);
+    assert.equal(env.context.reads, 1, 'wake restoration itself must not inspect the server');
 });
 
 test('replacing timer A fences and cancels the old callback', async () => {

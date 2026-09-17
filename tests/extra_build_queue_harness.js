@@ -997,6 +997,69 @@ test('missing authoritative offer performs one necessary inspection and never a 
     assert.equal(system.store.get('1').queue.length, 1, 'stale target metadata cannot consume the intent');
 });
 
+test('early resource event reads one official offer and rejects a higher server cost', async () => {
+    const server = {
+        queue: [], full: false,
+        resources: { wood: 1000, stone: 1000, iron: 1000, pop: 0, popMax: 100 },
+        nextBuildOffers: { farm: { level: 25, wood: 1200, stone: 1200, iron: 1200, pop: 1 } }
+    };
+    const system = createSystem({
+        server,
+        inspect: async () => {
+            system.counters.inspections++;
+            const observation = defaultObservation(system.clock, server);
+            observation.official.nextBuildOffers = server.nextBuildOffers;
+            return observation;
+        },
+        getCost: (_villageId, _head, record) => {
+            const offer = record.official?.nextBuildOffers?.farm;
+            return offer
+                ? { effectiveLevel: offer.level, cost: offer, source: 'SERVER_OBSERVATION', authoritative: true }
+                : { effectiveLevel: 25, cost: { wood: 800, stone: 800, iron: 800, pop: 1 },
+                    source: 'DERIVED_OFFICIAL_LEVEL_CACHE_COST', authoritative: false };
+        }
+    });
+    system.store.add('1', 'farm', 25);
+    system.controller.schedule('1', {
+        delayMs: 0, forceFresh: true, reason: 'cached-cost-possibly-affordable'
+    });
+    await system.scheduler.runNext();
+    assert.deepEqual(system.counters, { inspections: 1, mutations: 0 });
+    assert.equal(system.store.get('1').execution.state, 'WAITING_RESOURCES');
+    assert.ok(system.store.get('1').execution.nextDueAt > system.clock.now);
+});
+
+test('early resource event builds once only after the fresh official cost confirms affordability', async () => {
+    const server = {
+        queue: [], full: false,
+        resources: { wood: 1000, stone: 1000, iron: 1000, pop: 0, popMax: 100 },
+        nextBuildOffers: { farm: { level: 25, wood: 900, stone: 900, iron: 900, pop: 1 } }
+    };
+    const system = createSystem({
+        server,
+        inspect: async () => {
+            system.counters.inspections++;
+            const observation = defaultObservation(system.clock, server);
+            observation.official.nextBuildOffers = server.nextBuildOffers;
+            return observation;
+        },
+        getCost: (_villageId, _head, record) => {
+            const offer = record.official?.nextBuildOffers?.farm;
+            return offer
+                ? { effectiveLevel: offer.level, cost: offer, source: 'SERVER_OBSERVATION', authoritative: true }
+                : { effectiveLevel: 25, cost: { wood: 800, stone: 800, iron: 800, pop: 1 },
+                    source: 'DERIVED_OFFICIAL_LEVEL_CACHE_COST', authoritative: false };
+        }
+    });
+    system.store.add('1', 'farm', 25);
+    system.controller.schedule('1', {
+        delayMs: 0, forceFresh: true, reason: 'cached-cost-possibly-affordable'
+    });
+    await system.scheduler.runNext();
+    assert.deepEqual(system.counters, { inspections: 1, mutations: 1 });
+    assert.equal(system.store.get('1').queue.length, 0);
+});
+
 test('disabled Building Queue preserves intent but restores no background task or network work', () => {
     const system = createSystem({ isEnabled: () => false });
     system.store.add('1', 'farm', 25);

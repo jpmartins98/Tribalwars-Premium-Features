@@ -111,6 +111,55 @@ test('unrelated slow/rejected hydration cannot block the early UI and init is si
     assert.equal(entries.find(entry => entry.status === 'BOOT_COMPLETE').durationMs, 3000);
 });
 
+test('slow Building Queue hydration does not gate global start or unrelated UI', async () => {
+    const buildQueue = deferred();
+    const order = [];
+    const once = new Map();
+    let boot;
+    let bqNetwork = 0;
+    const document = {
+        readyState: 'loading', location: { href: 'https://example.test/game.php?screen=overview' },
+        getElementById: () => null, createElement: () => ({ appendChild() {} })
+    };
+    const ctx = context({
+        document,
+        settings_cookies: { general: { show__village_list: true, show__building_queue: true },
+            widgets: [{ name: 'village_list', column: 'col' }, { name: 'building_queue', column: 'col' }] },
+        $: () => ({ off() { return this; }, on() { return this; } }),
+        PremiumFeaturesRuntimeRegistry: {
+            onceAsync(key, run) { if (!once.has(key)) once.set(key, Promise.resolve().then(run)); return once.get(key); },
+            addEventListener() {}, installInteractionTracking() {}, requestReconcile(_reason, run) { run(); },
+            setTimeout(_key, run) { boot = run; }
+        },
+        prepareLocalStorageItems() {},
+        hydrateBuildQueueCache: () => buildQueue.promise,
+        cleanupLegacyNotepadStorage() {}, hydrateNotepadCache() {},
+        hydrateVillageProfileNotesCache() {}, hydrateReservationsCache() {},
+        cleanupLegacyMapDataLocalStorage() {}, hydrateMapDataCache() {},
+        cleanupLegacyRecruitQueueLocalStorage() {}, cleanupLegacyReportsLocalStorage() {},
+        restoreTimeouts() {}, restoreScavengingAutoWakes() {}, prepareBuildQueueStorageDefaults() {},
+        injectScriptColumn() {}, injectVillagesListWidget() { order.push('village-list'); },
+        createWidgetLoadingElement: () => ({}), createWidgetElement({ widgetKey }) { order.push(widgetKey); },
+        injectScriptSettingsPopUp() { order.push('settings'); }, start() { order.push('start'); },
+        PremiumFeaturesCoordination: { start() {} }, PremiumFeaturesBackgroundScheduler: { start() {} },
+        fetch: async () => { bqNetwork++; throw new Error('BQ must not fetch before hydration'); }
+    });
+    load(ctx, 'main.user.js');
+    if (ctx.PremiumFeaturesBootLifecycle) ctx.PremiumFeaturesBootLifecycle.bootNow();
+    else boot();
+    await flush();
+    assert.ok(order.includes('settings'));
+    assert.ok(order.includes('village-list'));
+    assert.ok(order.includes('start'), 'global start must precede BQ hydration completion');
+    assert.equal(order.filter(item => item === 'start').length, 1);
+    assert.equal(ctx.PremiumFeaturesHydration.buildQueue.status, 'PENDING');
+    assert.equal(bqNetwork, 0);
+    buildQueue.resolve();
+    await flush();
+    assert.equal(ctx.PremiumFeaturesHydration.buildQueue.status, 'READY');
+    assert.equal(order.filter(item => item === 'start').length, 1);
+});
+
 test('slow map-cache hydration cannot turn a fresh TTL into redundant map GETs', async () => {
     const pendingMap = deferred();
     const registered = [];
@@ -137,6 +186,35 @@ test('slow map-cache hydration cannot turn a fresh TTL into redundant map GETs',
     await flush();
     assert.deepEqual(registered.filter(key => key.startsWith('map-')), ['map-villages', 'map-players', 'map-allies']);
     assert.equal(requests, 0);
+});
+
+test('pending Build Queue hydration defers only its dependent background registrations', async () => {
+    const pendingBuildQueue = deferred();
+    const registered = [];
+    const ctx = context({
+        document: { location: { href: 'https://example.test/game.php?screen=other' }, getElementById: () => null },
+        game_data: { village: { id: 1 }, features: { Premium: { active: true } } },
+        settings_cookies: { general: {}, widgets: [] },
+        BACKGROUND_TASK_PRIORITY: { REFRESH: 4, AUTOMATIC: 3, HOUSEKEEPING: 5 },
+        PremiumFeaturesHydration: { buildQueue: { status: 'PENDING', promise: pendingBuildQueue.promise } },
+        PremiumFeaturesRuntimeRegistry: { currentGeneration: () => 1, claimFeature: () => true, clearInterval() {} },
+        PremiumFeaturesCoordination: { registerBackgroundTask: key => registered.push(key) },
+        detectServerTimezoneOffsetMs: () => 0,
+        prepareVillageList() {}, listenTextAreas() {}, setCookieCurrentVillage() {}, addRessourcesHover() {},
+        insertNavigationArrows() {}, insertListVillagesPopup() {}, injectNavigationBar() {}, defineKeyboardShortcuts() {},
+        injectScriptSettingsPopUp() {},
+        $: () => ({ length: 0 })
+    });
+    load(ctx, 'utils/core_utils.js');
+    ctx.start();
+    assert.equal(registered.includes('build-queue-sweep'), false);
+    assert.equal(registered.includes('build-instant-timers'), false);
+    assert.ok(registered.includes('map-villages'), 'unrelated work must not wait for BQ');
+    ctx.PremiumFeaturesHydration.buildQueue.status = 'READY';
+    pendingBuildQueue.resolve();
+    await flush();
+    assert.equal(registered.filter(key => key === 'build-queue-sweep').length, 1);
+    assert.equal(registered.filter(key => key === 'build-instant-timers').length, 1);
 });
 
 test('reservation action does not treat a pending cache as proof of no reservation', async () => {

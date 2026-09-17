@@ -16,6 +16,7 @@
     const BUILD_INSTANT_STATE = Object.freeze({
         IDLE: 'IDLE',
         WAITING_WINDOW: 'WAITING_WINDOW',
+        WAITING_FREE_CONFIRMATION: 'WAITING_FREE_CONFIRMATION',
         CHECKING: 'CHECKING',
         EXECUTING: 'EXECUTING',
         STALE: 'STALE',
@@ -270,6 +271,7 @@
                 availableTo: Number(current.availableTo) || null,
                 nextDueAt: Number(current.nextDueAt) || null,
                 checkedOfficialGeneration: Math.max(0, Number(current.checkedOfficialGeneration) || 0),
+                confirmationAttempted: Boolean(current.confirmationAttempted),
                 snapshotHash: current.snapshotHash || null,
                 reason: current.reason || null,
                 updatedAt: Number(current.updatedAt) || 0,

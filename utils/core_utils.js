@@ -225,25 +225,45 @@ function start() {
         settings_cookies = localStorage.getItem('settings_cookies') ? JSON.parse(localStorage.getItem('settings_cookies')) : settings_cookies;
         listenTextAreas();
         setCookieCurrentVillage();
-        if (typeof checkEarlyBuildOpportunity === 'function') checkEarlyBuildOpportunity();
+        if (window.PremiumFeaturesHydration?.buildQueue?.status !== 'PENDING' &&
+            window.PremiumFeaturesHydration?.buildQueue?.status !== 'FAILED' &&
+            typeof checkEarlyBuildOpportunity === 'function') checkEarlyBuildOpportunity();
         if (typeof captureCurrentVillageMarketTransports === 'function') captureCurrentVillageMarketTransports();
         // Arms every known village's instant-free timer, not just the current one — re-arming is
         // idempotent (each call clears its own previous timeout first), so this is safe to run even
         // on screens where the widget will also call checkAndScheduleBuildInstantFree() moments later.
-        registerBackground('build-instant-timers', function (guard) {
-            guard?.assertActive?.();
-            if (typeof initInstantFreeForAllVillages === 'function') initInstantFreeForAllVillages();
-            else if (typeof checkAndScheduleBuildInstantFree === 'function') checkAndScheduleBuildInstantFree();
-        }, { priority: BACKGROUND_TASK_PRIORITY.AUTOMATIC, leaseKey: 'build-instant-timers' });
+        const buildQueueHydration = window.PremiumFeaturesHydration?.buildQueue;
+        const registerBuildInstantTimers = function () {
+            if ((runtime?.currentGeneration?.() || 1) !== startGeneration) return;
+            registerBackground('build-instant-timers', function (guard) {
+                guard?.assertActive?.();
+                if (typeof initInstantFreeForAllVillages === 'function') initInstantFreeForAllVillages();
+                else if (typeof checkAndScheduleBuildInstantFree === 'function') checkAndScheduleBuildInstantFree();
+            }, { priority: BACKGROUND_TASK_PRIORITY.AUTOMATIC, leaseKey: 'build-instant-timers' });
+        };
+        if (buildQueueHydration?.status === 'PENDING' && buildQueueHydration.promise) {
+            buildQueueHydration.promise.then(registerBuildInstantTimers);
+        } else registerBuildInstantTimers();
         if (typeof injectOverviewVillagesTopbarMenu === 'function') {
             injectOverviewVillagesTopbarMenu();
         }
         // Periodic safety-net sweep so other villages' build queues keep progressing while this
         // tab has a different village displayed.
-        registerBackground('build-queue-sweep', function (guard) {
-            guard?.assertActive?.();
-            if (typeof initBackgroundVillageQueueSweep === 'function') initBackgroundVillageQueueSweep();
-        }, { priority: BACKGROUND_TASK_PRIORITY.AUTOMATIC, leaseKey: 'build-queue-sweep' });
+        const registerBuildQueueBackground = function () {
+            if ((runtime?.currentGeneration?.() || 1) !== startGeneration) return;
+            if (window.PremiumFeaturesHydration?.buildQueue?.status === 'FAILED') return;
+            registerBackground('build-queue-sweep', function (guard) {
+                guard?.assertActive?.();
+                if (typeof initBackgroundVillageQueueSweep === 'function') initBackgroundVillageQueueSweep();
+            }, { priority: BACKGROUND_TASK_PRIORITY.AUTOMATIC, leaseKey: 'build-queue-sweep' });
+        };
+        if (buildQueueHydration?.status === 'PENDING' && buildQueueHydration.promise) {
+            buildQueueHydration.promise.then(registerBuildQueueBackground).catch(function (error) {
+                console.error('[TW] Could not register build queue work after hydration', error);
+            });
+        } else {
+            registerBuildQueueBackground();
+        }
         addRessourcesHover(localStorage.getItem('full_storage_times') ? JSON.parse(localStorage.getItem('full_storage_times')) : null);
         if (urlPage.includes("screen=overview") && !urlPage.includes("screen=overview_villages")) {
             injectScriptColumn();

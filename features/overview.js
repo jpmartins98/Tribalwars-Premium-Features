@@ -277,7 +277,10 @@ function getMarketInfo() {
  * @returns {string}
  */
 function getPlaceInfo() {
-    const endTime_scavenging = localStorage.getItem('endTime_scavenging-auto');
+    const villageId = String(game_data?.village?.id || '');
+    const endTime_scavenging = villageId
+        ? localStorage.getItem('endTime_scavenging-auto:' + villageId)
+        : null;
     if (endTime_scavenging) {
         // Compute remaining time until the scavenging mission returns
         var endTime = Math.floor(endTime_scavenging / 1000);

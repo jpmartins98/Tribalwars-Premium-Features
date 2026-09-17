@@ -140,6 +140,8 @@ function ensureBuildQueueController() {
 }
 
 function initializeBuildQueueStateInfrastructure() {
+    const hydrationStatus = window.PremiumFeaturesHydration?.buildQueue?.status;
+    if (hydrationStatus === 'PENDING' || hydrationStatus === 'FAILED') return null;
     const state = getBuildQueueStateApi();
     if (!state) return null;
     state.start();
@@ -157,6 +159,8 @@ function initializeBuildQueueStateInfrastructure() {
 }
 
 function requestBuildQueueReconcile(villageId, options = {}) {
+    if (window.PremiumFeaturesHydration?.buildQueue?.status === 'PENDING' ||
+        window.PremiumFeaturesHydration?.buildQueue?.status === 'FAILED') return null;
     const vId = String(villageId || game_data?.village?.id || '');
     const controller = initializeBuildQueueStateInfrastructure();
     if (!controller) return refreshBackgroundVillageQueueLegacy(vId);
@@ -1307,6 +1311,18 @@ function setCancelBuildIds(cancelButtons, villageId) {
  * @param {string|number} [villageId] - Village to act on. Defaults to the currently loaded village.
  */
 function addToBuildQueue(build_id, villageId, actionButton) {
+    const hydration = window.PremiumFeaturesHydration?.buildQueue;
+    if (hydration?.status === 'PENDING' && hydration.promise) {
+        return hydration.promise.then(function () {
+            if (hydration.status === 'READY') return addToBuildQueue(build_id, villageId, actionButton);
+            setBuildQueueButtonLoading(actionButton, false);
+            return null;
+        });
+    }
+    if (hydration?.status === 'FAILED') {
+        setBuildQueueButtonLoading(actionButton, false);
+        return null;
+    }
     const vId = String(villageId || game_data?.village?.id || '');
     const state = getBuildQueueStateApi();
     const controller = initializeBuildQueueStateInfrastructure();
@@ -2011,6 +2027,14 @@ function clearVillageBuildQueueTimeout(villageId) {
  * @param {number} waitTime - Delay in milliseconds.
  */
 function scheduleVillageAddToBuildQueue(villageId, waitTime) {
+    const hydration = window.PremiumFeaturesHydration?.buildQueue;
+    if (hydration?.status === 'PENDING') {
+        const dueAt = Date.now() + Math.max(0, Number(waitTime) || 0);
+        return hydration.promise?.then(function () {
+            if (hydration.status === 'READY') return scheduleVillageAddToBuildQueue(villageId, Math.max(0, dueAt - Date.now()));
+        });
+    }
+    if (hydration?.status === 'FAILED') return null;
     const controller = initializeBuildQueueStateInfrastructure();
     if (controller) return controller.schedule(String(villageId), {
         delayMs: Math.max(0, Number(waitTime) || 0),
@@ -2029,6 +2053,14 @@ function scheduleVillageAddToBuildQueue(villageId, waitTime) {
  * @param {number} waitTime - Delay in milliseconds.
  */
 function scheduleVillageQueueRefresh(villageId, waitTime) {
+    const hydration = window.PremiumFeaturesHydration?.buildQueue;
+    if (hydration?.status === 'PENDING') {
+        const dueAt = Date.now() + Math.max(0, Number(waitTime) || 0);
+        return hydration.promise?.then(function () {
+            if (hydration.status === 'READY') return scheduleVillageQueueRefresh(villageId, Math.max(0, dueAt - Date.now()));
+        });
+    }
+    if (hydration?.status === 'FAILED') return null;
     const controller = initializeBuildQueueStateInfrastructure();
     if (controller) return controller.schedule(String(villageId), {
         delayMs: Math.max(0, Number(waitTime) || 0),
@@ -2124,6 +2156,8 @@ function updateBuildQueueTimers(villageId) {
  * @param {string|number} [villageId] - Defaults to the currently loaded village.
  */
 function checkEarlyBuildOpportunity(villageId) {
+    if (window.PremiumFeaturesHydration?.buildQueue?.status === 'PENDING' ||
+        window.PremiumFeaturesHydration?.buildQueue?.status === 'FAILED') return;
     const vId = villageId || game_data?.village?.id;
     const state = getBuildQueueStateApi();
     const controller = initializeBuildQueueStateInfrastructure();
@@ -2136,14 +2170,16 @@ function checkEarlyBuildOpportunity(villageId) {
         if (resources) {
             state.updateResources(vId, resources);
         }
-        if (resources && costDecision?.authoritative && hasEnoughForBuild(resources, costDecision.cost)) {
+        if (resources && costDecision?.cost && hasEnoughForBuild(resources, costDecision.cost)) {
             // Even when an older official snapshot said "full", new authoritative resources
             // invalidate the resource decision. The reconcile step will independently re-check
-            // whether the slot is still blocked.
+            // whether the slot is still blocked. A cached cost is only a trigger for a fresh
+            // official observation, never authorization for a mutation.
             controller.schedule(String(vId), {
                 delayMs: 0,
                 priority: window.PremiumFeaturesBackgroundScheduler?.PRIORITY?.RECONCILIATION || 2,
-                reason: 'early-resources'
+                reason: costDecision.authoritative ? 'early-resources' : 'cached-cost-possibly-affordable',
+                forceFresh: !costDecision.authoritative
             });
         }
         return;
@@ -2248,6 +2284,8 @@ function scheduleCompletionNotification(villageId) {
  * @param {string|number} villageId
  */
 async function refreshBackgroundVillageQueue(villageId) {
+    if (window.PremiumFeaturesHydration?.buildQueue?.status === 'PENDING' ||
+        window.PremiumFeaturesHydration?.buildQueue?.status === 'FAILED') return;
     const controller = initializeBuildQueueStateInfrastructure();
     if (controller) {
         return controller.schedule(String(villageId), {
@@ -2365,6 +2403,17 @@ function installBuildQueueResourceObserver() {
             const waitingForResources = current.execution?.state === window.BUILD_QUEUE_STATE?.WAITING_RESOURCES ||
                 current.execution?.state === window.BUILD_QUEUE_STATE?.WAITING_POPULATION;
             const enoughNow = costDecision?.authoritative && hasEnoughForBuild(resources, costDecision.cost);
+            if (waitingForResources && costDecision?.cost && !costDecision.authoritative &&
+                hasEnoughForBuild(resources, costDecision.cost)) {
+                ensureBuildQueueController()?.schedule(vId, {
+                    delayMs: 0,
+                    priority: window.PremiumFeaturesBackgroundScheduler?.PRIORITY?.RECONCILIATION || 2,
+                    reason: 'cached-cost-possibly-affordable',
+                    forceFresh: true,
+                    dueMode: window.PremiumFeaturesBackgroundScheduler?.DUE_MODE?.REPLACE || 'REPLACE'
+                });
+                return;
+            }
             if (!enoughNow) {
                 if (!waitingForResources || !costDecision?.authoritative) return;
                 const currentDueAt = Number(current.execution?.nextDueAt) || 0;
@@ -2515,6 +2564,18 @@ function startBuildQueueResourcePolling(villageId) {
  * @param {boolean} [update=false] - If true, replaces the existing widget element.
  */
 function fetchBuildQueueWidget(update = false, onComplete) {
+    const hydration = window.PremiumFeaturesHydration?.buildQueue;
+    if (hydration?.status === 'PENDING' && hydration.promise) {
+        return hydration.promise.then(function () {
+            if (hydration.status === 'READY') return fetchBuildQueueWidget(update, onComplete);
+            if (onComplete) onComplete();
+            return { source: 'hydration-failed' };
+        });
+    }
+    if (hydration?.status === 'FAILED') {
+        if (onComplete) onComplete();
+        return Promise.resolve({ source: 'hydration-failed' });
+    }
     const controller = initializeBuildQueueStateInfrastructure();
     if (controller && settings_cookies.general['show__building_queue']) {
         const vId = String(game_data?.village?.id || '');
@@ -2591,6 +2652,8 @@ function fetchBuildQueueWidget(update = false, onComplete) {
  */
 var backgroundQueueSweepInterval = null;
 function initBackgroundVillageQueueSweep() {
+    if (window.PremiumFeaturesHydration?.buildQueue?.status === 'PENDING' ||
+        window.PremiumFeaturesHydration?.buildQueue?.status === 'FAILED') return;
     const controller = initializeBuildQueueStateInfrastructure();
     if (controller) {
         const ids = new Set([
