@@ -1086,14 +1086,14 @@ function injectFakeQueueList(queueBuildIdsActive, buildQueueElment, allBuildings
                     const fmt = (d > 0 ? d + 'd ' : '') + (h > 0 ? h + 'h ' : '') + (m > 0 ? m + 'm ' : '') + s + 's';
                     return `<div style="margin-top:2px;color:#888;">${t('buildQueue.nextAttemptIn', { time: fmt })}</div>`;
                 })() : '';
-                if (taskDescription?.state === 'RUNNING' || execution.state === window.BUILD_QUEUE_STATE?.RECONCILING || execution.state === window.BUILD_QUEUE_STATE?.EXECUTING) {
-                    timeHtml = `<div style="margin-top:3px;color:#777;">${t('buildQueue.statusReconciling')}</div>`;
+                if (taskDescription?.hardStopped || window.PremiumFeaturesBackgroundScheduler?.stats?.().hardStopped) {
+                    timeHtml = `<div style="margin-top:3px;color:#a00;">${t('buildQueue.statusHardStop')}</div>`;
                 } else if (taskDescription?.state === 'WAITING_LEASE') {
                     timeHtml = `<div style="margin-top:3px;color:#777;">${t('buildQueue.statusWaitingTab')}</div>`;
+                } else if (taskDescription?.state === 'RUNNING' || execution.state === window.BUILD_QUEUE_STATE?.RECONCILING || execution.state === window.BUILD_QUEUE_STATE?.EXECUTING) {
+                    timeHtml = `<div style="margin-top:3px;color:#777;">${t('buildQueue.statusReconciling')}</div>`;
                 } else if (taskDescription?.state === 'DEFERRED') {
                     timeHtml = `<div style="margin-top:3px;color:#777;">${t('buildQueue.statusInteractionDeferred')}</div>`;
-                } else if (taskDescription?.state === 'HARD_STOP') {
-                    timeHtml = `<div style="margin-top:3px;color:#a00;">${t('buildQueue.statusHardStop')}</div>`;
                 } else if (execution.state === window.BUILD_QUEUE_STATE?.UNCERTAIN) {
                     timeHtml = `<div style="margin-top:3px;color:#a60;">${t('buildQueue.statusUncertain')}</div>`;
                 } else if (execution.state === window.BUILD_QUEUE_STATE?.SOFT_PAUSED) {
@@ -1109,7 +1109,9 @@ function injectFakeQueueList(queueBuildIdsActive, buildQueueElment, allBuildings
                 } else {
                     timeHtml = `<div style="margin-top:3px;color:#a60;">${t('buildQueue.statusOverdue')}</div>`;
                 }
-                timeHtml += countdownHtml;
+                if (!(taskDescription?.hardStopped || window.PremiumFeaturesBackgroundScheduler?.stats?.().hardStopped)) {
+                    timeHtml += countdownHtml;
+                }
                 if (costDecision) {
                     timeHtml += `<div style="margin-top:2px;color:#777;">${t('buildQueue.effectiveLevel', { level: costDecision.effectiveLevel })} · ${t('buildQueue.costSource', { source: costDecision.source })}</div>`;
                 }
@@ -1704,11 +1706,17 @@ function observeBuildQueueDocument(doc, villageId, source) {
 async function inspectBuildQueueVillage(villageId, context = {}) {
     const vId = String(villageId || game_data?.village?.id || '');
     context.guard?.assertActive?.();
+    if (window.PremiumFeaturesBotProtection?.isActive?.() ||
+        window.PremiumFeaturesBackgroundScheduler?.stats?.().hardStopped) {
+        const error = new Error('Building Queue hard stop before inspection');
+        error.code = 'HARD_STOP';
+        throw error;
+    }
     if (!getBuildQueueStateApi()?.isCurrent(vId, context.captured)) return { stale: true };
 
     const isCurrentVillage = vId == game_data?.village?.id;
     const liveMainDom = isCurrentVillage && document.querySelector('#building_wrapper') && document.querySelector('#buildings');
-    if (liveMainDom) return observeBuildQueueDocument(document, vId, 'dom');
+    if (liveMainDom && !context.requireNetwork) return observeBuildQueueDocument(document, vId, 'dom');
 
     const cached = getBuildQueueStateApi()?.get(vId);
     const officialAge = Date.now() - Number(cached?.official?.fetchedAt || 0);
@@ -1720,6 +1728,12 @@ async function inspectBuildQueueVillage(villageId, context = {}) {
 
     context.guard?.assertActive?.();
     if (!getBuildQueueStateApi()?.isCurrent(vId, context.captured)) return { stale: true };
+    if (window.PremiumFeaturesBotProtection?.isActive?.() ||
+        window.PremiumFeaturesBackgroundScheduler?.stats?.().hardStopped) {
+        const error = new Error('Building Queue hard stop before network inspection');
+        error.code = 'HARD_STOP';
+        throw error;
+    }
     const result = await fetchVillageMainPage(vId);
     context.guard?.assertActive?.();
     if (!getBuildQueueStateApi()?.isCurrent(vId, context.captured)) return { stale: true };
@@ -1735,7 +1749,8 @@ function executeBuildQueueMutation(villageId, item, context = {}) {
     if (!state?.isCurrent(vId, captured, { includeObserved: true })) {
         return Promise.resolve({ accepted: false, stale: true });
     }
-    if (window.PremiumFeaturesBotProtection?.isActive?.()) {
+    if (window.PremiumFeaturesBotProtection?.isActive?.() ||
+        window.PremiumFeaturesBackgroundScheduler?.stats?.().hardStopped) {
         const error = new Error('Bot protection active');
         error.code = 'HARD_STOP';
         return Promise.reject(error);
@@ -1764,6 +1779,12 @@ function executeBuildQueueMutation(villageId, item, context = {}) {
     return new Promise((resolve, reject) => {
         try {
             guard?.assertActive?.();
+            if (window.PremiumFeaturesBotProtection?.isActive?.() ||
+                window.PremiumFeaturesBackgroundScheduler?.stats?.().hardStopped) {
+                const error = new Error('Building Queue hard stop before mutation');
+                error.code = 'HARD_STOP';
+                throw error;
+            }
             if (!state.isCurrent(vId, captured, { includeObserved: true })) {
                 delete buildQueueRequestInFlightByVillage[vId];
                 resolve({ accepted: false, stale: true });

@@ -523,6 +523,8 @@
     "settings.softDarkModeDesc": "Aplica um tema mais escuro e subtil em toda a interface, preservando a legibilidade, os limites e os ícones do jogo",
     "settings.softDarkModeLabel": "Modo Escuro Suave",
     "settings.title": "Definições do Script",
+    "settings.hardStopStatus": "HARD STOP — automações pausadas. ",
+    "settings.resumeAutomations": "Retomar automações",
     "settings.villageGroupsDesc": "Mostra e permite editar a afiliação da aldeia aos grupos na página de visão geral",
     "settings.villageGroupsLabel": "Widget de Grupos da Aldeia",
     "settings.villageHoverInfoDesc": "Adiciona informação extra ao passar o cursor sobre uma aldeia no mapa",

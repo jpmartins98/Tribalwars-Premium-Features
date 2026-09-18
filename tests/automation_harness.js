@@ -307,6 +307,58 @@ test('Paladin UI is visible without a private gate and invalid maxLevel falls ba
     assert.equal(context._paladinEnabled(), true);
 });
 
+test('Settings exposes manual recovery only after protection is gone', () => {
+    const ui = createUiDocument();
+    let hardStopped = true;
+    let markers = true;
+    let resumes = 0;
+    const context = createContext({ document: ui.document,
+        PremiumFeaturesBackgroundScheduler: { stats: () => ({ hardStopped }) },
+        PremiumFeaturesBotProtection: {
+            canResumeAfterHardStop: () => hardStopped && !markers,
+            resumeAfterHardStop() { resumes++; hardStopped = false; return true; }
+        }
+    });
+    load(context, 'utils/core_settings.js');
+    context.createSaveButton();
+    const panel = ui.document.getElementById('twpf_hard_stop_recovery');
+    const button = ui.document.getElementById('twpf_hard_stop_resume');
+    assert.ok(panel && button);
+    assert.equal(panel.style.display, '');
+    assert.equal(button.style.display, 'none');
+    markers = false;
+    context.refreshHardStopRecoveryControl();
+    assert.equal(button.style.display, '');
+    button.onclick();
+    assert.equal(resumes, 1);
+    assert.equal(panel.style.display, 'none');
+});
+
+test('Instant Free manual recovery bypasses old live DOM for one fresh official read', async () => {
+    let domReads = 0;
+    let networkReads = 0;
+    const official = { queue: ['farm25'], nextSlotAt: Date.now() + 179000, generation: 1 };
+    const context = createContext({
+        settings_cookies: { general: { show__auto_build_instant_free: true } },
+        PremiumFeaturesBuildState: { listVillageIds: () => ['1'], get: () => ({ official }) }
+    });
+    context.document.querySelector = selector =>
+        selector === '#building_wrapper' || selector === '#buildings' ? {} : null;
+    context.observeBuildQueueDocument = () => { domReads++; return { official }; };
+    context.fetchVillageMainPage = async () => { networkReads++; return { doc: {} }; };
+    load(context, 'bots/buildInstantFree.js');
+    await context._inspectBuildInstant('1', 'ordinary-window');
+    assert.equal(domReads, 1);
+    assert.equal(networkReads, 0);
+    context.markBuildInstantHardStopRecovery();
+    await context._inspectBuildInstant('1', 'post-hard-stop');
+    assert.equal(networkReads, 1);
+    assert.equal(domReads, 2, 'fresh document is parsed after the network read');
+    await context._inspectBuildInstant('1', 'later-event');
+    assert.equal(domReads, 3);
+    assert.equal(networkReads, 1);
+});
+
 test('Paladin confirmed read failure and worker exception both retain a future recovery wake', async () => {
     const context = createContext({
         settings_cookies: { general: { show__auto_paladin_train: { enabled: true, maxLevel: 30 } } }
@@ -1152,6 +1204,9 @@ test('overview Building Queue tooltip reads the live rearmed due time and real o
     assert.equal(context.getBuildQueueOverviewWaitingStatus('1').kind, 'WAITING_LEASE');
     task = { state: 'WAITING_LEASE', dueAt: Date.now() - 1 };
     assert.equal(context.getBuildQueueOverviewWaitingStatus('1').kind, 'WAITING_LEASE');
+    execution = { state: 'RECONCILING', nextDueAt: Date.now() - 1 };
+    task = { state: 'RUNNING', hardStopped: true, dueAt: Date.now() - 1 };
+    assert.equal(context.getBuildQueueOverviewWaitingStatus('1').kind, 'HARD_STOP');
 });
 
 test('Reports normal navigation inside TTL performs zero forced sync requests', async () => {

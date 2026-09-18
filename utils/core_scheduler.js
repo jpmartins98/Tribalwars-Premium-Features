@@ -359,15 +359,23 @@ function createCooperativeScheduler(options = {}) {
             console.warn('[TW Scheduler] Failed to persist hard-stop', error);
         }
         clearWake();
+        host.refreshHardStopRecoveryControl?.();
         return reason;
     }
 
     function clearHardStop() {
+        try {
+            host.localStorage?.removeItem(hardStopStorageKey);
+        } catch (error) {
+            console.warn('[TW Scheduler] Failed to clear persisted hard-stop', error);
+            return false;
+        }
         hardStopped = false;
         paused = false;
         hardStopReason = null;
-        try { host.localStorage?.removeItem(hardStopStorageKey); } catch (_error) { /* manual recovery remains in memory */ }
         scheduleWake();
+        host.refreshHardStopRecoveryControl?.();
+        return true;
     }
 
     function registerHandler(name, handler) {
@@ -424,7 +432,7 @@ function createCooperativeScheduler(options = {}) {
     function describe(key) {
         const stringKey = String(key);
         const active = activeTasks.get(stringKey);
-        if (active) return { taskKey: stringKey, state: 'RUNNING', running: true, dueAt: active.dueAt, hardStopped, hardStopReason };
+        if (active) return { taskKey: stringKey, state: hardStopped ? 'HARD_STOP' : 'RUNNING', running: true, dueAt: active.dueAt, hardStopped, hardStopReason };
         const task = tasks.get(stringKey);
         if (!task) return { taskKey: stringKey, state: hardStopped ? 'HARD_STOP' : 'MISSING', hardStopped, hardStopReason };
         const timestamp = now();
@@ -443,6 +451,11 @@ function createCooperativeScheduler(options = {}) {
             hardStopped,
             hardStopReason
         };
+    }
+
+    function hasTask(key) {
+        const stringKey = String(key);
+        return tasks.has(stringKey) || activeTasks.has(stringKey);
     }
 
     function hasPendingHigherPriority(priorityValue) {
@@ -470,6 +483,7 @@ function createCooperativeScheduler(options = {}) {
         restorePersistedTasks,
         start,
         describe,
+        hasTask,
         hasPendingHigherPriority,
         stats
     };
@@ -696,11 +710,18 @@ function restoreTimeoutById(id) {
 }
 
 /** Restores every persisted timeout idempotently and registers each timer in activeTimeouts. */
-function restoreTimeouts() {
+function restoreTimeouts(options = {}) {
     Object.keys(localStorage)
         .filter(key => key.startsWith('endTime_'))
         .map(key => key.slice('endTime_'.length))
-        .forEach(id => restoreTimeoutById(id));
+        .forEach(id => {
+            if (options.missingOnly) {
+                if (BackgroundScheduler?.hasTask?.('persistent-timeout:' + id)) return;
+                if (activeTimeouts[id] !== undefined &&
+                    Number(localStorage.getItem('endTime_' + id)) > Date.now()) return;
+            }
+            restoreTimeoutById(id);
+        });
 }
 
 function handlePersistedTimeoutStorageEvent(event) {

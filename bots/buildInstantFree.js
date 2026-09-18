@@ -5,6 +5,33 @@ const BUILD_INSTANT_COMPLETION_MARGIN_MS = 2000;
 const BUILD_INSTANT_FALLBACK_MS = 5 * 60 * 1000;
 const BUILD_INSTANT_CONFIRMATION_LEAD_MS = 60 * 1000;
 let buildInstantObservedRoot = null;
+const buildInstantNeedsFreshAfterHardStop = new Set();
+
+function markBuildInstantHardStopRecovery() {
+    if (!_buildInstantEnabled()) return;
+    Object.keys(localStorage).filter(key => key.startsWith('endTime_build_instant_free_'))
+        .forEach(key => buildInstantNeedsFreshAfterHardStop.add(
+            key.slice('endTime_build_instant_free_'.length)
+        ));
+    const state = _buildInstantStateApi();
+    state?.listVillageIds?.().forEach(villageId => {
+        if ((state.get(villageId)?.official?.queue || []).length) {
+            buildInstantNeedsFreshAfterHardStop.add(String(villageId));
+        }
+    });
+}
+
+function restoreMissingBuildInstantWakes() {
+    if (!_buildInstantEnabled()) return;
+    const state = _buildInstantStateApi();
+    state?.listVillageIds?.().forEach(villageId => {
+        const vId = String(villageId);
+        if (!(state.get(vId)?.official?.queue || []).length) return;
+        if (localStorage.getItem('endTime_' + _buildInstantTaskId(vId)) ||
+            window.PremiumFeaturesBackgroundScheduler?.hasTask?.('persistent-timeout:' + _buildInstantTaskId(vId))) return;
+        checkAndScheduleBuildInstantFree(vId, { observeDom: false });
+    });
+}
 
 function _observeBuildInstantActionDom(villageId) {
     const runtime = window.PremiumFeaturesRuntimeRegistry;
@@ -214,7 +241,13 @@ function checkAndScheduleBuildInstantFree(villageId, options = {}) {
         });
         return { status: 'SOFT_PAUSED', dueAt: instant.nextDueAt };
     }
-    const nextSlotAt = Number(official.nextSlotAt || bqGet('building_queue_next_slot', vId)) || 0;
+    // A fresh official observation of an empty queue must win over an older legacy mirror.
+    // Falling back through `||` reused the previous slot after a confirmed instant completion,
+    // rearmed the same window and caused one redundant inspection.
+    const hasOfficialObservation = Number(official.generation) > 0 || Number(official.fetchedAt) > 0;
+    const nextSlotAt = hasOfficialObservation
+        ? Number(official.nextSlotAt) || 0
+        : Number(typeof bqGet === 'function' ? bqGet('building_queue_next_slot', vId) : 0) || 0;
     if (!nextSlotAt || nextSlotAt <= Date.now()) {
         _clearBuildInstantFreeTimeout(vId);
         _setBuildInstantState(vId, { state: 'IDLE', nextDueAt: null, reason: 'no-active-build', uncertain: null }, true);
@@ -301,13 +334,14 @@ async function _inspectBuildInstant(villageId, reason) {
         error.code = 'HARD_STOP';
         throw error;
     }
-    if (vId == String(game_data?.village?.id || '') &&
+    if (!buildInstantNeedsFreshAfterHardStop.has(vId) && vId == String(game_data?.village?.id || '') &&
         document.querySelector('#building_wrapper') && document.querySelector('#buildings') &&
         typeof observeBuildQueueDocument === 'function') {
         return observeBuildQueueDocument(document, vId, 'dom');
     }
     if (typeof fetchVillageMainPage === 'function') {
         const result = await fetchVillageMainPage(vId);
+        buildInstantNeedsFreshAfterHardStop.delete(vId);
         return typeof observeBuildQueueDocument === 'function'
             ? observeBuildQueueDocument(result.doc, vId, 'build-instant-' + reason)
             : { doc: result.doc };
@@ -318,7 +352,9 @@ async function _inspectBuildInstant(villageId, reason) {
         method: 'GET', reason
     }, () => fetch(url, { credentials: 'include' }));
     _throwBuildInstantResponse(response, url);
-    return { doc: new DOMParser().parseFromString(await response.text(), 'text/html') };
+    const doc = new DOMParser().parseFromString(await response.text(), 'text/html');
+    buildInstantNeedsFreshAfterHardStop.delete(vId);
+    return { doc };
 }
 
 function _buildInstantButtonData(observed) {

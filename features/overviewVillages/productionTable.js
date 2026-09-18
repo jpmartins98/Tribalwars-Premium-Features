@@ -71,11 +71,13 @@ function getBuildQueueOverviewWaitingStatus(villageId) {
     const dueAt = Number(task?.dueAt) || Number(execution.nextDueAt) || persistedDueAt;
     const remaining = dueAt - Date.now();
     const time = remaining > 0 ? formatQueueRemaining(remaining) : null;
+    if (task?.hardStopped || window.PremiumFeaturesBackgroundScheduler?.stats?.().hardStopped) {
+        return { kind: 'HARD_STOP', dueAt, time: null };
+    }
+    if (task?.state === 'WAITING_LEASE') return { kind: 'WAITING_LEASE', dueAt, time };
     if (task?.state === 'RUNNING' || execution.state === window.BUILD_QUEUE_STATE?.RECONCILING ||
         execution.state === window.BUILD_QUEUE_STATE?.EXECUTING) return { kind: 'RECONCILING', dueAt, time };
-    if (task?.state === 'WAITING_LEASE') return { kind: 'WAITING_LEASE', dueAt, time };
     if (task?.state === 'DEFERRED') return { kind: 'INTERACTION_DEFERRED', dueAt, time };
-    if (task?.state === 'HARD_STOP') return { kind: 'HARD_STOP', dueAt, time };
     if (execution.state === window.BUILD_QUEUE_STATE?.UNCERTAIN) return { kind: 'UNCERTAIN', dueAt, time };
     if (execution.state === window.BUILD_QUEUE_STATE?.SOFT_PAUSED) return { kind: 'SOFT_PAUSED', dueAt, time };
     if (execution.state === window.BUILD_QUEUE_STATE?.WAITING_SLOT) return { kind: 'WAITING_SLOT', dueAt, time };

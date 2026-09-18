@@ -524,6 +524,8 @@
     "settings.softDarkModeDesc": "Applies a subtle darker theme across the interface while preserving readability, borders and game icons",
     "settings.softDarkModeLabel": "Soft Dark Mode",
     "settings.title": "Script Settings",
+    "settings.hardStopStatus": "HARD STOP — automations paused. ",
+    "settings.resumeAutomations": "Resume automations",
     "settings.villageGroupsDesc": "Shows and edits the current village's group membership on the overview page",
     "settings.villageGroupsLabel": "Village Groups Widget",
     "settings.villageHoverInfoDesc": "Adds extra information when hovering over a village on the map",

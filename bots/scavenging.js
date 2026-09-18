@@ -211,6 +211,9 @@ function _ensureScavengingAutoWake(villageId) {
     const vId = _getScavengeVillageId(villageId);
     const config = getScavengeConfig(vId);
     if (!config.enabled && !config.uncertain) return false;
+    if (window.PremiumFeaturesBackgroundScheduler?.hasTask?.('persistent-timeout:' + _scavengingTimerId(vId))) {
+        return false;
+    }
     if (_scavengingScheduledDueAt(vId) > Date.now()) return false;
     // A partly persisted/legacy deadline can still be useful even if its handler disappeared.
     // Repair the handler without moving a known future return forward to page-load time.

@@ -205,8 +205,12 @@
                 cancelIds: Array.isArray(current.cancelIds)
                     ? current.cancelIds.slice()
                     : (readField('queue_cancelIds', villageId) || []).slice?.() || [],
-                nextSlotAt: Number(current.nextSlotAt ?? readField('building_queue_next_slot', villageId)) || null,
-                lastSlotAt: Number(current.lastSlotAt ?? readField('building_queue_last_slot', villageId)) || null,
+                // An explicit null from a newer official observation clears an old legacy slot.
+                // Nullish coalescing here resurrected completed builds from the legacy mirror.
+                nextSlotAt: Number(Object.prototype.hasOwnProperty.call(current, 'nextSlotAt')
+                    ? current.nextSlotAt : readField('building_queue_next_slot', villageId)) || null,
+                lastSlotAt: Number(Object.prototype.hasOwnProperty.call(current, 'lastSlotAt')
+                    ? current.lastSlotAt : readField('building_queue_last_slot', villageId)) || null,
                 full: typeof current.full === 'boolean' ? current.full : queue.length >= maxSlots,
                 maxSlots,
                 currentLevels: Object.assign({}, current.currentLevels || {}),
@@ -1158,7 +1162,8 @@
                 nextDueAt: dueAt,
                 decisionHash: queueDecisionHash(record),
                 reason: scheduleOptions.reason || 'scheduled',
-                freshness: scheduleOptions.forceFresh ? 'REQUIRED' : record.execution?.freshness || null
+                freshness: scheduleOptions.requireNetwork ? 'REQUIRED_NETWORK' :
+                    scheduleOptions.forceFresh ? 'REQUIRED' : record.execution?.freshness || null
             }, !!scheduleOptions.immediatePersistence);
             const descriptor = {
                 key,
@@ -1333,7 +1338,7 @@
             });
         }
 
-        async function inspectFresh(villageId, captured, guard, forceFresh) {
+        async function inspectFresh(villageId, captured, guard, forceFresh, requireNetwork) {
             guard?.assertActive?.();
             if (!store.isCurrent(villageId, captured)) return { stale: true };
             requestCounts.inspections++;
@@ -1342,12 +1347,14 @@
                 const result = await resilientRun({
                     key: 'build-queue-inspect:' + villageId,
                     snapshotHash: captured.hash,
-                    run: () => inspect(villageId, { captured, guard, forceFresh: !!forceFresh })
+                    run: () => inspect(villageId, { captured, guard, forceFresh: !!forceFresh,
+                        requireNetwork: !!requireNetwork })
                 });
                 if (result.status !== 'SUCCESS') return { stale: false, result };
                 observed = result.value;
             } else {
-                observed = await inspect(villageId, { captured, guard, forceFresh: !!forceFresh });
+                observed = await inspect(villageId, { captured, guard, forceFresh: !!forceFresh,
+                    requireNetwork: !!requireNetwork });
             }
             guard?.assertActive?.();
             if (!store.isCurrent(villageId, captured)) return { stale: true };
@@ -1369,7 +1376,8 @@
                 record.execution?.state === BUILD_QUEUE_STATE.WAITING_RESOURCES ||
                 record.execution?.state === BUILD_QUEUE_STATE.WAITING_POPULATION ||
                 record.execution?.state === BUILD_QUEUE_STATE.SOFT_PAUSED;
-            if (waitingState && record.execution.nextDueAt > now() && record.execution.decisionHash === decisionHash) {
+            if (waitingState && !['REQUIRED', 'REQUIRED_NETWORK'].includes(record.execution?.freshness) &&
+                record.execution.nextDueAt > now() && record.execution.decisionHash === decisionHash) {
                 return schedule(vId, {
                     dueAt: record.execution.nextDueAt,
                     state: record.execution.state,
@@ -1381,8 +1389,9 @@
             const captured = store.capture(vId);
             guard?.assertActive?.();
             if (!store.isCurrent(vId, captured)) return rescheduleStale(vId, 'stale-before-inspect');
+            const requireNetwork = record.execution?.freshness === 'REQUIRED_NETWORK';
             const forceFresh = record.execution?.state === BUILD_QUEUE_STATE.UNCERTAIN ||
-                record.execution?.freshness === 'REQUIRED';
+                ['REQUIRED', 'REQUIRED_NETWORK'].includes(record.execution?.freshness);
             store.setExecution(vId, {
                 state: BUILD_QUEUE_STATE.RECONCILING,
                 nextDueAt: null,
@@ -1391,7 +1400,7 @@
                 freshness: null
             });
 
-            const inspected = await inspectFresh(vId, captured, guard, forceFresh);
+            const inspected = await inspectFresh(vId, captured, guard, forceFresh, requireNetwork);
             if (inspected.stale) return rescheduleStale(vId, 'stale-after-inspect');
             if (inspected.result) {
                 if (inspected.result.status === 'HARD_STOP') return inspected.result;
@@ -1620,7 +1629,7 @@
             );
         }
 
-        function bootstrap(villageIds) {
+        function bootstrap(villageIds, bootstrapOptions = {}) {
             const ids = new Set([...(villageIds || []), ...store.listVillageIds()]);
             ids.forEach(villageId => {
                 const record = store.get(villageId);
@@ -1642,6 +1651,8 @@
                     dueAt,
                     state: record.execution?.state || BUILD_QUEUE_STATE.RECONCILING,
                     reason: dueAt > now() ? 'restore-known-due' : 'restore-overdue',
+                    forceFresh: !!bootstrapOptions.forceFresh,
+                    requireNetwork: !!bootstrapOptions.requireNetwork,
                     immediatePersistence: true
                 });
             });

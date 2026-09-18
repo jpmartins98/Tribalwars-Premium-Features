@@ -189,6 +189,7 @@ function createContext({ storage = createStorage(), clock = new FakeClock(), ove
         Error,
         TypeError,
         URL,
+        URLSearchParams,
         Date: FakeDate,
         localStorage: storage,
         document,
@@ -331,6 +332,260 @@ test('replacing timer A fences and cancels the old callback', async () => {
     `, env.context);
     await drainTimers(env.clock);
     assert.deepEqual(Array.from(env.context.events), ['new']);
+});
+
+test('persisted hard-stop needs a safe manual action and resumes a queued real scheduler task', async () => {
+    const storage = createStorage();
+    const first = createContext({ storage, overrides: { getSetting: () => true, BotProtect: { show() {} } } });
+    loadCore(first.context);
+    first.context.PremiumFeaturesBackgroundScheduler.hardStop({ source: 'bot-protection' });
+    const restored = createContext({ storage, overrides: { getSetting: () => true, BotProtect: { show() {} } } });
+    loadCore(restored.context);
+    load(restored.context, 'utils/core_bot_protection.js');
+    restored.context.PremiumFeaturesBackgroundScheduler.start();
+    let runs = 0;
+    restored.context.PremiumFeaturesBackgroundScheduler.enqueue({
+        key: 'due-after-manual-recovery', dueAt: restored.clock.now,
+        run() { runs++; }
+    });
+    restored.clock.tick(1000);
+    await flushMicrotasks();
+    assert.equal(runs, 0);
+    assert.equal(restored.context.PremiumFeaturesBackgroundScheduler.stats().hardStopped, true);
+    assert.equal(restored.context.PremiumFeaturesBotProtection.resumeAfterHardStop(), true);
+    for (let i = 0; i < 5; i++) { restored.clock.tick(0); await flushMicrotasks(); }
+    assert.equal(runs, 1);
+    assert.equal(storage.getItem('twpf_scheduler_hard_stop_v1'), null);
+});
+
+test('manual hard-stop recovery refuses active protection markers', () => {
+    const env = createContext({ overrides: { getSetting: () => true, BotProtect: { show() {} } } });
+    loadCore(env.context);
+    load(env.context, 'utils/core_bot_protection.js');
+    env.context.PremiumFeaturesBackgroundScheduler.hardStop({ source: 'bot-protection' });
+    env.document.querySelector = selector => selector === '.captcha' ? {} : null;
+    assert.equal(env.context.PremiumFeaturesBotProtection.canResumeAfterHardStop(), false);
+    assert.equal(env.context.PremiumFeaturesBotProtection.resumeAfterHardStop(), false);
+    assert.equal(env.context.PremiumFeaturesBackgroundScheduler.stats().hardStopped, true);
+});
+
+test('manual recovery signal reopens an eligible second tab; storage removal alone does not', () => {
+    const storage = createStorage();
+    const first = createContext({ storage, overrides: { getSetting: () => true, BotProtect: { show() {} } } });
+    const second = createContext({ storage, overrides: { getSetting: () => true, BotProtect: { show() {} } } });
+    for (const env of [first, second]) {
+        loadCore(env.context);
+        load(env.context, 'utils/core_bot_protection.js');
+        env.context.PremiumFeaturesBackgroundScheduler.hardStop({ source: 'bot-protection' });
+    }
+    storage.removeItem('twpf_scheduler_hard_stop_v1');
+    assert.equal(second.context.PremiumFeaturesBackgroundScheduler.stats().hardStopped, true);
+    assert.equal(first.context.PremiumFeaturesBotProtection.resumeAfterHardStop(), true);
+    const key = Object.keys(storage).find(value => value.startsWith('twpf_hard_stop_manual_resume_v1:'));
+    assert.ok(key);
+    second.windowEvents.dispatch('storage', { key, newValue: storage.getItem(key) });
+    assert.equal(second.context.PremiumFeaturesBackgroundScheduler.stats().hardStopped, false);
+});
+
+test('real scheduler resumes Building Queue, Instant Free and Scavenging through their workers', async () => {
+    const requests = { buildGet: 0, buildPost: 0, instantGet: 0, instantMutation: 0, scavGet: 0, scavPost: 0 };
+    const instantReasons = [];
+    const clock = new FakeClock(1000000);
+    const env = createContext({ clock, overrides: {
+        game_data: { world: 'pt99', csrf: 'csrf', screen: 'overview',
+            link_base_pure: '/game.php?village=3&screen=', village: { id: 3 }, player: { id: 7 } },
+        settings_cookies: { general: { show__building_queue: true, show__auto_build_instant_free: true } },
+        getSetting: () => true, BotProtect: { show() {} }, t: key => key,
+        showAutoHideBox() {}, getVillageLinkBase: id => '/game.php?village=' + id + '&screen=',
+        getVillageName: id => String(id),
+        fetch: async (url, options = {}) => {
+            if (String(url).includes('build_order_reduce')) {
+                requests.instantMutation++;
+                return { ok: true, status: 200, url, json: async () => ({}) };
+            }
+            if (String(url).includes('mode=scavenge')) {
+                requests.scavGet++;
+                const village = { options: { 1: { base_id: 1, is_locked: false, scavenging_squad: null } },
+                    unit_counts_home: { spear: 10 } };
+                return { ok: true, status: 200, url, text: async () => 'var village = ' + JSON.stringify(village) + ';' };
+            }
+            if (String(url).includes('scavenge_api') && options.method === 'POST') {
+                requests.scavPost++;
+                return { ok: true, status: 200, url, json: async () => ({ response: {
+                    squad_responses: [{ success: true }], villages: { 3: { options: {
+                        1: { base_id: 1, scavenging_squad: { return_time: Math.floor((clock.now + 300000) / 1000) } }
+                    } } }
+                } }) };
+            }
+            throw new Error('Unexpected request: ' + url);
+        },
+        DOMParser: class { parseFromString(html) {
+            return { querySelectorAll: () => [{ textContent: html }] };
+        } }
+    } });
+    env.context.PremiumFeaturesBuildState = {};
+    loadCore(env.context);
+    const timerSets = [];
+    const setHandler = env.context.setHandlerOnTimeOut;
+    env.context.setHandlerOnTimeOut = function (...args) {
+        timerSets.push({ id: args[0], reason: args[2]?.[3], at: clock.now });
+        return setHandler(...args);
+    };
+    load(env.context, 'utils/buildStateStore.js');
+    const stored = {};
+    const queueStorage = {
+        get(field, id) { return stored[String(id)]?.[field] ?? null; },
+        patchMemory(fields, id) { stored[String(id)] = Object.assign({}, stored[String(id)] || {}, fields); },
+        persistVillage() { return Promise.resolve(); },
+        listVillageIds() { return Object.keys(stored); }
+    };
+    const store = env.context.createBuildStateStore({
+        host: env.context, storage: env.storage, queueStorage, clock, now: () => clock.now,
+        coordination: env.context.PremiumFeaturesCoordination, writeBehind: null
+    });
+    env.context.PremiumFeaturesBuildState = store;
+    store.start();
+    let scheduler = env.context.PremiumFeaturesBackgroundScheduler;
+    const createController = currentScheduler => env.context.createBuildQueueController({
+        store, scheduler: currentScheduler, clock, now: () => clock.now, handlerName: 'reconcileBuildQueueVillage',
+        getCost: (_id, head, record) => {
+            const offer = record.official?.nextBuildOffers?.[head.buildingId];
+            return offer ? { effectiveLevel: offer.level, cost: offer, source: 'SERVER_OBSERVATION', authoritative: true }
+                : { effectiveLevel: head.targetLevel, cost: { wood: 100, stone: 100, iron: 100 },
+                    source: 'LOCAL_TARGET_CACHE', authoritative: false };
+        },
+        inspect: async (_villageId, context) => {
+            assert.equal(context.requireNetwork, true, 'manual recovery must not authorize from stale page DOM');
+            requests.buildGet++;
+            return { official: { queue: [], levels: [], slots: [], cancelIds: [], full: false,
+                maxSlots: 2, nextBuildOffers: { farm: { level: 25, wood: 100, stone: 100, iron: 100 } },
+                fetchedAt: clock.now, source: 'test-official' },
+            resources: { wood: 1000, stone: 1000, iron: 1000, pop: 0, popMax: 1000,
+                fetchedAt: clock.now, source: 'test-official' } };
+        },
+        mutate: async () => { requests.buildPost++; return { accepted: true }; },
+        runResilientTask: async options => ({ status: 'SUCCESS', value: await options.run() })
+    });
+    let controller = createController(scheduler);
+    env.context.initializeBuildQueueStateInfrastructure = () => controller;
+    env.context.ensureBuildQueueController = () => controller;
+    env.context.getBuildQueueTimeoutId = id => 'building_queue_' + id;
+    scheduler.registerHandler('reconcileBuildQueueVillage', (args, guard) => controller.reconcile(args[0], guard));
+    store.add('1', 'farm', 25);
+    store.setExecution('1', { state: 'RECONCILING', nextDueAt: null, reason: 'interrupted-before-inspect' }, true);
+    store.updateOfficial('2', { queue: ['farm25'], levels: [25], slots: [clock.now + 179000],
+        cancelIds: ['7'], nextSlotAt: clock.now + 179000, full: false,
+        instantFree: { orderId: '7', availableFrom: clock.now - 1000, availableTo: clock.now + 179000 },
+        fetchedAt: clock.now, source: 'test-official' });
+    const officialUpdates = [];
+    const updateOfficial = store.updateOfficial;
+    store.updateOfficial = function (id, observation) {
+        if (String(id) === '2') officialUpdates.push({ source: observation?.source,
+            queue: observation?.queue?.length, at: clock.now });
+        return updateOfficial(id, observation);
+    };
+    load(env.context, 'bots/buildInstantFree.js');
+    const instantWorkerResults = [];
+    const instantHandler = env.context.timeoutHandlers.instantFreeWorker;
+    env.context.timeoutHandlers.instantFreeWorker = async (...args) => {
+        const currentOfficial = store.get('2').official;
+        const before = { expectedGeneration: args[1], actualGeneration: currentOfficial.generation,
+            sameHash: args[2] === env.context._buildInstantSnapshot('2', currentOfficial) };
+        const result = await instantHandler(...args);
+        instantWorkerResults.push({ reason: args[3], status: result?.status || 'none', before });
+        return result;
+    };
+    vm.runInContext(`_inspectBuildInstant = async function (villageId, reason) {
+        window.__instantInspections(reason);
+        return { official: PremiumFeaturesBuildState.get(villageId).official };
+    };`, env.context);
+    env.context.__instantInspections = reason => { requests.instantGet++; instantReasons.push(reason); };
+    load(env.context, 'bots/scavenging.js');
+    load(env.context, 'utils/core_bot_protection.js');
+    vm.runInContext(`saveScavengeConfig({ enabled: true, level: 0, allUnits: true, units: {} }, '3');
+        checkAndScheduleBuildInstantFree('2', { observeDom: false });
+        _scheduleScavengingAuto(0, '3');`, env.context);
+    controller.schedule('1', { dueAt: clock.now, state: 'RECONCILING', forceFresh: true });
+    scheduler.hardStop({ source: 'bot-protection' });
+    scheduler.cancel(controller.taskKey('1'), 'simulate interrupted hard-stop reconcile');
+    assert.equal(scheduler.hasTask(controller.taskKey('1')), false);
+    load(env.context, 'features/overviewVillages/init.js');
+    load(env.context, 'features/overviewVillages/productionTable.js');
+    assert.equal(env.context.getBuildQueueOverviewWaitingStatus('1').kind, 'HARD_STOP');
+    for (let i = 0; i < 3; i++) { clock.tick(500); await flushMicrotasks(12); }
+    assert.deepEqual(requests, { buildGet: 0, buildPost: 0, instantGet: 0,
+        instantMutation: 0, scavGet: 0, scavPost: 0 });
+    assert.equal(scheduler.stats().hardStopped, true);
+    assert.equal(scheduler.hasTask('persistent-timeout:build_instant_free_2'), true);
+    // Simulate a page reload: timers and scheduler memory disappear, while the persisted
+    // hard-stop, queue intent, official snapshot, scavenging config and deadlines remain.
+    clock.timers.clear();
+    env.context.activeTimeouts = {};
+    env.context.activeTimeoutGenerations = {};
+    scheduler = env.context.createCooperativeScheduler({
+        host: env.context, clock, now: () => clock.now,
+        runtime: env.context.PremiumFeaturesRuntimeRegistry,
+        coordinator: env.context.PremiumFeaturesCoordination, autoStart: false
+    });
+    env.context.BackgroundScheduler = scheduler;
+    env.context.PremiumFeaturesBackgroundScheduler = scheduler;
+    controller = createController(scheduler);
+    scheduler.registerHandler('reconcileBuildQueueVillage', (args, guard) => controller.reconcile(args[0], guard));
+    scheduler.start();
+    assert.equal(scheduler.stats().hardStopped, true, 'reload must not auto-clear protection');
+    assert.deepEqual(requests, { buildGet: 0, buildPost: 0, instantGet: 0,
+        instantMutation: 0, scavGet: 0, scavPost: 0 });
+    assert.equal(env.context.PremiumFeaturesBotProtection.resumeAfterHardStop(), true);
+    for (let i = 0; i < 18; i++) { clock.tick(500); await flushMicrotasks(20); }
+    assert.deepEqual(requests, { buildGet: 1, buildPost: 1, instantGet: 1,
+        instantMutation: 1, scavGet: 1, scavPost: 1 }, 'instant reasons: ' + instantReasons.join(', ') +
+        '; worker: ' + JSON.stringify(instantWorkerResults) + '; updates: ' + JSON.stringify(officialUpdates) +
+        '; sets: ' + JSON.stringify(timerSets));
+    assert.equal(store.get('1').queue.length, 0);
+    assert.equal(store.get('2').official.queue.length, 0);
+    assert.notEqual(env.context.getBuildQueueOverviewWaitingStatus('1').kind, 'HARD_STOP');
+});
+
+test('Instant Free expiry during hard-stop performs a fresh read but no stale reduce mutation', async () => {
+    const clock = new FakeClock(1000000);
+    let reads = 0;
+    let mutations = 0;
+    const official = { generation: 1, queue: ['farm25'], levels: [25],
+        slots: [clock.now + 179000], cancelIds: ['7'], nextSlotAt: clock.now + 179000,
+        instantFree: { orderId: '7', availableFrom: clock.now - 1000, availableTo: clock.now + 179000 },
+        fetchedAt: clock.now, source: 'test-official' };
+    const record = { official, instant: {} };
+    const env = createContext({ clock, overrides: {
+        game_data: { world: 'pt99', csrf: 'csrf', village: { id: 2 }, player: { id: 7 },
+            link_base_pure: '/game.php?village=2&screen=' },
+        settings_cookies: { general: { show__auto_build_instant_free: true } },
+        PremiumFeaturesBuildState: {
+            get: () => record,
+            setInstant(_id, patch) { Object.assign(record.instant, patch); return record; },
+            updateOfficial(_id, patch) { Object.assign(record.official, patch); record.official.generation++; return record; },
+            publishObservation() {}
+        },
+        getSetting: () => true, BotProtect: { show() {} }, getVillageLinkBase: id => '/game.php?village=' + id + '&screen=',
+        fetch: async () => { mutations++; return { ok: true, status: 200, json: async () => ({}) }; }
+    } });
+    loadCore(env.context);
+    load(env.context, 'bots/buildInstantFree.js');
+    load(env.context, 'utils/core_bot_protection.js');
+    vm.runInContext(`_inspectBuildInstant = async function () {
+        window.__countInstantRead();
+        return { official: PremiumFeaturesBuildState.get('2').official };
+    };`, env.context);
+    env.context.__countInstantRead = () => { reads++; };
+    env.context.checkAndScheduleBuildInstantFree('2', { observeDom: false });
+    env.context.PremiumFeaturesBackgroundScheduler.hardStop({ source: 'bot-protection' });
+    clock.tick(180000);
+    await flushMicrotasks(10);
+    assert.equal(reads, 0);
+    assert.equal(mutations, 0);
+    assert.equal(env.context.PremiumFeaturesBotProtection.resumeAfterHardStop(), true);
+    for (let i = 0; i < 5; i++) { clock.tick(500); await flushMicrotasks(20); }
+    assert.equal(reads, 1);
+    assert.equal(mutations, 0);
 });
 
 test('persisted timeout remains recoverable until its asynchronous callback settles', async () => {
