@@ -247,6 +247,16 @@ After installation, open the script settings in TribalWars and enable the featur
 > Completes an eligible active building upgrade during TribalWars' final three-minute free window.
 </details>
 
+<details>
+<summary>AutoFarm Adaptive (A/B)</summary>
+
+> Optional, per-village Farm Assistant controller with adaptive target ranking, report-based learning and persistent stochastic execution plans. It is hidden and stopped by default; enable the feature in Settings, then start each village explicitly from its command deck.
+
+> The implementation uses TWPF's shared scheduler, cross-tab leases, account-wide HARD_STOP and IndexedDB journal. It never automates Bot Protection/CAPTCHA, never sends when map/template/troop proofs are unknown, and permits at most one farm POST per scheduler occurrence. Template C remains the game's native scouting action and is not automated.
+
+See [the v2.0.15 integration and recovery notes](docs/autofarm-adaptive-v2.0.15.md).
+</details>
+
 ### Interface and Settings
 
 <details>
@@ -279,7 +289,7 @@ After installation, open the script settings in TribalWars and enable the featur
 
 ## Data and Limitations
 
-- IndexedDB stores structured data for build queues, recruitment data, reports, notes and map data.
+- IndexedDB stores structured data for build queues, recruitment data, reports, notes, map data and native AutoFarm ledgers/model state.
 - `localStorage` stores settings and selected world- or player-specific data.
 - The extra building queue is a local waiting queue. It does not increase the server's real queue limit: normally two slots for free accounts and five for Premium accounts.
 - The browser tab must remain open for the local build queue and scheduled automation to run. (It's not recommended to leave the tab open on *overview_villages* page.)

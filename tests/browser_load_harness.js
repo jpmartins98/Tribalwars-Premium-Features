@@ -110,6 +110,9 @@ const installedSource = requires.map(relativePath => {
 vm.runInContext(installedSource, context, { filename: 'installed-userscript.js' });
 assert.ok(context.PremiumFeaturesRuntimeRegistry, 'runtime registry was not installed');
 assert.ok(context.PremiumFeaturesBootLifecycle, 'main boot lifecycle was not installed');
+assert.ok(context.PremiumFeaturesAutoFarmStorage, 'native AutoFarm storage boundary was not installed');
+assert.ok(context.PremiumFeaturesAutoFarmAdaptiveCore, 'AutoFarm semantic core was not installed');
+assert.ok(context.PremiumFeaturesAutoFarmAdaptive, 'native AutoFarm controller was not installed');
 
 (async function () {
     context.PremiumFeaturesBootLifecycle.bootNow();

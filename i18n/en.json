@@ -442,6 +442,8 @@
     "settings.autoBuildInstantFreeLabel": "Auto Build Instant Free",
     "settings.autoDailyBonusDesc": "Automatically collects the daily login bonus whenever available Schedules itself for the next day after collecting",
     "settings.autoDailyBonusLabel": "Auto Daily Bonus",
+    "settings.autoFarmAdaptiveLabel": "AutoFarm Adaptive",
+    "settings.autoFarmAdaptiveDesc": "Shows the native, safety-first A/B Farm Assistant controller. Automation remains disabled per village until explicitly started.",
     "settings.autoPaladinTrainDesc": "Automatically manages paladin training tasks — only available with 1 village",
     "settings.autoPaladinTrainLabel": "Auto-Paladin Trainer",
     "settings.autoPaladinTrainLevelLabel": "Train until level:",

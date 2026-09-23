@@ -6,7 +6,7 @@
     }
 
     const state = {
-        active: false,
+        active: Boolean(window.PremiumFeaturesBackgroundScheduler?.stats?.().hardStopped),
         observer: null,
         hookTimer: null
     };
@@ -24,7 +24,7 @@
 
     function canResumeAfterHardStop() {
         return Boolean(window.PremiumFeaturesBackgroundScheduler?.stats?.().hardStopped &&
-            !state.active && !hasBotProtectionMarkers());
+            !hasBotProtectionMarkers());
     }
 
     function rearmBuildQueueAfterHardStop() {
@@ -56,6 +56,9 @@
         if (typeof restoreTimeouts === 'function') restoreTimeouts({ missingOnly: true });
         if (typeof restoreScavengingAutoWakes === 'function') restoreScavengingAutoWakes();
         if (window.PremiumFeaturesBackgroundScheduler?.clearHardStop?.() === false) return false;
+        state.active = false;
+        watchForBotProtection();
+        if (state.active) return false;
         rearmBuildQueueAfterHardStop();
         window.PremiumFeaturesDiagnostics?.record?.({
             feature: 'bot-protection', status: 'MANUAL_RESUME', reason: fromManualSignal ? 'another-tab' : 'user-action'
@@ -87,14 +90,19 @@
         return getSetting('antiBot__disableOnDetection') !== false;
     }
 
-    function blockPremiumFeatures() {
-        if (!shouldDisableFeaturesOnDetection()) return;
-        if (state.active) return;
+    function suspendForHardStop() {
         state.active = true;
-        console.warn('Bot protection detected. Aborting script execution.');
         stopHookTimer();
         stopObserver();
         $(document).off('partial_reload_end.premium_features');
+        window.refreshHardStopRecoveryControl?.();
+    }
+
+    function blockPremiumFeatures() {
+        if (!shouldDisableFeaturesOnDetection()) return;
+        if (state.active) return;
+        console.warn('Bot protection detected. Aborting script execution.');
+        suspendForHardStop();
         window.PremiumFeaturesBackgroundScheduler?.hardStop?.({ source: 'bot-protection' });
         window.PremiumFeaturesCoordination?.broadcast?.('hard-stop', { source: 'bot-protection' });
         window.PremiumFeaturesCoordination?.stop?.();
@@ -164,6 +172,9 @@
         },
         block() {
             blockPremiumFeatures();
+        },
+        suspendForHardStop() {
+            suspendForHardStop();
         }
     };
 
@@ -178,10 +189,11 @@
         window.addEventListener?.('storage', onManualResumeSignal);
     }
 
-    window.PremiumFeaturesCoordination?.subscribe?.('hard-stop', function () {
+    window.PremiumFeaturesCoordination?.subscribe?.('hard-stop', function (_payload, message) {
+        if (message?.sender === window.PremiumFeaturesCoordination?.instanceId) return;
         window.PremiumFeaturesBackgroundScheduler?.hardStop?.({ source: 'remote-hard-stop' });
         window.PremiumFeaturesCoordination?.stop?.();
-        blockPremiumFeatures();
+        suspendForHardStop();
     });
 
     if (document.body) {

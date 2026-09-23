@@ -441,6 +441,8 @@
     "settings.autoBuildInstantFreeLabel": "Construção Instantânea Grátis Automática",
     "settings.autoDailyBonusDesc": "Recolhe automaticamente o bónus diário de login sempre que disponível Agenda-se automaticamente para o dia seguinte após a recolha",
     "settings.autoDailyBonusLabel": "Bónus Diário Automático",
+    "settings.autoFarmAdaptiveLabel": "AutoFarm Adaptativo",
+    "settings.autoFarmAdaptiveDesc": "Mostra o controlador nativo e seguro do Assistente de Saque A/B. A automação continua desligada por aldeia até ser iniciada explicitamente.",
     "settings.autoPaladinTrainDesc": "Gere automaticamente as tarefas de treino do paladino — apenas disponível com 1 aldeia",
     "settings.autoPaladinTrainLabel": "Treinador Automático de Paladino",
     "settings.autoPaladinTrainLevelLabel": "Treinar até ao nível:",

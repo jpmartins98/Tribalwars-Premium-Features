@@ -141,6 +141,7 @@ var availableSettings = [
     { "name": "show__building_queue_all", "label": t('settings.buildingQueueAllLabel'), "description": t('settings.buildingQueueAllDesc'), "group": t('settings.groupAutomation') },
     { "name": "show__auto_daily_bonus", "label": t('settings.autoDailyBonusLabel'), "description": t('settings.autoDailyBonusDesc'), "group": t('settings.groupAutomation') },
     { "name": "show__auto_build_instant_free", "label": t('settings.autoBuildInstantFreeLabel'), "description": t('settings.autoBuildInstantFreeDesc'), "group": t('settings.groupAutomation') },
+    { "name": "show__auto_farm_adaptive", "label": t('settings.autoFarmAdaptiveLabel'), "description": t('settings.autoFarmAdaptiveDesc'), "group": t('settings.groupAutomation') },
     {
         "name": "show__auto_paladin_train", "label": t('settings.autoPaladinTrainLabel'), "description": t('settings.autoPaladinTrainDesc'), "group": t('settings.groupAutomation'),
         "extraSettings": {

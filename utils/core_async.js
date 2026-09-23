@@ -246,13 +246,15 @@ function classifyRequestFailure(error, context = {}) {
 
 function triggerPremiumFeaturesHardStop(failure) {
     console.warn('[TW Resilience] Hard stop:', failure.status || 'bot-protection');
-    window.PremiumFeaturesBackgroundScheduler?.hardStop?.(failure);
-    window.PremiumFeaturesCoordination?.broadcast?.('hard-stop', {
-        source: 'same-origin-http',
+    const reason = {
+        source: [403, 429].includes(Number(failure.status)) ? 'same-origin-http' :
+            (failure.source || 'explicit-hard-stop'),
         status: failure.status
-    });
+    };
+    window.PremiumFeaturesBackgroundScheduler?.hardStop?.(reason);
+    window.PremiumFeaturesCoordination?.broadcast?.('hard-stop', reason);
     window.PremiumFeaturesCoordination?.stop?.();
-    window.PremiumFeaturesBotProtection?.block?.();
+    window.PremiumFeaturesBotProtection?.suspendForHardStop?.();
 }
 
 function createCircuitBreaker(options = {}) {

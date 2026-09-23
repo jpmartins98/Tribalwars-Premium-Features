@@ -2,6 +2,7 @@
 // ceiling once an account has many villages/reports; IndexedDB does not.
 
 const TW_DB_NAME = 'tw_premium_features';
+const TW_DB_VERSION = 9;
 const BUILD_QUEUE_STORE_NAME = 'build_queue';
 const WORLD_REPORTS_STORE_NAME = 'world_reports';
 const VILLAGE_NOTEPAD_STORE_NAME = 'village_notepad';
@@ -9,8 +10,71 @@ const VILLAGE_PROFILE_NOTES_STORE_NAME = 'village_profile_notes';
 const MAP_DATA_STORE_NAME = 'map_data';
 const ALLY_RESERVATIONS_STORE_NAME = 'ally_reservations';
 const QUICK_FARM_ATTACKS_STORE_NAME = 'quick_farm_ongoing_attacks';
+const AUTOFARM_STORE_SCHEMA = Object.freeze({
+    autofarm_meta: {
+        keyPath: ['world', 'playerId', 'sourceVillageId', 'recordType'],
+        indexes: { by_type: ['world', 'playerId', 'recordType'] }
+    },
+    autofarm_farms: {
+        keyPath: ['world', 'playerId', 'sourceVillageId', 'targetCoord'],
+        indexes: {
+            by_village: ['world', 'playerId', 'sourceVillageId'],
+            by_updatedAt: ['world', 'playerId', 'sourceVillageId', 'updatedAt']
+        }
+    },
+    autofarm_dispatches: {
+        keyPath: 'dispatchId',
+        indexes: {
+            by_village: ['world', 'playerId', 'sourceVillageId'],
+            by_village_sentAt: ['world', 'playerId', 'sourceVillageId', 'sentAt'],
+            by_target_sentAt: ['world', 'playerId', 'sourceVillageId', 'targetCoord', 'sentAt'],
+            by_status: ['world', 'playerId', 'sourceVillageId', 'status'],
+            by_round: ['world', 'playerId', 'sourceVillageId', 'executionRoundId']
+        }
+    },
+    autofarm_reports: {
+        keyPath: ['world', 'playerId', 'reportId'],
+        indexes: {
+            by_village: ['world', 'playerId', 'sourceVillageId'],
+            by_village_timestamp: ['world', 'playerId', 'sourceVillageId', 'timestamp'],
+            by_target_timestamp: ['world', 'playerId', 'sourceVillageId', 'targetCoord', 'timestamp'],
+            by_detailState: ['world', 'playerId', 'sourceVillageId', 'detailState']
+        }
+    },
+    autofarm_events: {
+        keyPath: 'eventId',
+        indexes: {
+            by_village: ['world', 'playerId', 'sourceVillageId'],
+            by_village_at: ['world', 'playerId', 'sourceVillageId', 'at'],
+            by_target_at: ['world', 'playerId', 'sourceVillageId', 'targetCoord', 'at']
+        }
+    },
+    autofarm_operational: {
+        keyPath: ['world', 'playerId', 'sourceVillageId', 'recordType'],
+        indexes: { by_type: ['world', 'playerId', 'recordType'] }
+    },
+    autofarm_mutations: {
+        keyPath: 'mutationId',
+        indexes: {
+            by_village: ['world', 'playerId', 'sourceVillageId'],
+            by_village_status: ['world', 'playerId', 'sourceVillageId', 'status'],
+            by_round: ['world', 'playerId', 'sourceVillageId', 'executionRoundId'],
+            by_target: ['world', 'playerId', 'sourceVillageId', 'targetCoord'],
+            by_createdAt: ['world', 'playerId', 'sourceVillageId', 'preparedAt']
+        }
+    },
+    autofarm_diagnostics: {
+        keyPath: 'eventId',
+        indexes: {
+            by_village: ['world', 'playerId', 'sourceVillageId'],
+            by_village_at: ['world', 'playerId', 'sourceVillageId', 'at']
+        }
+    }
+});
 
 var twDbPromise = null;
+var twDbConnection = null;
+var twDbSchemaReady = false;
 // One entry per village: { [villageId]: { building_queue, building_queue_active, ... } }
 var buildQueueMemoryCache = {};
 // One entry per village: { [villageId]: noteText }
@@ -42,12 +106,26 @@ function normalizeBuildQueueVillageId(villageId) {
  */
 function openTwDb() {
     if (twDbPromise) return twDbPromise;
+    if (typeof indexedDB === 'undefined') {
+        const error = new Error('IndexedDB unavailable');
+        error.code = 'IDB_UNAVAILABLE';
+        return Promise.reject(error);
+    }
+    let request;
+    try {
+        request = indexedDB.open(TW_DB_NAME, TW_DB_VERSION);
+    } catch (error) {
+        return Promise.reject(error);
+    }
     twDbPromise = new Promise((resolve, reject) => {
-        if (typeof indexedDB === 'undefined') {
-            reject(new Error('IndexedDB unavailable'));
-            return;
-        }
-        const request = indexedDB.open(TW_DB_NAME, 7);
+        let settled = false;
+        const fail = function (error) {
+            if (settled) return;
+            settled = true;
+            twDbSchemaReady = false;
+            twDbPromise = null;
+            reject(error);
+        };
         request.onupgradeneeded = function () {
             const db = request.result;
             if (!db.objectStoreNames.contains(BUILD_QUEUE_STORE_NAME)) {
@@ -75,11 +153,166 @@ function openTwDb() {
                 store.createIndex('sentAtMs', 'sentAtMs', { unique: false });
                 store.createIndex('targetVillageId', 'targetVillageId', { unique: false });
             }
+            const upgrade = request.transaction;
+            Object.entries(AUTOFARM_STORE_SCHEMA).forEach(([name, schema]) => {
+                const store = db.objectStoreNames.contains(name)
+                    ? upgrade.objectStore(name)
+                    : db.createObjectStore(name, { keyPath: schema.keyPath });
+                Object.entries(schema.indexes).forEach(([indexName, keyPath]) => {
+                    if (!store.indexNames.contains(indexName)) {
+                        store.createIndex(indexName, keyPath, { unique: false });
+                    }
+                });
+            });
         };
-        request.onsuccess = function () { resolve(request.result); };
-        request.onerror = function () { reject(request.error); };
+        request.onblocked = function () {
+            const error = new Error('IndexedDB schema upgrade blocked by another tab');
+            error.code = 'IDB_UPGRADE_BLOCKED';
+            fail(error);
+        };
+        request.onsuccess = function () {
+            const db = request.result;
+            if (settled) {
+                db.close();
+                return;
+            }
+            let schemaReady = false;
+            try {
+                schemaReady = db.version >= TW_DB_VERSION &&
+                    Object.entries(AUTOFARM_STORE_SCHEMA).every(([name, schema]) => {
+                        if (!db.objectStoreNames.contains(name)) return false;
+                        const store = db.transaction(name, 'readonly').objectStore(name);
+                        if (JSON.stringify(store.keyPath) !== JSON.stringify(schema.keyPath)) return false;
+                        return Object.entries(schema.indexes).every(([indexName, keyPath]) =>
+                            store.indexNames.contains(indexName) &&
+                            JSON.stringify(store.index(indexName).keyPath) === JSON.stringify(keyPath)
+                        );
+                    });
+            } catch (_) {
+                schemaReady = false;
+            }
+            if (!schemaReady) {
+                db.close();
+                const error = new Error('IndexedDB AutoFarm schema incomplete');
+                error.code = 'IDB_SCHEMA_INCOMPLETE';
+                fail(error);
+                return;
+            }
+            settled = true;
+            twDbConnection = db;
+            twDbSchemaReady = true;
+            db.onversionchange = function () {
+                db.close();
+                if (twDbConnection === db) {
+                    twDbConnection = null;
+                    twDbPromise = null;
+                    twDbSchemaReady = false;
+                }
+            };
+            resolve(db);
+        };
+        request.onerror = function () { fail(request.error || new Error('IndexedDB open failed')); };
     });
     return twDbPromise;
+}
+
+function isTwDbSchemaReady() {
+    return twDbSchemaReady && !!twDbConnection;
+}
+
+/**
+ * Strict transaction boundary for AutoFarm's future CAS/journal writes. Unlike
+ * the legacy convenience writers below, success means the whole transaction
+ * committed, not merely that one request succeeded. `execute` must enqueue its
+ * initial requests synchronously; subsequent requests belong in `onRequest`
+ * callbacks so the browser cannot auto-commit between awaits.
+ */
+function runAutoFarmDbTransaction(storeNames, mode, execute) {
+    const names = Array.isArray(storeNames) ? [...new Set(storeNames)] : [];
+    if (!names.length || names.some(name => !Object.prototype.hasOwnProperty.call(AUTOFARM_STORE_SCHEMA, name)) ||
+        !['readonly', 'readwrite'].includes(mode) || typeof execute !== 'function') {
+        const error = new Error('Invalid AutoFarm transaction declaration');
+        error.code = 'IDB_TRANSACTION_INVALID';
+        return Promise.reject(error);
+    }
+    return openTwDb().then(db => new Promise((resolve, reject) => {
+        if (!isTwDbSchemaReady() || twDbConnection !== db) {
+            const error = new Error('IndexedDB AutoFarm schema is not ready');
+            error.code = 'IDB_SCHEMA_INCOMPLETE';
+            reject(error);
+            return;
+        }
+        let transaction;
+        try {
+            transaction = db.transaction(names, mode);
+        } catch (error) {
+            reject(error);
+            return;
+        }
+        let result;
+        let failure = null;
+        let settled = false;
+        const abort = error => {
+            if (settled) return;
+            failure = error instanceof Error ? error : new Error(String(error || 'AutoFarm transaction aborted'));
+            try {
+                transaction.abort();
+            } catch (_) {
+                settled = true;
+                reject(failure);
+            }
+        };
+        transaction.oncomplete = function () {
+            if (settled) return;
+            settled = true;
+            if (failure) reject(failure);
+            else resolve(result);
+        };
+        transaction.onabort = function () {
+            if (settled) return;
+            settled = true;
+            const error = failure || transaction.error || new Error('AutoFarm transaction aborted');
+            if (!error.code) error.code = 'IDB_TRANSACTION_ABORTED';
+            reject(error);
+        };
+        transaction.onerror = function () {
+            if (!failure) failure = transaction.error || new Error('AutoFarm transaction request failed');
+        };
+        const api = {
+            store(name) {
+                if (!names.includes(name)) {
+                    const error = new Error('AutoFarm transaction store not declared: ' + name);
+                    error.code = 'IDB_TRANSACTION_INVALID';
+                    throw error;
+                }
+                return transaction.objectStore(name);
+            },
+            onRequest(request, onSuccess) {
+                request.onsuccess = function () {
+                    if (settled) return;
+                    try { onSuccess?.(request.result); } catch (error) { abort(error); }
+                };
+                request.onerror = function () {
+                    abort(request.error || new Error('AutoFarm IndexedDB request failed'));
+                };
+                return request;
+            },
+            setResult(value) { result = value; },
+            abort
+        };
+        try {
+            const returned = execute(api);
+            if (returned && typeof returned.then === 'function') {
+                const error = new Error('Async callbacks cannot hold an IndexedDB transaction open');
+                error.code = 'IDB_TRANSACTION_ASYNC_CALLBACK';
+                abort(error);
+            } else if (returned !== undefined) {
+                result = returned;
+            }
+        } catch (error) {
+            abort(error);
+        }
+    }));
 }
 
 function createQuickFarmAttackId() {

@@ -369,6 +369,23 @@ test('manual hard-stop recovery refuses active protection markers', () => {
     assert.equal(env.context.PremiumFeaturesBackgroundScheduler.stats().hardStopped, true);
 });
 
+test('manual recovery clears a resolved local bot-protection stop and restores its guard', () => {
+    const env = createContext({ overrides: { getSetting: () => true, BotProtect: { show() {} } } });
+    let markerVisible = true;
+    env.document.querySelector = selector => markerVisible && selector === '.captcha' ? {} : null;
+    loadCore(env.context);
+    load(env.context, 'utils/core_bot_protection.js');
+
+    assert.equal(env.context.PremiumFeaturesBackgroundScheduler.stats().hardStopped, true);
+    assert.equal(env.context.PremiumFeaturesBotProtection.isActive(), true);
+    assert.equal(env.context.PremiumFeaturesBotProtection.resumeAfterHardStop(), false);
+
+    markerVisible = false;
+    assert.equal(env.context.PremiumFeaturesBotProtection.resumeAfterHardStop(), true);
+    assert.equal(env.context.PremiumFeaturesBackgroundScheduler.stats().hardStopped, false);
+    assert.equal(env.context.PremiumFeaturesBotProtection.isActive(), false);
+});
+
 test('manual recovery signal reopens an eligible second tab; storage removal alone does not', () => {
     const storage = createStorage();
     const first = createContext({ storage, overrides: { getSetting: () => true, BotProtect: { show() {} } } });
@@ -385,6 +402,95 @@ test('manual recovery signal reopens an eligible second tab; storage removal alo
     assert.ok(key);
     second.windowEvents.dispatch('storage', { key, newValue: storage.getItem(key) });
     assert.equal(second.context.PremiumFeaturesBackgroundScheduler.stats().hardStopped, false);
+});
+
+test('local bot protection hard-stop retains its provenance after coordination broadcast', () => {
+    const env = createContext({ overrides: { getSetting: () => true, BotProtect: { show() {} } } });
+    loadCore(env.context);
+    load(env.context, 'utils/core_bot_protection.js');
+
+    env.context.PremiumFeaturesBotProtection.block();
+
+    const persisted = JSON.parse(env.storage.getItem('twpf_scheduler_hard_stop_v1'));
+    assert.equal(persisted.reason.source, 'bot-protection');
+    assert.equal(env.context.PremiumFeaturesBackgroundScheduler.stats().hardStopReason.source, 'bot-protection');
+});
+
+test('local HTTP 429 hard-stop keeps HTTP provenance and is manually recoverable', () => {
+    const env = createContext({ overrides: { getSetting: () => true, BotProtect: { show() {} } } });
+    loadCore(env.context);
+    load(env.context, 'utils/core_bot_protection.js');
+
+    env.context.triggerPremiumFeaturesHardStop({ status: 429, url: '/game.php', hardStop: true });
+
+    const persisted = JSON.parse(env.storage.getItem('twpf_scheduler_hard_stop_v1'));
+    assert.equal(persisted.reason.source, 'same-origin-http');
+    assert.equal(persisted.reason.status, 429);
+    assert.equal(env.context.PremiumFeaturesBotProtection.isActive(), true);
+    assert.equal(env.context.PremiumFeaturesBotProtection.canResumeAfterHardStop(), true);
+});
+
+test('HTTP hard-stop persists its local network guard across reload until manual recovery', () => {
+    const storage = createStorage();
+    const first = createContext({ storage, overrides: { getSetting: () => true, BotProtect: { show() {} } } });
+    loadCore(first.context);
+    load(first.context, 'utils/core_bot_protection.js');
+    first.context.triggerPremiumFeaturesHardStop({ status: 403, url: '/game.php', hardStop: true });
+
+    const restored = createContext({ storage, overrides: { getSetting: () => true, BotProtect: { show() {} } } });
+    loadCore(restored.context);
+    load(restored.context, 'utils/core_bot_protection.js');
+    assert.equal(restored.context.PremiumFeaturesBackgroundScheduler.stats().hardStopped, true);
+    assert.equal(restored.context.PremiumFeaturesBotProtection.isActive(), true);
+    assert.equal(restored.context.PremiumFeaturesBotProtection.resumeAfterHardStop(), true);
+    assert.equal(restored.context.PremiumFeaturesBotProtection.isActive(), false);
+});
+
+test('remote hard-stop keeps remote provenance and permits manual recovery once local protection is clear', () => {
+    const env = createContext({ overrides: { getSetting: () => true, BotProtect: { show() {} } } });
+    loadCore(env.context);
+    load(env.context, 'utils/core_bot_protection.js');
+    env.context.PremiumFeaturesCoordination.start();
+
+    const remoteMessage = {
+        scope: env.context.PremiumFeaturesCoordination.scope,
+        sender: 'other-instance',
+        id: 'remote-hard-stop-1',
+        type: 'hard-stop',
+        payload: { source: 'same-origin-http', status: 429 }
+    };
+    const messageKey = 'twpf_coordination_v1:' + encodeURIComponent(remoteMessage.scope) + ':message';
+    env.windowEvents.dispatch('storage', { key: messageKey, newValue: JSON.stringify(remoteMessage) });
+
+    const persisted = JSON.parse(env.storage.getItem('twpf_scheduler_hard_stop_v1'));
+    assert.equal(persisted.reason.source, 'remote-hard-stop');
+    assert.equal(env.context.PremiumFeaturesBotProtection.isActive(), true);
+    assert.equal(env.context.PremiumFeaturesBotProtection.canResumeAfterHardStop(), true);
+});
+
+test('external localStorage quota failure is not attributed to TWPF', () => {
+    let warnings = 0;
+    class QuotaStorage {
+        setItem() {
+            const error = new Error('Quota exceeded');
+            error.name = 'QuotaExceededError';
+            throw error;
+        }
+    }
+    const storage = new QuotaStorage();
+    const originalSetItem = QuotaStorage.prototype.setItem;
+    const env = createContext({ storage, overrides: {
+        Storage: QuotaStorage,
+        showAutoHideBox() { warnings++; },
+        t: key => key
+    } });
+    load(env.context, 'utils/core_storage.js');
+
+    assert.equal(QuotaStorage.prototype.setItem, originalSetItem);
+    assert.throws(() => storage.setItem('external-big-key', 'large-data'), { name: 'QuotaExceededError' });
+    assert.equal(warnings, 0);
+    assert.equal(env.context.safeLocalStorageSet('twpf-key', 'value'), false);
+    assert.equal(warnings, 1);
 });
 
 test('real scheduler resumes Building Queue, Instant Free and Scavenging through their workers', async () => {
@@ -923,19 +1029,21 @@ test('mutation response parse failure after transmission is UNCERTAIN', async ()
 
 test('same-origin 429 performs zero retries and hard-stops', async () => {
     let ajaxCalls = 0;
-    let hardStops = 0;
+    let schedulerStops = 0;
+    let botProtectionBlocks = 0;
     const jquery = jqueryStub();
     jquery.ajax = settings => {
         ajaxCalls++;
         settings.error({ status: 429, responseURL: 'https://pt99.tribalwars.com.pt/game.php' });
     };
     const env = createContext({ overrides: { $: jquery } });
-    env.context.PremiumFeaturesBotProtection = { block: () => { hardStops++; } };
-    env.context.PremiumFeaturesBackgroundScheduler = { hardStop: () => { hardStops++; } };
+    env.context.PremiumFeaturesBotProtection = { block: () => { botProtectionBlocks++; } };
+    env.context.PremiumFeaturesBackgroundScheduler = { hardStop: () => { schedulerStops++; } };
     load(env.context, 'utils/core_async.js');
     await assert.rejects(env.context.fetchWithRetry429({ url: '/game.php', type: 'GET' }));
     assert.equal(ajaxCalls, 1);
-    assert.equal(hardStops, 2);
+    assert.equal(schedulerStops, 1);
+    assert.equal(botProtectionBlocks, 0);
 });
 
 test('403/429 hard-stop policy is restricted to same-origin Tribal Wars', async () => {
@@ -960,7 +1068,7 @@ test('403/429 hard-stop policy is restricted to same-origin Tribal Wars', async 
         run: async () => { throw explicit; }
     });
     assert.equal(result.status, 'HARD_STOP');
-    assert.equal(explicitStops, 3);
+    assert.equal(explicitStops, 2);
 });
 
 test('resume processes overdue work one task per deterministic turn', async () => {

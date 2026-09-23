@@ -82,16 +82,16 @@
             return writeStorage(key, String(token)) ? token : null;
         }
 
-        function emit(type, payload) {
+        function emit(type, payload, message) {
             const callbacks = listeners.get(type);
             if (callbacks) callbacks.forEach(callback => {
-                try { callback(payload); } catch (error) { console.error('[TW Coordination] listener failed', error); }
+                try { callback(payload, message); } catch (error) { console.error('[TW Coordination] listener failed', error); }
             });
         }
 
         function receiveMessage(message) {
             if (!message || message.scope !== scope || message.sender === instanceId) return;
-            emit(message.type, message.payload);
+            emit(message.type, message.payload, message);
             if (message.type === 'lease-changed' && message.payload?.taskKey === 'coordinator') {
                 evaluateCoordinator();
             }
@@ -103,7 +103,7 @@
                 try { channel.postMessage(message); } catch (error) { console.warn('[TW Coordination] BroadcastChannel failed', error); }
             }
             writeStorage(messageStorageKey(), JSON.stringify(message));
-            emit(type, payload);
+            emit(type, payload, message);
         }
 
         function acquireLease(taskKey, ttlMs = coordinatorLeaseMs) {

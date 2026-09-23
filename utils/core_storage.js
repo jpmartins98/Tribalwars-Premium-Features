@@ -40,22 +40,3 @@ function safeLocalStorageSet(key, value) {
         return false;
     }
 }
-
-function installLocalStorageQuotaHandler() {
-    if (typeof Storage === 'undefined' || Storage.prototype.__twQuotaHandlerInstalled) return;
-
-    const originalSetItem = Storage.prototype.setItem;
-    const wrappedSetItem = function (key, value) {
-        try {
-            return originalSetItem.call(this, key, value);
-        } catch (error) {
-            reportStorageError(error, 'saving ' + key);
-            throw error;
-        }
-    };
-    wrappedSetItem.__twOriginalSetItem = originalSetItem;
-    Storage.prototype.setItem = wrappedSetItem;
-    Storage.prototype.__twQuotaHandlerInstalled = true;
-}
-
-installLocalStorageQuotaHandler();

@@ -1,21 +1,21 @@
 // ==UserScript==
 // @name         Tribalwars: Premium Features [Premium Compat]
-// @version      5.3.7
-// @description  Feature-rich enhancement suite for TribalWars. Widgets: Village List, Notepad, Extra Build Queue, Recruit Troops. Map: hover details, outgoing command overlay, attack heat-map, custom CTX attack template buttons, large map view. Automation: Auto Daily Bonus collection. UI: Custom Navigation Bar, Navigation Arrows, Visual Building Overview. Settings: full import/export support.
+// @version      5.3.9
+// @description  Feature-rich enhancement suite for TribalWars. Widgets, map/report tools and optional safety-first automation including AutoFarm Adaptive A/B.
 // @author       killwilll
 // @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/i18n/i18n_utils.js?v=5.3.2
-// @resource     i18n_en      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/i18n/en.json?v=5.3.7
-// @resource     i18n_pt      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/i18n/pt.json?v=5.3.7
+// @resource     i18n_en      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/i18n/en.json?v=5.3.9
+// @resource     i18n_pt      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/i18n/pt.json?v=5.3.9
 // @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/utils/emojiMap.js?v=5.3.2
-// @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/utils/core_storage.js?v=5.3.2
+// @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/utils/core_storage.js?v=5.3.9
 // @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/utils/core_runtime.js?v=5.3.3
 // @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/utils/core_diagnostics.js?v=5.3.2
-// @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/utils/core_coordination.js?v=5.3.3
-// @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/utils/core_state.js?v=5.3.5
+// @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/utils/core_coordination.js?v=5.3.9
+// @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/utils/core_state.js?v=5.3.9
 // @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/utils/core_utils.js?v=5.3.6
 // @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/utils/core_widgets.js?v=5.3.5
 // @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/utils/core_time.js?v=5.3.2
-// @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/utils/core_async.js?v=5.3.3
+// @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/utils/core_async.js?v=5.3.9
 // @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/utils/core_scheduler.js?v=5.3.7
 // @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/utils/mapDataCache.js?v=5.3.2
 // @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/utils/bbcode.js?v=5.3.2
@@ -23,16 +23,19 @@
 // @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/utils/buildingsData.js?v=5.3.2
 // @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/utils/attackLauncher.js?v=5.3.2
 // @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/utils/nativeMemo.js?v=5.3.2
-// @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/utils/core_indexeddb.js?v=5.3.2
+// @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/utils/core_indexeddb.js?v=5.3.9
+// @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/features/autoFarmAdaptiveCore.js?v=5.3.9
+// @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/features/autoFarmAdaptiveStorage.js?v=5.3.9
 // @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/utils/buildStateStore.js?v=5.3.7
 // @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/utils/resourcesManager.js?v=5.3.2
 // @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/utils/buildingsManager.js?v=5.3.2
 // @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/utils/marketTransports.js?v=5.3.2
-// @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/utils/core_bot_protection.js?v=5.3.7
+// @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/utils/core_bot_protection.js?v=5.3.9
+// @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/features/autoFarmAdaptive.js?v=5.3.9
 // @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/utils/core_css.js?v=5.3.5
 // @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/utils/core_darkmode.js?v=5.3.2
 // @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/utils/core_sidebar.js?v=5.3.5
-// @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/utils/core_settings.js?v=5.3.7
+// @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/utils/core_settings.js?v=5.3.9
 // @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/utils/mapSdk.js?v=5.3.2
 // @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/utils/ctxCustom.js?v=5.3.2
 // @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/widgets/villageArrows.js?v=5.3.2
@@ -173,6 +176,7 @@
             runtime.installInteractionTracking(document);
             window.PremiumFeaturesCoordination?.start?.();
             window.PremiumFeaturesBackgroundScheduler?.start?.();
+            await window.PremiumFeaturesAutoFarmAdaptive?.init?.();
         });
     }
 
@@ -210,6 +214,9 @@
     function mountUi(reason) {
         if (document.getElementById('mobileContent')) return;
         const startedAt = monotonicNow();
+        window.PremiumFeaturesAutoFarmAdaptive?.init?.().catch?.(function (error) {
+            console.error('[TW] AutoFarm reconcile failed', error);
+        });
         start();
         recordBoot('BOOT_START_COMPLETE', 'start', {
             reason: reason || 'initial',

@@ -91,6 +91,7 @@ var default_settings_cookies = {
         },
         show__auto_daily_bonus: false,
         show__auto_build_instant_free: false,
+        show__auto_farm_adaptive: false,
         show__auto_paladin_train: {
             enabled: false,
             maxLevel: 30,
