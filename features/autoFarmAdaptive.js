@@ -10,6 +10,7 @@
     const ASSISTANT_TTL_MS = 120000;
     const CAPACITY_TTL_MS = 90000;
     const REPORT_RETRY_MS = 5 * 60000;
+    const REPORT_GET_BUDGET = 6;
     const runtime = {
         storage: null,
         registered: false,
@@ -26,7 +27,17 @@
 
     function scheduler() { return root.PremiumFeaturesBackgroundScheduler; }
     function coordinator() { return root.PremiumFeaturesCoordination; }
+    function planner() {
+        const value = root.PremiumFeaturesAutoFarmPlanner;
+        if (!value) throw coded('AUTOFARM_PLANNER_MISSING', 'Native AutoFarm planner is unavailable');
+        return value;
+    }
     function coded(code, message) { const error = new Error(message || code); error.code = code; return error; }
+    function isCriticalStorageError(error) {
+        return /IDB|STORAGE|CAS|MUTATION|SCOPE|LEGACY|QUOTA|TRANSACTION|INDEXEDDB/i.test(
+            `${String(error?.code || '')} ${String(error?.name || '')}`
+        );
+    }
     function now() { return Date.now(); }
     function scopeKey(scope) { return `${scope.world}:p${scope.playerId}:v${scope.sourceVillageId}`; }
     function taskKey(scope) { return TASK_PREFIX + scopeKey(scope); }
@@ -41,7 +52,9 @@
     }
 
     function featureAllowed() {
-        const value = root.settings_cookies?.general?.show__auto_farm_adaptive;
+        const value = typeof getSetting === 'function'
+            ? getSetting('show__auto_farm_adaptive')
+            : root.PremiumFeaturesSettingsState?.getSetting?.('show__auto_farm_adaptive');
         return value === undefined ? false : (typeof value === 'object' ? value.enabled === true : value === true);
     }
 
@@ -113,9 +126,15 @@
             root.PremiumFeaturesBackgroundScheduler?.hardStop?.({ source: 'bot-protection', feature: FEATURE });
             root.PremiumFeaturesCoordination?.broadcast?.('hard-stop', { source: 'bot-protection', feature: FEATURE });
             root.PremiumFeaturesBotProtection?.suspendForHardStop?.();
-            throw coded('HARD_STOP', 'Bot Protection/CAPTCHA detected');
+            const error = coded('HARD_STOP', 'Bot Protection/CAPTCHA detected');
+            error.hardStopSource = 'bot-protection';
+            throw error;
         }
-        if (containsLogin(text, response.url)) throw coded('HARD_STOP', 'Session expired');
+        if (containsLogin(text, response.url)) {
+            const error = coded('HARD_STOP', 'Session expired');
+            error.hardStopSource = 'session-expired';
+            throw error;
+        }
         if (!response.ok) {
             const error = new Error(`HTTP ${response.status}`);
             error.status = response.status;
@@ -192,12 +211,15 @@
         const read = await resilientRequest(scope, 'map', url, { method: 'GET', cache: 'no-cache' }, guard);
         const targets = parseWorldMap(read.text, settings.radius);
         const observedAt = now();
+        const contentRevision = planner().stableHash([...targets.entries()]);
         return {
             targets,
             proof: {
                 status: 'READY', observedAt, freshUntil: observedAt + MAP_TTL_MS,
                 authorizationFreshUntil: observedAt + MAP_TTL_MS,
-                revision: observedAt, targetIds: Object.fromEntries(targets), center: villageCoord()
+                revision: observedAt, observationRevision: observedAt, contentRevision,
+                analysisFreshUntil: observedAt + MAP_TTL_MS,
+                targetIds: Object.fromEntries(targets), center: villageCoord()
             }
         };
     }
@@ -248,7 +270,10 @@
         const dom = core().parseDomTemplateComposition(assistant.firstDoc, templateId);
         if (inline && dom && !core().sameComposition(inline, dom)) return { usable: false, reason: 'TEMPLATE_CONFLICT' };
         const composition = core().normalizeComposition(inline || dom);
-        const currentUnits = core().parseInlineCurrentUnits(assistant.firstDoc) || core().parseUnitsEntryAll(assistant.firstDoc);
+        // Only the fresh am_farm `current_units` payload is accepted as proof of
+        // units available at home. Generic totals/support/away counters are never
+        // promoted to mutation authority.
+        const currentUnits = core().parseInlineCurrentUnits(assistant.firstDoc);
         const capacity = composition && currentUnits ? core().capacityForComposition(composition, currentUnits) : null;
         if (!composition || !currentUnits || !Number.isFinite(capacity)) {
             return { usable: false, reason: 'CAPACITY_UNKNOWN', templateId, composition, currentUnits };
@@ -261,7 +286,10 @@
                 observedAt, freshUntil: observedAt + CAPACITY_TTL_MS,
                 source: 'ASSISTANT_CURRENT_UNITS', templateId,
                 farmTemplate: settings.farmTemplate, composition,
-                compositionAuthoritative: true, currentUnits, sourceVillageId
+                compositionAuthoritative: true, currentUnits, sourceVillageId,
+                availableAtHome: true,
+                authority: 'AM_FARM_FRESH_CURRENT_UNITS',
+                revision: observedAt
             })
         };
     }
@@ -275,11 +303,21 @@
         return runtime.storage;
     }
 
-    function assertLegacyStandaloneInactive(scope) {
-        const factory = root.PremiumFeaturesAutoFarmStorage;
-        if (typeof factory?.readLegacySnapshot !== 'function') return true;
-        factory.readLegacySnapshot(scope, { host: root, storage: root.localStorage, now });
-        return true;
+    async function assertMutationAuthority(scope) {
+        const authority = await storage().legacyAuthorityStatus(scope);
+        if (!authority.mutationAllowed) {
+            const error = coded(
+                authority.status === 'LEGACY_AUTOFARM_DETECTED'
+                    ? 'AUTOFARM_LEGACY_ACTIVE'
+                    : 'AUTOFARM_LEGACY_HANDOFF_REQUIRED',
+                authority.status === 'LEGACY_AUTOFARM_DETECTED'
+                    ? 'Standalone AutoFarm runtime detected; TWPF mutation authority is disabled'
+                    : 'Explicit verified legacy handoff is required before TWPF mutations'
+            );
+            error.authority = authority;
+            throw error;
+        }
+        return authority;
     }
 
     function metaKey(scope, type) {
@@ -287,6 +325,7 @@
     }
 
     async function ensureNativeRecords(scope) {
+        let initializationState = 'STARTING';
         let settings = await storage().readRecord('autofarm_meta', metaKey(scope, 'settings'));
         if (!settings) {
             try {
@@ -299,7 +338,10 @@
                 }
             } catch (error) {
                 if (!['AUTOFARM_LEGACY_ACTIVE', 'AUTOFARM_LEGACY_CORRUPT'].includes(error?.code)) throw error;
-                diagnostic(scope, 'MIGRATION_BLOCKED', error.code);
+                initializationState = error.code === 'AUTOFARM_LEGACY_ACTIVE'
+                    ? 'LEGACY_AUTOFARM_DETECTED'
+                    : 'MIGRATION_ERROR';
+                diagnostic(scope, initializationState, error.code);
             }
             settings = await storage().readRecord('autofarm_meta', metaKey(scope, 'settings'));
         }
@@ -320,6 +362,38 @@
             targetRecord = await storage().readRecord('autofarm_operational', metaKey(scope, 'targetStates'));
         }
         const records = { settings, coordination: coordinationRecord, targets: targetRecord };
+        try {
+            const authority = await storage().legacyAuthorityStatus(scope);
+            if (!authority.mutationAllowed) {
+                initializationState = authority.status;
+                const current = core().normalizeCoordinationState(coordinationRecord.value);
+                if (current.state !== authority.status || current.reason !== authority.reason) {
+                    coordinationRecord = await storage().putMetaCas(scope, 'coordination', coordinationRecord.revision,
+                        core().normalizeCoordinationState({
+                            ...current,
+                            state: authority.status,
+                            executionDueAt: 0,
+                            authorizationDueAt: 0,
+                            reason: authority.reason || authority.evidence || authority.status
+                        }));
+                    records.coordination = coordinationRecord;
+                }
+            }
+            records.legacyAuthority = authority;
+        } catch (error) {
+            initializationState = 'MIGRATION_ERROR';
+            const current = core().normalizeCoordinationState(coordinationRecord.value);
+            if (current.state !== 'MIGRATION_ERROR') {
+                coordinationRecord = await storage().putMetaCas(scope, 'coordination', coordinationRecord.revision,
+                    core().normalizeCoordinationState({
+                        ...current, state: 'MIGRATION_ERROR', executionDueAt: 0,
+                        authorizationDueAt: 0, reason: error.code || error.message
+                    }));
+                records.coordination = coordinationRecord;
+            }
+            records.legacyAuthority = { status: initializationState, mutationAllowed: false, reason: error.message };
+        }
+        records.initializationState = initializationState;
         runtime.records.set(scopeKey(scope), records);
         return records;
     }
@@ -448,7 +522,7 @@
         return saved;
     }
 
-    async function scanReportIndex(scope, settings, map, model, guard) {
+    async function scanReportIndex(scope, settings, map, model, guard, budget = { remaining: REPORT_GET_BUDGET }) {
         let state = core().prepareAdaptiveReportIndexScope(model.reportIndex, map.targets, settings, now());
         const activeCoords = new Set(map.targets.keys());
         const historyCoords = new Set(core().normalizedCoordList(state.historyCoords));
@@ -482,7 +556,8 @@
         const cutoff = now() - settings.adaptiveHistoryDays * 86400000;
         let page = state.nextPage;
         let pagesRead = 0;
-        while (pagesRead < core().ADAPTIVE_REPORT_INDEX_PAGES_PER_PASS) {
+        while (pagesRead < core().ADAPTIVE_REPORT_INDEX_PAGES_PER_PASS && budget.remaining > 0) {
+            budget.remaining--;
             const read = await resilientRequest(scope, `report-index:${page}`, reportIndexUrl(scope, page), {
                 method: 'GET', headers: { 'X-Requested-With': 'XMLHttpRequest' }
             }, guard);
@@ -543,7 +618,7 @@
         return { pagesRead, backlog: state.backlog.length };
     }
 
-    async function ingestReportDetails(scope, settings, records, assistant, model, guard) {
+    async function ingestReportDetails(scope, settings, records, assistant, model, guard, budget = { remaining: REPORT_GET_BUDGET }) {
         const completeIds = new Set((model.reportLedger || [])
             .filter(record => String(record?.detailState || '') !== 'ASSISTANT_SUMMARY')
             .map(record => String(record.reportId || '')));
@@ -557,11 +632,13 @@
         const queue = [...queueById.values()]
             .sort((a, b) => Number(Boolean(records.targets?.value?.[b.coord]?.pending)) - Number(Boolean(records.targets?.value?.[a.coord]?.pending)) ||
                 Number(b.assistantAttackAt || 0) - Number(a.assistantAttackAt || 0))
-            .slice(0, settings.adaptiveReportFetchPerPass);
+            .slice(0, Math.min(settings.adaptiveReportFetchPerPass, Math.max(0, budget.remaining)));
         let committed = 0;
         let reportIndexChanged = false;
         for (const row of queue) {
             guard?.assertActive?.();
+            if (!(budget.remaining > 0)) break;
+            budget.remaining--;
             let read;
             try {
                 read = await resilientRequest(scope, `report:${row.reportId}`, reportDetailUrl(scope, row.reportId), {
@@ -709,8 +786,9 @@
         ]);
         guard?.assertActive?.();
         const assistant = await readAssistant(scope, settings, map.targets, guard);
-        await scanReportIndex(scope, settings, map, model, guard);
-        await ingestReportDetails(scope, settings, records, assistant, model, guard);
+        const reportBudget = { remaining: REPORT_GET_BUDGET };
+        await scanReportIndex(scope, settings, map, model, guard, reportBudget);
+        await ingestReportDetails(scope, settings, records, assistant, model, guard, reportBudget);
         await synchronizePendingAssistantReports(scope, settings, records, assistant, guard);
         const capacity = chooseTemplateAndCapacity(assistant, settings, scope.sourceVillageId);
         const targetStates = records.targets?.value || {};
@@ -773,14 +851,21 @@
     }
 
     async function persistObservationPlan(scope, observation, guard) {
-        const { settings, records, map, assistant, capacity, presence, candidates, timestamp } = observation;
+        const { settings, records, model, map, assistant, capacity, presence, candidates, timestamp } = observation;
         const settingsRecord = records.settings;
         if (!capacity.usable || capacity.capacity <= 0 || !candidates.length) {
             const waitReason = !capacity.usable ? capacity.reason : (capacity.capacity <= 0 ? 'CAPACITY_ZERO' : 'NO_CANDIDATES');
             const coordinationValue = core().normalizeCoordinationState({
                 ...records.coordination.value,
-                state: 'WAITING_WORK', executionPlan: null, stochasticPlan: null,
-                executionRound: null, reason: waitReason,
+                state: capacity.capacity === 0 ? 'WAITING_CAPACITY' : 'WAITING_WORK',
+                executionPlan: null, stochasticPlan: null, desiredIntent: null,
+                executionRound: null, executionDueAt: 0, authorizationDueAt: 0,
+                capacityDueAt: capacity.capacity === 0
+                    ? Math.max(timestamp + 1000, Number(capacity.proof?.freshUntil) || 0)
+                    : 0,
+                observationDueAt: capacity.capacity === 0 ? 0 : timestamp + settings.retrySeconds * 1000,
+                maintenanceDueAt: timestamp + settings.adaptiveMaintenanceMaxHours * 3600000,
+                reason: waitReason,
                 sources: {
                     ...records.coordination.value?.sources,
                     MAP: { ...map.proof, source: 'MAP', data: map.proof },
@@ -788,36 +873,22 @@
                     CAPACITY: capacity.proof ? { ...capacity.proof, source: 'CAPACITY', data: capacity.proof } : { source: 'CAPACITY', status: 'UNKNOWN' }
                 }
             });
-            await storage().putMetaCas(scope, 'coordination', records.coordination.revision, coordinationValue, guard);
+            const saved = await storage().putMetaCas(scope, 'coordination', records.coordination.revision, coordinationValue, guard);
             await storage().putMetaCas(scope, 'mapPresence', previousRevision(observation, 'mapPresence'), presence.state, guard)
                 .catch(error => { if (error.code !== 'AUTOFARM_CAS_MISMATCH') throw error; });
+            armNextDeadline(scope, saved.value);
             return { planned: false, reason: waitReason };
         }
-        const ranked = rankCandidates(observation).slice(0, Math.min(settings.maxSendsPerPass, capacity.capacity));
+        const ranked = rankCandidates(observation).slice(0, settings.maxSendsPerPass);
         const generation = Math.max(0, Number(records.coordination.value?.generation) || 0) + 1;
         const planRevision = Math.max(0, Number(records.coordination.value?.planRevision) || 0) + 1;
         const roundId = `${scope.sourceVillageId}:${generation}:${timestamp}`;
         const cycleId = `${roundId}:1`;
-        const proofEnd = Math.min(map.proof.authorizationFreshUntil, assistant.proof.freshUntil, capacity.proof.freshUntil);
         const notBeforeAt = timestamp;
-        const stochasticRandom = core().createRandomSource(null, 'scheduling');
-        const stochastic = core().generateStochasticPlan({
-            now: timestamp, mode: settings.stochasticSchedulingMode, cycleId, generation, planRevision,
-            ownerId: coordinator()?.instanceId || '', earliestExecutionAt: notBeforeAt,
-            latestCheapExecutionAt: proofEnd - core().PLAN_PROOF_MARGIN_MS,
-            maxHoldAt: proofEnd - core().PLAN_PROOF_MARGIN_MS,
-            knownDispatchBudget: capacity.capacity, readyCandidateCount: ranked.length,
-            configuredMaximum: settings.maxSendsPerPass,
-            randomSources: {
-                coalescing: core().createRandomSource(null, 'coalescing'),
-                scheduling: stochasticRandom
-            }
-        }, stochasticRandom);
-        if (!(stochastic.executionDueAt > 0)) return { planned: false, reason: 'INVALID_STOCHASTIC_WINDOW' };
         const round = core().normalizeExecutionRound({
             executionRoundId: roundId, cycleId, generation, planRevision,
             sourceVillageId: scope.sourceVillageId, configuredLimit: settings.maxSendsPerPass,
-            dispatchLimitRemaining: Math.min(settings.maxSendsPerPass, capacity.capacity, ranked.length),
+            dispatchLimitRemaining: settings.maxSendsPerPass,
             createdAt: timestamp, status: 'OPEN'
         });
         const plan = core().normalizeExecutionPlan({
@@ -827,17 +898,45 @@
             candidates: ranked.map(compactCandidate), dispatchLimitRemaining: round.dispatchLimitRemaining,
             capacityProof: capacity.proof, composition: capacity.composition,
             compositionAuthoritative: true, sourceRevisions: {
-                settings: settingsRecord.revision, map: map.proof.revision,
+                settings: settingsRecord.revision,
+                map: map.proof.observationRevision,
+                mapContent: map.proof.contentRevision,
                 assistant: assistant.proof.revision, capacity: capacity.proof.observedAt
             },
             requiredSources: ['MAP', 'ASSISTANT', 'TEMPLATE', 'CAPACITY'],
             reason: 'native-observation'
         });
+        const generated = planner().createDesiredIntent({
+            now: timestamp,
+            mode: settings.stochasticSchedulingMode,
+            cycleId,
+            executionRoundId: roundId,
+            generation,
+            planRevision,
+            ownerId: coordinator()?.instanceId || '',
+            immutableNotBeforeAt: notBeforeAt,
+            nextMutationNotBeforeAt: 0,
+            knownDispatchBudget: capacity.capacity,
+            configuredMaximum: settings.maxSendsPerPass,
+            candidateRefs: plan.candidates,
+            modelRevision: Number(model?._metaRecord?.revision) || 0,
+            configRevision: settingsRecord.revision,
+            reason: 'native-observation',
+            intentCreatedBecause: 'NEW_EXECUTION_ROUND'
+        });
+        const desiredIntent = generated.intent;
+        const stochastic = generated.stochastic;
         const coordinationValue = core().normalizeCoordinationState({
             ...records.coordination.value, generation, planRevision,
             state: 'WAITING_EXECUTION', executionRound: round, executionPlan: plan,
-            stochasticPlan: stochastic, executionDueAt: stochastic.executionDueAt,
-            nextWakeAt: stochastic.executionDueAt, wakeKind: 'EXECUTION', reason: 'native-plan',
+            stochasticPlan: stochastic, desiredIntent,
+            executionDueAt: desiredIntent.desiredExecutionAt,
+            authorizationDueAt: 0, observationDueAt: 0, capacityDueAt: 0,
+            maintenanceDueAt: Math.max(
+                desiredIntent.desiredExecutionAt + 1000,
+                timestamp + settings.adaptiveMaintenanceMaxHours * 3600000
+            ),
+            nextWakeAt: desiredIntent.desiredExecutionAt, wakeKind: 'EXECUTION', reason: 'native-plan',
             sources: {
                 ...records.coordination.value?.sources,
                 MAP: { ...map.proof, source: 'MAP', data: map.proof },
@@ -851,11 +950,26 @@
                     freshUntil: capacity.proof.freshUntil, revision: capacity.proof.observedAt, data: capacity.proof }
             }
         });
-        await storage().putMetaCas(scope, 'coordination', records.coordination.revision, coordinationValue, guard);
+        const saved = await storage().putMetaCas(scope, 'coordination', records.coordination.revision, coordinationValue, guard);
         await storage().putMetaCas(scope, 'mapPresence', previousRevision(observation, 'mapPresence'), presence.state, guard)
             .catch(error => { if (error.code !== 'AUTOFARM_CAS_MISMATCH') throw error; });
-        schedule(scope, stochastic.executionDueAt, 'EXECUTION');
-        return { planned: true, plan, round, stochastic };
+        diagnostic(scope, 'DESIRED_INTENT_CREATED', desiredIntent.intentId, {
+            stochasticPolicyVersion: desiredIntent.stochasticPolicyVersion,
+            stochasticDecisionId: desiredIntent.stochasticDecisionId,
+            mode: desiredIntent.mode,
+            stochasticAnchorAt: desiredIntent.stochasticAnchorAt,
+            coalesceTarget: desiredIntent.coalesceTarget,
+            coalesceUntil: desiredIntent.coalesceUntil,
+            temporalProfile: desiredIntent.temporalProfile,
+            stochasticSubwindowStart: desiredIntent.stochasticSubwindowStart,
+            stochasticSubwindowEnd: desiredIntent.stochasticSubwindowEnd,
+            desiredDelayMs: desiredIntent.desiredDelayMs,
+            desiredExecutionAt: desiredIntent.desiredExecutionAt,
+            rngDrawCount: desiredIntent.randomDrawCount,
+            intentCreatedBecause: desiredIntent.intentCreatedBecause
+        });
+        armNextDeadline(scope, saved.value);
+        return { planned: true, plan, round, stochastic, desiredIntent };
     }
 
     function previousRevision(observation, type) {
@@ -880,6 +994,33 @@
             rerunWhileActive: true
         });
         return true;
+    }
+
+    function armNextDeadline(scope, state) {
+        const next = planner().nextDeadline(state);
+        if (!next) {
+            scheduler()?.cancel?.(taskKey(scope), 'no-autofarm-deadline');
+            return null;
+        }
+        schedule(
+            scope,
+            next.dueAt,
+            next.kind,
+            next.kind === 'RECONCILIATION' ? scheduler()?.PRIORITY?.RECONCILIATION : undefined
+        );
+        return next;
+    }
+
+    async function updateDeadlines(scope, transform, guard) {
+        const saved = await updateCoordination(scope, state => {
+            const next = core().normalizeCoordinationState(transform(state));
+            const descriptor = planner().nextDeadline(next);
+            next.nextWakeAt = descriptor?.dueAt || 0;
+            next.wakeKind = descriptor?.kind || 'MAINTENANCE';
+            return next;
+        }, guard);
+        armNextDeadline(scope, saved.value);
+        return saved;
     }
 
     async function updateCoordination(scope, transform, guard) {
@@ -936,43 +1077,17 @@
         return parsePostJson(response.text);
     }
 
-    async function installPostCapacity(scope, plan, data, guard) {
-        const units = core().normalizeUnitCounts(data?.current_units, true);
-        const value = units && plan.compositionAuthoritative && plan.composition
-            ? core().capacityForComposition(plan.composition, units)
-            : null;
-        return updateCoordination(scope, state => {
-            const timestamp = now();
-            if (Number.isFinite(value)) {
-                const proof = core().normalizeCapacityProof({
-                    value, exact: true, authoritative: true,
-                    observedAt: timestamp, freshUntil: timestamp + CAPACITY_TTL_MS,
-                    source: 'POST_CURRENT_UNITS', templateId: plan.templateId,
-                    farmTemplate: plan.farmTemplate, composition: plan.composition,
-                    compositionAuthoritative: true, currentUnits: units,
-                    sourceVillageId: scope.sourceVillageId
-                });
-                state.sources.CAPACITY = {
-                    source: 'CAPACITY', status: 'READY', observedAt: timestamp,
-                    freshUntil: proof.freshUntil, revision: timestamp, data: proof
-                };
-            } else {
-                state.sources.CAPACITY = {
-                    source: 'CAPACITY', status: 'STALE', observedAt: timestamp,
-                    freshUntil: 0, invalidated: true, revision: timestamp,
-                    reason: 'MUTATION_CONFIRMED_WITHOUT_CURRENT_UNITS', data: null
-                };
-            }
-            return state;
-        }, guard);
-    }
-
     async function scheduleSuccessor(scope, settings, guard) {
         const coordinationRecord = await storage().readRecord('autofarm_meta', metaKey(scope, 'coordination'));
         const state = core().normalizeCoordinationState(coordinationRecord?.value);
         const plan = core().normalizeExecutionPlan(state.executionPlan);
         const round = core().normalizeExecutionRound(state.executionRound);
-        const proof = core().normalizeCapacityProof(state.sources.CAPACITY?.data);
+        if (round.status !== 'OPEN' || !(round.dispatchLimitRemaining > 0) || round.pendingMutation) return false;
+        const proof = planner().selectUsableCapacityProof(state.sources.CAPACITY?.data, {
+            sourceVillageId: scope.sourceVillageId,
+            templateId: plan.templateId,
+            farmTemplate: plan.farmTemplate
+        }, now(), core().PLAN_PROOF_MARGIN_MS);
         const remaining = plan.candidates.slice(1);
         const budget = core().successorDispatchBudget(round, proof, remaining.length, {
             sourceVillageId: scope.sourceVillageId,
@@ -980,37 +1095,47 @@
             farmTemplate: plan.farmTemplate
         }, now());
         if (!(budget > 0) || !remaining.length) return false;
-        const dueAt = Math.max(now() + Math.max(0, Number(settings.attemptGapMs) || 0), Number(plan.notBeforeAt) || 0);
-        const proofEnd = core().coordinationProofEnd(state, plan.requiredSources, now());
-        if (!(proofEnd >= dueAt + core().PLAN_PROOF_MARGIN_MS)) return false;
+        const createdAt = now();
+        const nextMutationNotBeforeAt = createdAt + Math.max(0, Number(settings.attemptGapMs) || 0);
         const generation = Number(state.generation) + 1;
         const cycleId = `${round.executionRoundId}:${generation}`;
-        const stochasticRandom = core().createRandomSource(null, 'scheduling');
-        const stochastic = core().generateStochasticPlan({
-            now: now(), mode: settings.stochasticSchedulingMode, cycleId,
+        const generated = planner().createDesiredIntent({
+            now: createdAt, mode: settings.stochasticSchedulingMode, cycleId,
+            executionRoundId: round.executionRoundId,
             generation, planRevision: state.planRevision, ownerId: coordinator()?.instanceId || '',
-            earliestExecutionAt: dueAt,
-            latestCheapExecutionAt: proofEnd - core().PLAN_PROOF_MARGIN_MS,
-            maxHoldAt: proofEnd - core().PLAN_PROOF_MARGIN_MS,
+            immutableNotBeforeAt: Number(plan.notBeforeAt) || 0,
+            nextMutationNotBeforeAt,
             knownDispatchBudget: budget, readyCandidateCount: remaining.length,
             configuredMaximum: settings.maxSendsPerPass,
-            randomSources: {
-                coalescing: core().createRandomSource(null, 'coalescing'),
-                scheduling: stochasticRandom
-            }
-        }, stochasticRandom);
-        if (!(stochastic.executionDueAt > 0)) return false;
+            candidateRefs: remaining,
+            modelRevision: state.desiredIntent?.modelRevision,
+            configRevision: state.desiredIntent?.configRevision,
+            reason: 'native-successor',
+            intentCreatedBecause: 'CONFIRMED_MUTATION_SUCCESSOR'
+        });
+        const stochastic = generated.stochastic;
+        const desiredIntent = generated.intent;
         const updated = await storage().putMetaCas(scope, 'coordination', coordinationRecord.revision,
             core().normalizeCoordinationState({
                 ...state, generation, state: 'WAITING_EXECUTION', wakeKind: 'EXECUTION',
-                nextWakeAt: stochastic.executionDueAt, executionDueAt: stochastic.executionDueAt,
-                stochasticPlan: stochastic,
+                nextWakeAt: desiredIntent.desiredExecutionAt,
+                executionDueAt: desiredIntent.desiredExecutionAt,
+                authorizationDueAt: 0, capacityDueAt: 0,
+                stochasticPlan: stochastic, desiredIntent,
                 executionRound: { ...round, cycleId, generation },
                 executionPlan: { ...plan, cycleId, generation, candidates: remaining, capacityProof: proof },
                 reason: 'native-successor'
             }), guard);
         runtime.records.set(scopeKey(scope), { ...(runtime.records.get(scopeKey(scope)) || {}), coordination: updated });
-        schedule(scope, stochastic.executionDueAt, 'EXECUTION');
+        diagnostic(scope, 'DESIRED_INTENT_CREATED', desiredIntent.intentId, {
+            stochasticDecisionId: desiredIntent.stochasticDecisionId,
+            desiredExecutionAt: desiredIntent.desiredExecutionAt,
+            desiredDelayMs: desiredIntent.desiredDelayMs,
+            temporalProfile: desiredIntent.temporalProfile,
+            rngDrawCount: desiredIntent.randomDrawCount,
+            intentCreatedBecause: desiredIntent.intentCreatedBecause
+        });
+        armNextDeadline(scope, updated.value);
         return true;
     }
 
@@ -1023,8 +1148,9 @@
         const state = core().normalizeCoordinationState(coordinationRecord?.value);
         const plan = core().normalizeExecutionPlan(state.executionPlan);
         const round = core().normalizeExecutionRound(state.executionRound);
+        const desiredIntent = core().normalizeDesiredIntent(state.desiredIntent);
         if (state.state !== 'WAITING_EXECUTION' || !plan.candidates.length || round.status !== 'OPEN' ||
-            !(round.dispatchLimitRemaining > 0) || round.pendingMutation) {
+            !(round.dispatchLimitRemaining > 0) || round.pendingMutation || !desiredIntent.intentId) {
             return { status: 'NO_EXECUTION_PLAN' };
         }
         if (plan.generation !== state.generation || plan.planRevision !== state.planRevision ||
@@ -1032,31 +1158,34 @@
             Number(plan.sourceRevisions?.settings) !== Number(records.settings.revision)) {
             throw coded('STALE_GENERATION', 'Execution plan was fenced by newer state');
         }
-        if (now() < Number(plan.notBeforeAt || 0)) {
-            schedule(scope, plan.notBeforeAt, 'EXECUTION');
+        if (now() < Number(desiredIntent.desiredExecutionAt || 0)) {
+            armNextDeadline(scope, state);
             return { status: 'NOT_BEFORE' };
         }
         const candidate = plan.candidates[0];
         const mapSource = state.sources.MAP;
         const assistantSource = state.sources.ASSISTANT;
         const templateSource = state.sources.TEMPLATE;
-        const capacityProof = core().normalizeCapacityProof(state.sources.CAPACITY?.data);
         const currentTime = now();
         const authorizationAt = currentTime + core().PLAN_PROOF_MARGIN_MS;
+        const capacityProof = planner().selectUsableCapacityProof(state.sources.CAPACITY?.data, {
+            sourceVillageId: scope.sourceVillageId,
+            templateId: plan.templateId,
+            farmTemplate: plan.farmTemplate
+        }, currentTime, core().PLAN_PROOF_MARGIN_MS);
         if (!mapSource || Number(mapSource.data?.authorizationFreshUntil || 0) < authorizationAt ||
             String(mapSource.data?.targetIds?.[candidate.coord] || '') !== String(candidate.targetId) ||
+            String(mapSource.data?.contentRevision || '') !== String(plan.sourceRevisions?.mapContent || '') ||
             !core().coordinationSourceFreshForPlanning(assistantSource, currentTime) ||
             !core().coordinationSourceFreshForPlanning(templateSource, currentTime) ||
-            !core().capacityProofUsable(capacityProof, {
-                sourceVillageId: scope.sourceVillageId,
-                templateId: plan.templateId,
-                farmTemplate: plan.farmTemplate
-            }, authorizationAt) || !(capacityProof.value > 0)) {
-            await updateCoordination(scope, value => ({
-                ...value, state: 'WAITING_WORK', executionPlan: null, stochasticPlan: null,
-                executionDueAt: 0, reason: 'FINAL_PROOF_STALE'
+            !capacityProof || !(capacityProof.value > 0)) {
+            await updateDeadlines(scope, value => ({
+                ...value,
+                state: 'WAITING_AUTHORIZATION',
+                executionDueAt: 0,
+                authorizationDueAt: currentTime,
+                reason: 'FINAL_PROOF_STALE_INTENT_PRESERVED'
             }), guard);
-            schedule(scope, currentTime + 1000, 'OBSERVATION');
             return { status: 'PROOF_STALE' };
         }
         const targetRecord = await storage().readRecord('autofarm_operational', metaKey(scope, 'targetStates'));
@@ -1064,17 +1193,21 @@
             throw coded('AUTOFARM_TARGET_PENDING', 'Target became pending before final gate');
         }
         assertActiveVillage(scope);
-        assertLegacyStandaloneInactive(scope);
+        await assertMutationAuthority(scope);
         const model = await loadModel(scope);
         const prediction = predictionForCandidate(candidate, model, settings, currentTime);
         if (!finalCandidateAllowed(candidate, prediction, settings)) {
-            await updateCoordination(scope, value => ({
+            await updateDeadlines(scope, value => ({
                 ...value, state: 'WAITING_WORK', executionPlan: null, stochasticPlan: null,
-                executionDueAt: 0, reason: 'ECONOMIC_GATE'
+                desiredIntent: null, executionRound: null,
+                executionDueAt: 0, authorizationDueAt: 0,
+                observationDueAt: currentTime + settings.retrySeconds * 1000,
+                reason: 'ECONOMIC_GATE'
             }), guard);
             return { status: 'ECONOMIC_GATE' };
         }
-        const mutationId = `${scopeKey(scope)}:${round.executionRoundId}:${candidate.coord}:${currentTime}`;
+        const mutationAttemptAt = currentTime;
+        const mutationId = `${scopeKey(scope)}:${round.executionRoundId}:${candidate.coord}:${mutationAttemptAt}`;
         const mutation = await storage().prepareMutation(scope, {
             mutationId,
             dispatchId: mutationId,
@@ -1091,8 +1224,40 @@
             reportIdAtSend: candidate.reportId,
             composition: plan.composition,
             capacity: capacityProof.value,
-            prediction
+            prediction,
+            startedAt: mutationAttemptAt,
+            intentId: desiredIntent.intentId,
+            stochasticDecisionId: desiredIntent.stochasticDecisionId
         }, guard);
+        const preTransmissionAt = now();
+        const localAuthorityStillFresh =
+            Number(mapSource.data?.authorizationFreshUntil || 0) >= preTransmissionAt &&
+            String(mapSource.data?.targetIds?.[candidate.coord] || '') === String(candidate.targetId) &&
+            String(mapSource.data?.contentRevision || '') === String(plan.sourceRevisions?.mapContent || '') &&
+            Number(assistantSource?.freshUntil || 0) >= preTransmissionAt &&
+            Number(templateSource?.freshUntil || 0) >= preTransmissionAt &&
+            Number(capacityProof?.freshUntil || 0) >= preTransmissionAt;
+        if (!localAuthorityStillFresh) {
+            await storage().settleMutation(scope, mutation.mutationId, 'NOT_SENT', {
+                reason: 'FINAL_LOCAL_AUTHORITY_EXPIRED_BEFORE_TRANSMISSION'
+            }, guard);
+            await updateDeadlines(scope, value => ({
+                ...value, state: 'WAITING_AUTHORIZATION', executionDueAt: 0,
+                authorizationDueAt: preTransmissionAt,
+                reason: 'PRE_TRANSMISSION_PROOF_STALE_INTENT_PRESERVED'
+            }), guard);
+            return { status: 'PROOF_STALE_BEFORE_TRANSMISSION' };
+        }
+        try {
+            // This second local authority check closes the time spent loading the
+            // model and preparing the journal. It performs no game-network GET.
+            await assertMutationAuthority(scope);
+        } catch (error) {
+            await storage().settleMutation(scope, mutation.mutationId, 'NOT_SENT', {
+                reason: 'LEGACY_AUTHORITY_CHANGED_BEFORE_TRANSMISSION', code: error.code || ''
+            }, guard);
+            throw error;
+        }
         assertActiveVillage(scope);
         await storage().markMutationTransmitting(scope, mutation.mutationId, guard);
         diagnostic(scope, 'POST_ATTEMPT', candidate.coord, { mutationId });
@@ -1101,57 +1266,90 @@
             data = await sendFarm(scope, candidate, plan, guard);
         } catch (error) {
             await storage().settleMutation(scope, mutation.mutationId, 'UNKNOWN', {
-                code: error.code || '', message: error.message, status: error.status || 0
+                code: error.code || '', message: error.message, status: error.status || 0,
+                reconcileDueAt: now() + REPORT_RETRY_MS
             }, guard);
             diagnostic(scope, 'POST_UNKNOWN', candidate.coord, { mutationId, reason: error.message });
-            schedule(scope, now() + REPORT_RETRY_MS, 'RECONCILIATION', scheduler()?.PRIORITY?.RECONCILIATION);
+            if (error?.code === 'HARD_STOP' || [401, 403, 429].includes(Number(error?.status))) {
+                // The transmission outcome stays UNKNOWN, while the account-level
+                // stop dominates every future read/mutation. Never convert a
+                // transport hard-stop into a stochastic or blind retry.
+                triggerHardStop(error);
+                return { status: 'HARD_STOP', mutationStatus: 'UNKNOWN' };
+            }
+            const unknownState = await storage().readRecord('autofarm_meta', metaKey(scope, 'coordination'));
+            armNextDeadline(scope, unknownState?.value);
             return { status: 'UNKNOWN' };
         }
         const classification = core().classifyFarmResponse(data);
         if (classification.kind === 'success') {
-            await storage().settleMutation(scope, mutation.mutationId, 'CONFIRMED', { classification, data }, guard);
-            await installPostCapacity(scope, plan, data, guard);
-            diagnostic(scope, 'POST_CONFIRMED', candidate.coord, { mutationId });
+            const responseAt = now();
+            const postCapacityProof = core().capacityProofAfterConfirmedPost(
+                capacityProof, data?.current_units, plan, responseAt
+            );
+            await storage().settleMutation(scope, mutation.mutationId, 'CONFIRMED', {
+                classification, capacityProof: postCapacityProof
+            }, guard);
+            diagnostic(scope, 'POST_CONFIRMED', candidate.coord, {
+                mutationId,
+                intentId: desiredIntent.intentId,
+                stochasticDecisionId: desiredIntent.stochasticDecisionId,
+                authorizationStartedAt: desiredIntent.authorizationStartedAt || currentTime,
+                actualExecutionAt: responseAt,
+                latenessMs: Math.max(0, responseAt - desiredIntent.desiredExecutionAt)
+            });
             if (!await scheduleSuccessor(scope, settings, guard)) {
-                schedule(scope, now() + settings.retrySeconds * 1000, 'OBSERVATION');
+                await updateDeadlines(scope, value => ({
+                    ...value,
+                    state: value.executionRound?.status === 'OPEN' && plan.candidates.length > 1
+                        ? 'WAITING_CAPACITY'
+                        : 'WAITING_WORK',
+                    capacityDueAt: value.executionRound?.status === 'OPEN' && plan.candidates.length > 1
+                        ? responseAt
+                        : 0,
+                    reportDueAt: responseAt + REPORT_RETRY_MS,
+                    observationDueAt: responseAt + settings.retrySeconds * 1000,
+                    reason: postCapacityProof
+                        ? 'ROUND_HAS_NO_SUCCESSOR'
+                        : 'POST_CONFIRMED_CAPACITY_INVALIDATED'
+                }), guard);
             }
             return { status: 'CONFIRMED', candidate };
         }
         if (classification.kind === 'no-units') {
-            await storage().settleMutation(scope, mutation.mutationId, 'REJECTED', { classification }, guard);
-            await updateCoordination(scope, value => {
-                const timestamp = now();
-                const zero = core().normalizeCapacityProof({
-                    value: 0, exact: true, authoritative: true, observedAt: timestamp,
-                    freshUntil: timestamp + 60000, source: 'SERVER_NO_UNITS',
-                    templateId: plan.templateId, farmTemplate: plan.farmTemplate,
-                    composition: plan.composition, compositionAuthoritative: plan.compositionAuthoritative,
-                    sourceVillageId: scope.sourceVillageId
-                });
-                value.sources.CAPACITY = { source: 'CAPACITY', status: 'READY', observedAt: timestamp,
-                    freshUntil: zero.freshUntil, revision: timestamp, data: zero };
-                value.state = 'WAITING_WORK';
-                value.executionPlan = null;
-                value.stochasticPlan = null;
-                value.reason = 'SERVER_NO_UNITS';
-                return value;
+            const zero = core().serverNoUnitsCapacityProof(plan, scope.sourceVillageId, now());
+            await storage().settleMutation(scope, mutation.mutationId, 'REJECTED', {
+                classification, capacityProof: zero
             }, guard);
-            schedule(scope, now() + 60000, 'OBSERVATION');
+            await updateDeadlines(scope, value => ({
+                ...value, state: 'WAITING_CAPACITY', executionDueAt: 0,
+                authorizationDueAt: 0, capacityDueAt: zero.freshUntil,
+                reason: 'SERVER_NO_UNITS'
+            }), guard);
             return { status: 'NO_UNITS' };
         }
         if (classification.kind === 'rejected') {
             await storage().settleMutation(scope, mutation.mutationId, 'REJECTED', { classification }, guard);
             diagnostic(scope, 'POST_REJECTED', classification.message, { mutationId });
-            schedule(scope, now() + settings.retrySeconds * 1000, 'OBSERVATION');
+            await updateDeadlines(scope, value => ({
+                ...value, state: 'WAITING_WORK', desiredIntent: null,
+                stochasticPlan: null, executionPlan: null, executionRound: null,
+                executionDueAt: 0, authorizationDueAt: 0,
+                observationDueAt: now() + settings.retrySeconds * 1000,
+                reason: 'SERVER_REJECTED'
+            }), guard);
             return { status: 'REJECTED' };
         }
-        await storage().settleMutation(scope, mutation.mutationId, 'UNKNOWN', { classification }, guard);
+        await storage().settleMutation(scope, mutation.mutationId, 'UNKNOWN', {
+            classification, reconcileDueAt: now() + REPORT_RETRY_MS
+        }, guard);
         if (classification.kind === 'protection') {
             root.PremiumFeaturesBackgroundScheduler?.hardStop?.({ source: 'bot-protection', feature: FEATURE });
             root.PremiumFeaturesCoordination?.broadcast?.('hard-stop', { source: 'bot-protection', feature: FEATURE });
             root.PremiumFeaturesBotProtection?.suspendForHardStop?.();
         } else {
-            schedule(scope, now() + REPORT_RETRY_MS, 'RECONCILIATION', scheduler()?.PRIORITY?.RECONCILIATION);
+            const unknownState = await storage().readRecord('autofarm_meta', metaKey(scope, 'coordination'));
+            armNextDeadline(scope, unknownState?.value);
         }
         return { status: 'UNKNOWN' };
     }
@@ -1164,6 +1362,11 @@
         const reportAt = Number(row.assistantAttackAt || 0);
         const sentAt = Number(mutation?.transmittedAt || mutation?.preparedAt || 0);
         return reportAt > 0 && sentAt > 0 && reportAt >= sentAt - 2 * 60000;
+    }
+
+    function reportSourceCoord(doc) {
+        const text = String(doc?.querySelector?.('#attack_info_att')?.textContent || '');
+        return text.match(/\b\d{3}\|\d{3}\b/)?.[0] || null;
     }
 
     async function unresolvedMutations(scope) {
@@ -1181,10 +1384,10 @@
         if (!settings.enabled) return { status: 'DISABLED' };
         const unresolved = await unresolvedMutations(scope);
         if (!unresolved.length) {
-            await updateCoordination(scope, value => ({
-                ...value, state: 'WAITING_WORK', reason: 'RECONCILIATION_EMPTY'
+            await updateDeadlines(scope, value => ({
+                ...value, state: 'WAITING_WORK', reconcileDueAt: 0,
+                observationDueAt: now() + 1000, reason: 'RECONCILIATION_EMPTY'
             }), guard);
-            schedule(scope, now() + 1000, 'OBSERVATION');
             return { status: 'EMPTY' };
         }
 
@@ -1200,35 +1403,80 @@
         const uncertain = (await unresolvedMutations(scope))
             .filter(item => ['TRANSMITTING', 'UNKNOWN'].includes(item.status));
         if (!uncertain.length) {
-            schedule(scope, now() + 1000, 'OBSERVATION');
+            await updateDeadlines(scope, value => ({
+                ...value, reconcileDueAt: 0, observationDueAt: now() + 1000,
+                reason: 'PREPARED_ROLLED_BACK'
+            }), guard);
             return { status: 'ROLLED_BACK_PREPARED' };
         }
-        const targetMap = new Map(uncertain.map(item => [String(item.targetCoord), String(item.targetId)]));
-        const assistant = await readAssistant(scope, settings, targetMap, guard);
-        let matched = 0;
-        for (const mutation of uncertain) {
-            const row = assistant.rows.get(String(mutation.targetCoord));
-            if (reportIsSafelyNewer(row, mutation)) {
+        // At most one unresolved mutation can own the round. Reconciliation gets
+        // a dedicated current report-index read before any historical work.
+        const mutation = [...uncertain].sort((a, b) =>
+            Number(a.startedAt || a.preparedAt) - Number(b.startedAt || b.preparedAt))[0];
+        const indexRead = await resilientRequest(scope, 'reconcile-report-index', reportIndexUrl(scope, 0), {
+            method: 'GET', headers: { 'X-Requested-With': 'XMLHttpRequest' }
+        }, guard);
+        const indexDoc = indexRead.doc || parseHtml(indexRead.text);
+        const candidates = core().parseReportIndexEntries(indexDoc, new Set([String(mutation.targetCoord)]))
+            .filter(row => reportIsSafelyNewer(row, mutation))
+            .sort((a, b) => Number(b.assistantAttackAt || 0) - Number(a.assistantAttackAt || 0));
+        let matched = false;
+        let inspectedReportId = null;
+        if (candidates.length) {
+            const row = candidates[0];
+            inspectedReportId = row.reportId;
+            const detailRead = await resilientRequest(scope, `reconcile-report:${row.reportId}`,
+                reportDetailUrl(scope, row.reportId), {
+                    method: 'GET', headers: { 'X-Requested-With': 'XMLHttpRequest' }
+                }, guard);
+            const detailDoc = detailRead.doc || parseHtml(detailRead.text);
+            const detail = {
+                timestamp: core().parseReportDetailTimestamp(detailDoc) || row.assistantAttackAt,
+                sourceCoord: reportSourceCoord(detailDoc),
+                composition: core().parseReportComposition(detailDoc)
+            };
+            matched = planner().reportMatchesMutation(
+                row, detail, mutation, villageCoord(), settings.pendingTimeoutHours
+            );
+            if (matched) {
                 await storage().settleMutation(scope, mutation.mutationId, 'CONFIRMED', {
-                    reason: 'later-assistant-report', reportId: row.reportId,
-                    reportAt: row.assistantAttackAt
+                    reason: 'strong-current-report-match', reportId: row.reportId,
+                    reportAt: detail.timestamp, capacityProof: null
                 }, guard);
-                matched++;
                 diagnostic(scope, 'MUTATION_RECONCILED_SENT', mutation.targetCoord, {
-                    mutationId: mutation.mutationId, reportId: row.reportId
+                    mutationId: mutation.mutationId, reportId: row.reportId,
+                    evidence: 'INDEX+DETAIL+SOURCE+COMPOSITION'
                 });
-            } else if (mutation.status === 'TRANSMITTING') {
-                await storage().settleMutation(scope, mutation.mutationId, 'UNKNOWN', {
-                    reason: 'no-safe-report-proof-yet'
-                }, guard);
             }
         }
-        if ((await unresolvedMutations(scope)).length) {
-            schedule(scope, now() + REPORT_RETRY_MS, 'RECONCILIATION', scheduler()?.PRIORITY?.RECONCILIATION);
-            return { status: 'STILL_UNKNOWN', matched };
+        if (!matched && mutation.status === 'TRANSMITTING') {
+            await storage().settleMutation(scope, mutation.mutationId, 'UNKNOWN', {
+                reason: 'fresh-report-evidence-inconclusive',
+                inspectedReportId,
+                reconcileDueAt: now() + REPORT_RETRY_MS
+            }, guard);
         }
-        schedule(scope, now() + 1000, 'OBSERVATION');
-        return { status: 'RECONCILED', matched };
+        if (!matched) {
+            const current = await storage().readRecord('autofarm_meta', metaKey(scope, 'coordination'));
+            if (mutation.status === 'UNKNOWN') {
+                await updateDeadlines(scope, value => ({
+                    ...value, state: 'UNKNOWN', reconcileDueAt: now() + REPORT_RETRY_MS,
+                    reason: 'STILL_UNKNOWN_POSITIVE_EVIDENCE_REQUIRED'
+                }), guard);
+            } else {
+                armNextDeadline(scope, current?.value);
+            }
+            return { status: 'STILL_UNKNOWN', matched: 0, reportGets: candidates.length ? 2 : 1 };
+        }
+        await updateDeadlines(scope, value => ({
+            ...value,
+            reconcileDueAt: 0,
+            capacityDueAt: now(),
+            reportDueAt: now() + REPORT_RETRY_MS,
+            state: 'WAITING_CAPACITY',
+            reason: 'RECONCILED_SENT_CAPACITY_REQUIRED'
+        }), guard);
+        return { status: 'RECONCILED', matched: 1, reportGets: 2 };
     }
 
     async function observationOccurrence(scope, guard) {
@@ -1238,7 +1486,10 @@
         if (!settings.enabled) return { status: 'DISABLED' };
         const unresolved = await unresolvedMutations(scope);
         if (unresolved.length) {
-            schedule(scope, now(), 'RECONCILIATION', scheduler()?.PRIORITY?.RECONCILIATION);
+            await updateDeadlines(scope, value => ({
+                ...value, state: 'RECONCILING', reconcileDueAt: now(),
+                reason: 'RECONCILIATION_REQUIRED'
+            }), guard);
             return { status: 'RECONCILIATION_REQUIRED' };
         }
         diagnostic(scope, 'OBSERVATION_START', 'fresh MAP and Assistant proofs');
@@ -1250,22 +1501,273 @@
             capacity: observation.capacity?.capacity ?? null,
             mapTargets: observation.map.targets.size
         });
-        if (!result.planned) {
-            schedule(scope, now() + settings.retrySeconds * 1000, 'OBSERVATION');
-        }
         return result;
     }
 
+    async function invalidateDesiredIntent(scope, reason, settings, guard) {
+        return updateDeadlines(scope, value => ({
+            ...value,
+            state: 'WAITING_WORK',
+            desiredIntent: null,
+            executionPlan: null,
+            stochasticPlan: null,
+            executionRound: null,
+            executionDueAt: 0,
+            authorizationDueAt: 0,
+            capacityDueAt: 0,
+            observationDueAt: now() + Math.min(1000, settings.retrySeconds * 1000),
+            reason: `INTENT_INVALIDATED:${String(reason || 'UNKNOWN')}`
+        }), guard);
+    }
+
+    async function authorizationOccurrence(scope, guard) {
+        assertNetworkAllowed(guard);
+        const records = await ensureNativeRecords(scope);
+        const settings = core().normalizeCfg(records.settings.value);
+        if (!settings.enabled) return { status: 'DISABLED' };
+        const unresolved = await unresolvedMutations(scope);
+        if (unresolved.length) {
+            await updateDeadlines(scope, value => ({
+                ...value, state: 'RECONCILING', authorizationDueAt: 0,
+                reconcileDueAt: now(), reason: 'UNKNOWN_DOMINATES_AUTHORIZATION'
+            }), guard);
+            return { status: 'RECONCILIATION_REQUIRED' };
+        }
+        const coordinationRecord = await storage().readRecord('autofarm_meta', metaKey(scope, 'coordination'));
+        let state = core().normalizeCoordinationState(coordinationRecord?.value);
+        let plan = core().normalizeExecutionPlan(state.executionPlan);
+        const intent = core().normalizeDesiredIntent(state.desiredIntent);
+        const round = core().normalizeExecutionRound(state.executionRound);
+        if (!intent.intentId || !plan.candidates.length || round.status !== 'OPEN' || round.pendingMutation) {
+            await invalidateDesiredIntent(scope, 'AUTHORIZATION_WITHOUT_OPEN_INTENT', settings, guard);
+            return { status: 'NO_INTENT' };
+        }
+        const authorizationStartedAt = now();
+        const needs = planner().authorizationRequirements(
+            state, plan, authorizationStartedAt, core().PLAN_PROOF_MARGIN_MS
+        );
+        if (!needs.required.length) {
+            const saved = await updateDeadlines(scope, value => ({
+                ...value,
+                state: 'WAITING_EXECUTION',
+                authorizationDueAt: 0,
+                executionDueAt: Math.max(authorizationStartedAt, intent.desiredExecutionAt),
+                desiredIntent: { ...intent, authorizationStartedAt },
+                reason: 'AUTHORIZATION_ALREADY_FRESH'
+            }), guard);
+            return { status: 'AUTHORIZED', required: [], revision: saved.revision };
+        }
+
+        let mapProof = state.sources.MAP?.data || null;
+        let targetIds = new Map(Object.entries(mapProof?.targetIds || {}));
+        if (needs.required.includes('MAP')) {
+            const refreshed = await readMap(scope, settings, guard);
+            mapProof = refreshed.proof;
+            targetIds = refreshed.targets;
+            const refreshedRefs = plan.candidates
+                .filter(candidate => String(targetIds.get(candidate.coord) || '') === String(candidate.targetId))
+                .map(planner().compactCandidateRef);
+            if (!refreshedRefs.length ||
+                planner().stableHash(refreshedRefs) !== String(intent.candidateSetRevision || '')) {
+                await invalidateDesiredIntent(scope, 'MAP_CONTENT_CHANGED_CANDIDATES', settings, guard);
+                return { status: 'INTENT_INVALIDATED', dependency: 'MAP' };
+            }
+        }
+
+        let assistant = null;
+        let capacity = needs.capacity;
+        if (needs.required.some(name => ['ASSISTANT', 'TEMPLATE', 'CAPACITY'].includes(name))) {
+            assistant = await readAssistant(scope, settings, targetIds, guard);
+            capacity = chooseTemplateAndCapacity(assistant, settings, scope.sourceVillageId);
+            if (!capacity.usable || String(capacity.templateId || '') !== String(plan.templateId || '') ||
+                !core().sameComposition(capacity.composition, plan.composition)) {
+                await invalidateDesiredIntent(scope, 'TEMPLATE_OR_COMPOSITION_CHANGED', settings, guard);
+                return { status: 'INTENT_INVALIDATED', dependency: 'TEMPLATE' };
+            }
+            const first = plan.candidates[0];
+            const row = assistant.rows.get(first.coord);
+            if (!first.bootstrap && (!row?.buttonSupported || row.disabled ||
+                String(row.templateId || '') !== String(plan.templateId || ''))) {
+                await invalidateDesiredIntent(scope, 'ASSISTANT_TARGET_NOT_SENDABLE', settings, guard);
+                return { status: 'INTENT_INVALIDATED', dependency: 'ASSISTANT' };
+            }
+        }
+
+        const latestRecord = await storage().readRecord('autofarm_meta', metaKey(scope, 'coordination'));
+        state = core().normalizeCoordinationState(latestRecord?.value);
+        plan = core().normalizeExecutionPlan(state.executionPlan);
+        const refreshedCapacityProof = assistant ? capacity.proof : capacity;
+        const updatedIntent = core().normalizeDesiredIntent({
+            ...state.desiredIntent,
+            authorizationStartedAt: Number(state.desiredIntent?.authorizationStartedAt) || authorizationStartedAt
+        });
+        const refreshedPlan = core().normalizeExecutionPlan({
+            ...plan,
+            capacityProof: refreshedCapacityProof,
+            sourceRevisions: {
+                ...plan.sourceRevisions,
+                map: mapProof?.observationRevision || mapProof?.revision,
+                mapContent: mapProof?.contentRevision,
+                assistant: assistant?.proof?.revision || plan.sourceRevisions?.assistant,
+                capacity: refreshedCapacityProof?.observedAt || plan.sourceRevisions?.capacity
+            }
+        });
+        const sources = { ...state.sources };
+        if (needs.required.includes('MAP')) {
+            sources.MAP = { ...mapProof, source: 'MAP', data: mapProof };
+        }
+        if (assistant) {
+            sources.ASSISTANT = {
+                ...assistant.proof, source: 'ASSISTANT',
+                data: { pagesRead: assistant.pagesRead, coversRadius: assistant.coversRadius }
+            };
+            sources.TEMPLATE = {
+                source: 'TEMPLATE', status: 'READY', observedAt: capacity.proof.observedAt,
+                freshUntil: capacity.proof.freshUntil, revision: capacity.proof.revision,
+                data: { templateId: capacity.templateId, composition: capacity.composition, authoritative: true }
+            };
+            sources.CAPACITY = {
+                source: 'CAPACITY', status: 'READY', observedAt: capacity.proof.observedAt,
+                freshUntil: capacity.proof.freshUntil, revision: capacity.proof.revision,
+                data: capacity.proof
+            };
+        }
+        const selectedProof = planner().selectUsableCapacityProof(refreshedCapacityProof || sources.CAPACITY?.data, {
+            sourceVillageId: scope.sourceVillageId,
+            templateId: plan.templateId,
+            farmTemplate: plan.farmTemplate
+        }, now(), core().PLAN_PROOF_MARGIN_MS);
+        const positive = Number(selectedProof?.value) > 0;
+        const nextState = core().normalizeCoordinationState({
+            ...state,
+            sources,
+            executionPlan: refreshedPlan,
+            desiredIntent: updatedIntent,
+            state: positive ? 'WAITING_EXECUTION' : 'WAITING_CAPACITY',
+            authorizationDueAt: 0,
+            executionDueAt: positive ? Math.max(now(), updatedIntent.desiredExecutionAt) : 0,
+            capacityDueAt: positive ? 0 : Math.max(now() + 1000, Number(selectedProof?.freshUntil) || now() + 60000),
+            reason: positive ? 'AUTHORIZATION_REFRESHED_INTENT_PRESERVED' : 'CAPACITY_ZERO_INTENT_PRESERVED'
+        });
+        const saved = await storage().putMetaCas(scope, 'coordination', latestRecord.revision, nextState, guard);
+        armNextDeadline(scope, saved.value);
+        diagnostic(scope, 'AUTHORIZATION_REFRESHED', updatedIntent.intentId, {
+            dependencies: needs.required,
+            stochasticDecisionId: updatedIntent.stochasticDecisionId,
+            desiredExecutionAt: updatedIntent.desiredExecutionAt,
+            rngAdditionalDraws: 0
+        });
+        return { status: positive ? 'AUTHORIZED' : 'CAPACITY_ZERO', required: needs.required };
+    }
+
+    async function capacityOccurrence(scope, guard) {
+        assertNetworkAllowed(guard);
+        const records = await ensureNativeRecords(scope);
+        const settings = core().normalizeCfg(records.settings.value);
+        if (!settings.enabled) return { status: 'DISABLED' };
+        const state = core().normalizeCoordinationState(records.coordination.value);
+        if (state.desiredIntent?.intentId) return authorizationOccurrence(scope, guard);
+        const plan = core().normalizeExecutionPlan(state.executionPlan);
+        const round = core().normalizeExecutionRound(state.executionRound);
+        if (round.status !== 'OPEN' || round.pendingMutation || !plan.candidates.length) {
+            await updateDeadlines(scope, value => ({
+                ...value, capacityDueAt: 0,
+                observationDueAt: now() + settings.retrySeconds * 1000,
+                state: 'WAITING_WORK', reason: 'CAPACITY_WITHOUT_OPEN_ROUND'
+            }), guard);
+            return { status: 'NO_OPEN_ROUND' };
+        }
+        const targetIds = new Map(Object.entries(state.sources.MAP?.data?.targetIds || {}));
+        const assistant = await readAssistant(scope, settings, targetIds, guard);
+        const capacity = chooseTemplateAndCapacity(assistant, settings, scope.sourceVillageId);
+        if (!capacity.usable || String(capacity.templateId || '') !== String(plan.templateId || '') ||
+            !core().sameComposition(capacity.composition, plan.composition)) {
+            await invalidateDesiredIntent(scope, 'CAPACITY_CONTEXT_CHANGED', settings, guard);
+            return { status: 'INTENT_INVALIDATED' };
+        }
+        const current = await storage().readRecord('autofarm_meta', metaKey(scope, 'coordination'));
+        const updated = await storage().putMetaCas(scope, 'coordination', current.revision,
+            core().normalizeCoordinationState({
+                ...current.value,
+                sources: {
+                    ...current.value.sources,
+                    ASSISTANT: { ...assistant.proof, source: 'ASSISTANT', data: { pagesRead: assistant.pagesRead, coversRadius: assistant.coversRadius } },
+                    TEMPLATE: {
+                        source: 'TEMPLATE', status: 'READY', observedAt: capacity.proof.observedAt,
+                        freshUntil: capacity.proof.freshUntil, revision: capacity.proof.revision,
+                        data: { templateId: capacity.templateId, composition: capacity.composition, authoritative: true }
+                    },
+                    CAPACITY: {
+                        source: 'CAPACITY', status: 'READY', observedAt: capacity.proof.observedAt,
+                        freshUntil: capacity.proof.freshUntil, revision: capacity.proof.revision, data: capacity.proof
+                    }
+                },
+                capacityDueAt: 0,
+                state: capacity.capacity > 0 ? 'WAITING_WORK' : 'WAITING_CAPACITY',
+                reason: capacity.capacity > 0 ? 'SUCCESSOR_CAPACITY_REFRESHED' : 'CAPACITY_ZERO'
+            }), guard);
+        if (capacity.capacity > 0 && await scheduleSuccessor(scope, settings, guard)) return { status: 'SUCCESSOR_PLANNED' };
+        await updateDeadlines(scope, value => ({
+            ...value,
+            capacityDueAt: capacity.capacity > 0 ? 0 : capacity.proof.freshUntil,
+            observationDueAt: capacity.capacity > 0 ? now() + settings.retrySeconds * 1000 : value.observationDueAt,
+            reason: capacity.capacity > 0 ? 'NO_SUCCESSOR_CANDIDATE' : 'CAPACITY_ZERO'
+        }), guard);
+        return { status: capacity.capacity > 0 ? 'NO_SUCCESSOR' : 'CAPACITY_ZERO' };
+    }
+
+    async function reportOccurrence(scope, guard) {
+        assertNetworkAllowed(guard);
+        const records = await ensureNativeRecords(scope);
+        const settings = core().normalizeCfg(records.settings.value);
+        if (!settings.enabled) return { status: 'DISABLED' };
+        if ((await unresolvedMutations(scope)).length) {
+            await updateDeadlines(scope, value => ({
+                ...value, state: 'RECONCILING', reportDueAt: 0,
+                reconcileDueAt: now(), reason: 'UNKNOWN_REPORT_PRIORITY'
+            }), guard);
+            return { status: 'RECONCILIATION_REQUIRED' };
+        }
+        const state = core().normalizeCoordinationState(records.coordination.value);
+        const targetIds = new Map(Object.entries(state.sources.MAP?.data?.targetIds || {}));
+        const model = await loadModel(scope);
+        const budget = { remaining: REPORT_GET_BUDGET };
+        await scanReportIndex(scope, settings, { targets: targetIds }, model, guard, budget);
+        await ingestReportDetails(scope, settings, records, { rows: new Map() }, model, guard, budget);
+        const refreshedTargets = await storage().readRecord('autofarm_operational', metaKey(scope, 'targetStates'));
+        const pending = Object.values(refreshedTargets?.value || {}).some(value => value?.pending || value?.sending);
+        await updateDeadlines(scope, value => ({
+            ...value,
+            reportDueAt: pending ? now() + REPORT_RETRY_MS : 0,
+            reason: value.desiredIntent?.intentId
+                ? 'REPORT_PROCESSED_INTENT_PRESERVED'
+                : 'REPORT_PROCESSED'
+        }), guard);
+        return { status: 'REPORT_PROCESSED', reportGets: REPORT_GET_BUDGET - budget.remaining };
+    }
+
     function triggerHardStop(error) {
+        const existing = scheduler()?.stats?.().hardStopReason || scheduler()?.stats?.().hardStop || null;
+        const source = String(error?.hardStopSource || (
+            error?.status === 429 ? 'http-429' :
+                error?.status === 403 ? 'http-403' :
+                    error?.code === 'BOT_PROTECTION_ACTIVE' ? 'bot-protection' :
+                        error?.code === 'HARD_STOP' ? 'remote-hard-stop' :
+                            /IDB|STORAGE|CAS|MUTATION/.test(String(error?.code || ''))
+                                ? 'storage-fail-closed'
+                                : 'autofarm-fail-closed'
+        ));
         const reason = {
-            source: error?.status === 429 ? 'http-429' :
-                error?.status === 403 ? 'http-403' : 'autofarm-fail-closed',
+            source,
             feature: FEATURE,
             message: String(error?.message || error || 'AutoFarm hard-stop')
         };
-        scheduler()?.hardStop?.(reason);
-        coordinator()?.broadcast?.('hard-stop', reason);
-        root.PremiumFeaturesBotProtection?.suspendForHardStop?.();
+        if (!existing) {
+            scheduler()?.hardStop?.(reason);
+            coordinator()?.broadcast?.('hard-stop', reason);
+        }
+        if (source === 'bot-protection') root.PremiumFeaturesBotProtection?.suspendForHardStop?.();
+        return existing || reason;
     }
 
     async function disableFailClosed(scope, error) {
@@ -1278,8 +1780,11 @@
                 core().normalizeCoordinationState({
                     ...coordinationRecord.value,
                     generation: Number(coordinationRecord.value?.generation || 0) + 1,
-                    state: 'SOFT_PAUSED', executionPlan: null, stochasticPlan: null,
-                    nextWakeAt: 0, executionDueAt: 0,
+                    state: 'STORAGE_ERROR', executionPlan: null, stochasticPlan: null,
+                    desiredIntent: null, nextWakeAt: 0, executionDueAt: 0,
+                    authorizationDueAt: 0, observationDueAt: 0,
+                    reportDueAt: 0, maintenanceDueAt: 0, capacityDueAt: 0,
+                    reconcileDueAt: 0,
                     reason: `FAIL_CLOSED:${String(error?.code || 'ERROR')}`
                 }));
         } catch (storageError) {
@@ -1291,6 +1796,7 @@
     }
 
     async function runOccurrence(scopeInput, wakeKind, guard) {
+        if (hardStopped()) return { status: 'HARD_STOP', gets: 0, posts: 0 };
         const activeVillageId = String(root.game_data?.village?.id || '');
         if (activeVillageId && String(scopeInput?.sourceVillageId || '') !== activeVillageId) {
             const parkedScope = currentScope(scopeInput?.sourceVillageId);
@@ -1312,7 +1818,13 @@
                 ? await executeOccurrence(scope, guard)
                 : kind === 'RECONCILIATION'
                     ? await reconcileOccurrence(scope, guard)
-                    : await observationOccurrence(scope, guard);
+                    : kind === 'AUTHORIZATION'
+                        ? await authorizationOccurrence(scope, guard)
+                        : kind === 'CAPACITY'
+                            ? await capacityOccurrence(scope, guard)
+                            : kind === 'REPORT'
+                                ? await reportOccurrence(scope, guard)
+                                : await observationOccurrence(scope, guard);
             render(scope);
             return result;
         } catch (error) {
@@ -1320,13 +1832,27 @@
             if (error?.code === 'HARD_STOP' || [401, 403, 429].includes(Number(error?.status))) {
                 triggerHardStop(error);
                 diagnostic(scope, 'HARD_STOP', error.message, { code: error.code || '', status: error.status || 0 });
-                const settingsRecord = await storage().readRecord('autofarm_meta', metaKey(scope, 'settings')).catch(() => null);
-                if (settingsRecord?.value?.enabled) {
-                    schedule(scope, now() + core().normalizeCfg(settingsRecord.value).retrySeconds * 1000, 'OBSERVATION');
-                }
                 return { status: 'HARD_STOP' };
             }
-            if (/IDB|STORAGE|CAS|MUTATION|SCOPE|LEGACY/.test(String(error?.code || ''))) {
+            if (error?.code === 'AUTOFARM_CAS_MISMATCH') {
+                diagnostic(scope, 'STALE_WRITER', error.message, { code: error.code });
+                const current = await storage().readRecord('autofarm_meta', metaKey(scope, 'coordination')).catch(() => null);
+                armNextDeadline(scope, current?.value);
+                return { status: 'CONFLICT', error };
+            }
+            if (['AUTOFARM_LEGACY_ACTIVE', 'AUTOFARM_LEGACY_HANDOFF_REQUIRED'].includes(error?.code)) {
+                const blockedState = error.code === 'AUTOFARM_LEGACY_ACTIVE'
+                    ? 'LEGACY_AUTOFARM_DETECTED'
+                    : 'LEGACY_HANDOFF_REQUIRED';
+                await updateCoordination(scope, value => ({
+                    ...value, state: blockedState, executionDueAt: 0,
+                    authorizationDueAt: 0, reason: error.message
+                }), guard).catch(() => null);
+                scheduler()?.cancel?.(taskKey(scope), blockedState);
+                diagnostic(scope, blockedState, error.message);
+                return { status: blockedState, error };
+            }
+            if (isCriticalStorageError(error)) {
                 await disableFailClosed(scope, error);
                 return { status: 'FAIL_CLOSED', error };
             }
@@ -1341,21 +1867,28 @@
 
     async function setEnabled(scope, enabled) {
         if (hardStopped() && enabled) throw coded('HARD_STOP', 'Clear TWPF HARD_STOP before enabling AutoFarm');
-        if (enabled) assertLegacyStandaloneInactive(scope);
         const records = await ensureNativeRecords(scope);
+        if (enabled) await assertMutationAuthority(scope);
         const settings = core().normalizeCfg({ ...records.settings.value, enabled: Boolean(enabled) });
         const saved = await storage().putMetaCas(scope, 'settings', records.settings.revision, settings);
         const currentCoordination = await storage().readRecord('autofarm_meta', metaKey(scope, 'coordination'));
+        const unresolved = enabled ? await unresolvedMutations(scope) : [];
         const nextCoordination = core().normalizeCoordinationState({
             ...currentCoordination.value,
             generation: Number(currentCoordination.value?.generation || 0) + 1,
-            state: enabled ? 'WAITING_WORK' : 'DISABLED',
-            executionPlan: null, stochasticPlan: null, executionRound: null,
-            nextWakeAt: 0, executionDueAt: 0,
-            reason: enabled ? 'USER_ENABLED' : 'USER_DISABLED'
+            state: enabled ? (unresolved.length ? 'RECONCILING' : 'WAITING_WORK') : 'DISABLED',
+            executionPlan: null, stochasticPlan: null, desiredIntent: null,
+            executionRound: unresolved.length ? currentCoordination.value?.executionRound : null,
+            nextWakeAt: 0, executionDueAt: 0, authorizationDueAt: 0,
+            observationDueAt: enabled && !unresolved.length ? now() : 0,
+            reconcileDueAt: enabled && unresolved.length ? now() : 0,
+            reportDueAt: 0, maintenanceDueAt: 0, capacityDueAt: 0,
+            reason: enabled
+                ? (unresolved.length ? 'USER_ENABLED_RECONCILIATION_REQUIRED' : 'USER_ENABLED')
+                : 'USER_DISABLED'
         });
-        await storage().putMetaCas(scope, 'coordination', currentCoordination.revision, nextCoordination);
-        if (enabled) schedule(scope, now(), 'OBSERVATION', scheduler()?.PRIORITY?.MANUAL);
+        const coordinationSaved = await storage().putMetaCas(scope, 'coordination', currentCoordination.revision, nextCoordination);
+        if (enabled) armNextDeadline(scope, coordinationSaved.value);
         else scheduler()?.cancel?.(taskKey(scope), 'user-disabled');
         diagnostic(scope, enabled ? 'ENABLED' : 'DISABLED', 'user action', { settingsRevision: saved.revision });
         render(scope);
@@ -1365,22 +1898,52 @@
     async function updateSettings(scope, patch) {
         const records = await ensureNativeRecords(scope);
         const next = core().normalizeCfg({ ...records.settings.value, ...(patch || {}) });
+        const changed = JSON.stringify(next) !== JSON.stringify(core().normalizeCfg(records.settings.value));
         const saved = await storage().putMetaCas(scope, 'settings', records.settings.revision, next);
+        if (!changed) {
+            const current = await storage().readRecord('autofarm_meta', metaKey(scope, 'coordination'));
+            armNextDeadline(scope, current?.value);
+            render(scope);
+            return saved;
+        }
         const coordinationRecord = await storage().readRecord('autofarm_meta', metaKey(scope, 'coordination'));
-        await storage().putMetaCas(scope, 'coordination', coordinationRecord.revision,
+        const coordinationSaved = await storage().putMetaCas(scope, 'coordination', coordinationRecord.revision,
             core().normalizeCoordinationState({
                 ...coordinationRecord.value,
                 generation: Number(coordinationRecord.value?.generation || 0) + 1,
                 state: next.enabled ? 'WAITING_WORK' : 'DISABLED',
-                executionPlan: null, stochasticPlan: null, executionRound: null,
-                nextWakeAt: 0, executionDueAt: 0, reason: 'SETTINGS_CHANGED'
+                executionPlan: null, stochasticPlan: null, desiredIntent: null, executionRound: null,
+                nextWakeAt: 0, executionDueAt: 0, authorizationDueAt: 0,
+                observationDueAt: next.enabled ? now() : 0,
+                reportDueAt: 0, maintenanceDueAt: 0, capacityDueAt: 0,
+                reason: 'SETTINGS_CHANGED_NEW_SEMANTIC_INTENT_REQUIRED'
             }));
-        if (next.enabled) schedule(scope, now(), 'OBSERVATION', scheduler()?.PRIORITY?.MANUAL);
+        if (next.enabled) armNextDeadline(scope, coordinationSaved.value);
         render(scope);
         return saved;
     }
 
     function panelId() { return 'twpf-autofarm-adaptive'; }
+
+    function uiState(settings, state, authorityState, descriptor) {
+        if (hardStopped()) return 'HARD_STOP';
+        if (['STORAGE_ERROR', 'MIGRATION_ERROR'].includes(state?.state)) return state.state;
+        if (['LEGACY_AUTOFARM_DETECTED', 'LEGACY_HANDOFF_REQUIRED', 'MIGRATION_BLOCKED'].includes(authorityState)) {
+            return authorityState;
+        }
+        if (['UNKNOWN', 'RECONCILING'].includes(state?.state)) return state.state;
+        if (['WAITING_LEASE', 'LEASE_WAIT'].includes(String(descriptor?.state || ''))) return 'WAITING_LEASE';
+        if (state?.state === 'EXECUTING') return 'EXECUTING';
+        if (!settings?.enabled || state?.state === 'DISABLED') return 'OFF';
+        if (state?.state === 'WAITING_WORK') {
+            const next = planner().nextDeadline(state);
+            if (next?.kind === 'REPORT') return 'WAITING_REPORT';
+            if (next?.kind === 'CAPACITY') return 'WAITING_CAPACITY';
+            if (next?.kind === 'AUTHORIZATION') return 'WAITING_AUTHORIZATION';
+            return 'WAITING';
+        }
+        return state?.state || 'WAITING';
+    }
 
     function installPanel(scope) {
         if (!featureAllowed() || !root.document?.body) return;
@@ -1399,9 +1962,11 @@
             <div class="af-body">
               <nav class="af-tabs"><button class="af-tab active" data-tab="now">Agora</button><button class="af-tab" data-tab="model">Modelo</button><button class="af-tab" data-tab="settings">Ajustes</button><button class="af-tab" data-tab="logs">Logs</button></nav>
               <section class="af-pane active" data-pane="now">
-                <div class="af-state" data-role="status">A carregar estado nativo…</div>
+                <div class="af-state" data-role="status">STARTING · a preparar estado nativo…</div>
+                <div class="af-state" data-role="intent">DesiredIntent ainda não criado.</div>
+                <div class="af-state" data-role="deadlines">Deadlines ainda não carregados.</div>
                 <div class="af-kpis"><span><b data-role="targets">—</b>alvos</span><span><b data-role="pending">—</b>pending</span><span><b data-role="reports">—</b>reports</span><span><b data-role="capacity">—</b>capacidade</span></div>
-                <div class="af-grid"><button class="af-primary" data-action="toggle">INICIAR</button><button data-action="recheck">Reavaliar agora</button><button data-tab="settings">Configurar</button></div>
+                <div class="af-grid"><button class="af-primary" data-action="toggle">INICIAR</button><button data-action="recheck">Reavaliar agora</button><button data-action="handoff">Confirmar handoff legacy</button><button data-tab="settings">Configurar</button></div>
               </section>
               <section class="af-pane" data-pane="model">
                 <div class="af-state" data-role="model-summary">Modelo ainda sem dados.</div>
@@ -1450,8 +2015,40 @@
                 if (action === 'toggle') await setEnabled(scope, !core().normalizeCfg(records.settings.value).enabled);
                 if (action === 'recheck') {
                     if (!core().normalizeCfg(records.settings.value).enabled) throw coded('AUTOFARM_DISABLED', 'Inicia primeiro o AutoFarm');
-                    schedule(scope, now(), 'OBSERVATION', scheduler()?.PRIORITY?.MANUAL);
-                    diagnostic(scope, 'MANUAL_REEVALUATION', 'normal stochastic scheduling preserved');
+                    const current = await storage().readRecord('autofarm_meta', metaKey(scope, 'coordination'));
+                    const decision = planner().manualReevaluationDecision(current?.value, now());
+                    if (decision.action === 'RECONCILE') {
+                        await updateDeadlines(scope, value => ({
+                            ...value, state: 'RECONCILING', reconcileDueAt: now(),
+                            reason: 'MANUAL_REEVALUATION_RECONCILIATION'
+                        }));
+                    } else if (decision.action === 'AUTHORIZE') {
+                        await updateDeadlines(scope, value => ({
+                            ...value, state: 'WAITING_AUTHORIZATION', executionDueAt: 0,
+                            authorizationDueAt: now(), reason: 'MANUAL_REEVALUATION_AUTHORIZATION_ONLY'
+                        }));
+                    } else if (decision.action === 'OBSERVE') {
+                        await updateDeadlines(scope, value => ({
+                            ...value, observationDueAt: now(), reason: 'MANUAL_REEVALUATION_NO_INTENT'
+                        }));
+                    } else {
+                        armNextDeadline(scope, current?.value);
+                    }
+                    diagnostic(scope, 'MANUAL_REEVALUATION', `${decision.action}; stochastic decision preserved`, {
+                        rngAdditionalDraws: 0
+                    });
+                }
+                if (action === 'handoff') {
+                    const authority = await storage().confirmLegacyHandoff(scope);
+                    diagnostic(scope, 'LEGACY_HANDOFF_CONFIRMED', authority.status, {
+                        legacyFingerprint: authority.legacyFingerprint
+                    });
+                    if (authority.status === 'TWPF_AUTHORITY') {
+                        const cleaned = await storage().cleanupVerifiedLegacy(scope);
+                        diagnostic(scope, 'LEGACY_CLEANUP', cleaned.status, {
+                            removedKnownKeys: cleaned.removed || []
+                        });
+                    }
                 }
                 if (action === 'save') {
                     const value = name => panel.querySelector(`[data-field="${name}"]`)?.value;
@@ -1474,7 +2071,7 @@
                 diagnostic(scope, 'UI_ERROR', error.message, { code: error.code || '' });
             }
         });
-        render(scope);
+        return panel;
     }
 
     async function render(scopeInput = null) {
@@ -1487,7 +2084,9 @@
             const records = await ensureNativeRecords(scope);
             const settings = core().normalizeCfg(records.settings.value);
             const state = core().normalizeCoordinationState(records.coordination.value);
+            const authorityState = String(records.legacyAuthority?.status || '');
             const descriptor = scheduler()?.describe?.(taskKey(scope));
+            const effectiveState = uiState(settings, state, authorityState, descriptor);
             const model = await loadModel(scope);
             const set = (name, value) => { const element = panel.querySelector(`[data-field="${name}"]`); if (element && root.document.activeElement !== element) element.value = value; };
             set('farmTemplate', settings.farmTemplate); set('radius', settings.radius);
@@ -1505,10 +2104,26 @@
             set('lossCooldownMin', settings.lossCooldownMin);
             const button = panel.querySelector('[data-action="toggle"]');
             if (button) button.textContent = settings.enabled ? 'PARAR' : 'INICIAR';
+            const handoffButton = panel.querySelector('[data-action="handoff"]');
+            if (handoffButton) handoffButton.hidden = !['LEGACY_HANDOFF_REQUIRED', 'MIGRATION_BLOCKED'].includes(authorityState);
             const status = panel.querySelector('[data-role="status"]');
-            if (status) status.textContent = `${settings.enabled ? 'ATIVO' : 'PARADO'} · ${state.state} · ` +
+            if (status) status.textContent = `${settings.enabled ? 'ATIVO' : 'OFF'} · ${effectiveState} · ` +
                 `wake ${descriptor?.state || 'MISSING'}${descriptor?.dueAt ? ` às ${new Date(descriptor.dueAt).toLocaleTimeString()}` : ''} · ` +
                 `ronda ${state.executionRound?.dispatchLimitRemaining ?? '—'} · ${state.reason || '—'}`;
+            const intentElement = panel.querySelector('[data-role="intent"]');
+            const intent = state.desiredIntent ? core().normalizeDesiredIntent(state.desiredIntent) : null;
+            if (intentElement) intentElement.textContent = intent?.intentId
+                ? `Intent ${intent.intentId} · decisão ${intent.stochasticDecisionId} · ${intent.temporalProfile || '—'} · ` +
+                    `desejado ${new Date(intent.desiredExecutionAt).toLocaleTimeString()} · delay ${Math.round(intent.desiredDelayMs / 1000)}s · ` +
+                    `draws ${intent.randomDrawCount}`
+                : 'Sem DesiredIntent ativa.';
+            const deadlinesElement = panel.querySelector('[data-role="deadlines"]');
+            if (deadlinesElement) {
+                const deadlines = planner().deadlineEntries(state);
+                deadlinesElement.textContent = deadlines.length
+                    ? deadlines.map(item => `${item.kind} ${new Date(item.dueAt).toLocaleTimeString()}`).join(' · ')
+                    : 'Sem deadlines armadas.';
+            }
             const targetStates = records.targets?.value || {};
             const targetCount = Number(state.sources.MAP?.data?.targetIds && Object.keys(state.sources.MAP.data.targetIds).length) ||
                 Object.keys(model.farms || {}).length;
@@ -1548,18 +2163,31 @@
         if (!featureAllowed()) return false;
         let scope;
         try { scope = currentScope(); } catch (_) { return false; }
-        const records = await ensureNativeRecords(scope);
         installPanel(scope);
+        let records;
+        try {
+            records = await ensureNativeRecords(scope);
+        } catch (error) {
+            const panel = root.document?.getElementById?.(panelId());
+            const status = panel?.querySelector?.('[data-role="status"]');
+            if (status) status.textContent = `${/MIGRATION|LEGACY/.test(String(error?.code || '')) ? 'MIGRATION_ERROR' : 'STORAGE_ERROR'} · ${error.message}`;
+            diagnostic(scope, /MIGRATION|LEGACY/.test(String(error?.code || '')) ? 'MIGRATION_ERROR' : 'STORAGE_ERROR', error.message, {
+                code: error.code || ''
+            });
+            return false;
+        }
         const settings = core().normalizeCfg(records.settings.value);
+        if (!records.legacyAuthority?.mutationAllowed && settings.enabled) {
+            service.cancel?.(taskKey(scope), records.legacyAuthority.status);
+            render(scope);
+            return true;
+        }
         if (!settings.enabled) {
             service.cancel?.(taskKey(scope), 'disabled');
             render(scope);
             return true;
         }
         if (hardStopped()) {
-            if (!service.hasTask?.(taskKey(scope))) {
-                schedule(scope, now() + settings.retrySeconds * 1000, 'OBSERVATION');
-            }
             render(scope);
             return true;
         }
@@ -1570,13 +2198,34 @@
         }
         const unresolved = await unresolvedMutations(scope);
         if (unresolved.length) {
-            schedule(scope, now(), 'RECONCILIATION', service.PRIORITY?.RECONCILIATION);
+            const saved = await updateCoordination(scope, value => ({
+                ...value, state: 'RECONCILING', reconcileDueAt: now(),
+                executionDueAt: 0, authorizationDueAt: 0,
+                reason: 'BOOT_RECONCILIATION_REQUIRED'
+            }));
+            armNextDeadline(scope, saved.value);
         } else {
-            const state = core().normalizeCoordinationState(records.coordination.value);
-            const dueAt = state.state === 'WAITING_EXECUTION' && Number(state.executionDueAt) > 0
-                ? Math.max(now(), Number(state.executionDueAt))
-                : now() + settings.retrySeconds * 1000;
-            schedule(scope, dueAt, state.state === 'WAITING_EXECUTION' ? 'EXECUTION' : 'OBSERVATION');
+            let coordinationRecord = await storage().readRecord('autofarm_meta', metaKey(scope, 'coordination'));
+            let state = core().normalizeCoordinationState(coordinationRecord.value);
+            const preserved = planner().desiredIntentFromLegacy(state);
+            if (!state.desiredIntent && preserved) {
+                state = core().normalizeCoordinationState({
+                    ...state,
+                    desiredIntent: preserved,
+                    executionDueAt: preserved.desiredExecutionAt,
+                    state: 'WAITING_EXECUTION',
+                    reason: 'COMPATIBLE_STOCHASTIC_INTENT_PRESERVED'
+                });
+                coordinationRecord = await storage().putMetaCas(scope, 'coordination', coordinationRecord.revision, state);
+            }
+            if (!planner().nextDeadline(state)) {
+                state = core().normalizeCoordinationState({
+                    ...state, observationDueAt: now() + settings.retrySeconds * 1000,
+                    reason: 'BOOT_OBSERVATION_ARMED'
+                });
+                coordinationRecord = await storage().putMetaCas(scope, 'coordination', coordinationRecord.revision, state);
+            }
+            armNextDeadline(scope, coordinationRecord.value);
         }
         render(scope);
         return true;
@@ -1586,6 +2235,9 @@
         VERSION, HANDLER, init, render, currentScope, setEnabled, updateSettings,
         runOccurrence, observationOccurrence, executeOccurrence, reconcileOccurrence,
         parseWorldMap, reportIsSafelyNewer,
-        _test: { runtime, featureAllowed, targetStateBlocked, historicalEvidence, finalCandidateAllowed }
+        _test: {
+            runtime, featureAllowed, targetStateBlocked, historicalEvidence, finalCandidateAllowed,
+            chooseTemplateAndCapacity, triggerHardStop, uiState, isCriticalStorageError
+        }
     });
 })(window);

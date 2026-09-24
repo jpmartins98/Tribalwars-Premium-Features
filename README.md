@@ -254,7 +254,8 @@ After installation, open the script settings in TribalWars and enable the featur
 
 > The implementation uses TWPF's shared scheduler, cross-tab leases, account-wide HARD_STOP and IndexedDB journal. It never automates Bot Protection/CAPTCHA, never sends when map/template/troop proofs are unknown, and permits at most one farm POST per scheduler occurrence. Template C remains the game's native scouting action and is not automated.
 
-See [the v2.0.15 integration and recovery notes](docs/autofarm-adaptive-v2.0.15.md).
+See [the v2.0.15 integration and recovery notes](docs/autofarm-adaptive-v2.0.15.md),
+[architecture contract](AUTOFARM-INTEGRATION.md) and [UI parity mapping](AUTOFARM-UI-MAPPING.md).
 </details>
 
 ### Interface and Settings

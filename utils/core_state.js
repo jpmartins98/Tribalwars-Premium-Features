@@ -136,6 +136,14 @@ function setSetting(name, value) {
     safeLocalStorageSet('settings_cookies', JSON.stringify(settings_cookies));
 }
 
+// Canonical bridge for isolated @require modules. Tampermonkey keeps the
+// userscript lexical binding private, so feature modules must not infer that
+// `settings_cookies` is also a page-window property.
+window.PremiumFeaturesSettingsState = Object.freeze({
+    getSetting: getSetting,
+    setSetting: setSetting
+});
+
 
 var widgetsInjectFunctions = {
     'village_list': injectVillagesListWidget,

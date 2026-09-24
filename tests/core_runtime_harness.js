@@ -493,8 +493,11 @@ test('external localStorage quota failure is not attributed to TWPF', () => {
     assert.equal(warnings, 1);
 });
 
-test('real scheduler resumes Building Queue, Instant Free and Scavenging through their workers', async () => {
-    const requests = { buildGet: 0, buildPost: 0, instantGet: 0, instantMutation: 0, scavGet: 0, scavPost: 0 };
+test('real scheduler resumes Building Queue, Instant Free, Scavenging and AutoFarm through independent final gates', async () => {
+    const requests = {
+        buildGet: 0, buildPost: 0, instantGet: 0, instantMutation: 0,
+        scavGet: 0, scavPost: 0, autoFarmPost: 0
+    };
     const instantReasons = [];
     const clock = new FakeClock(1000000);
     const env = createContext({ clock, overrides: {
@@ -552,6 +555,16 @@ test('real scheduler resumes Building Queue, Instant Free and Scavenging through
     env.context.PremiumFeaturesBuildState = store;
     store.start();
     let scheduler = env.context.PremiumFeaturesBackgroundScheduler;
+    const registerAutoFarmFixture = currentScheduler => {
+        currentScheduler.registerHandler('autofarmIntegratedFixture', (_args, guard) => {
+            guard.assertActive();
+            assert.equal(currentScheduler.stats().hardStopped, false,
+                'AutoFarm final gate observes the account HARD_STOP');
+            requests.autoFarmPost++;
+            return { status: 'CONFIRMED' };
+        });
+    };
+    registerAutoFarmFixture(scheduler);
     const createController = currentScheduler => env.context.createBuildQueueController({
         store, scheduler: currentScheduler, clock, now: () => clock.now, handlerName: 'reconcileBuildQueueVillage',
         getCost: (_id, head, record) => {
@@ -611,6 +624,11 @@ test('real scheduler resumes Building Queue, Instant Free and Scavenging through
     vm.runInContext(`saveScavengeConfig({ enabled: true, level: 0, allUnits: true, units: {} }, '3');
         checkAndScheduleBuildInstantFree('2', { observeDom: false });
         _scheduleScavengingAuto(0, '3');`, env.context);
+    scheduler.enqueue({
+        key: 'autofarm:integrated:3', handlerName: 'autofarmIntegratedFixture', args: [],
+        dueAt: clock.now, leaseKey: 'autofarm:integrated:3', requiresCoordinator: true,
+        persist: true, rerunWhileActive: true
+    });
     controller.schedule('1', { dueAt: clock.now, state: 'RECONCILING', forceFresh: true });
     scheduler.hardStop({ source: 'bot-protection' });
     scheduler.cancel(controller.taskKey('1'), 'simulate interrupted hard-stop reconcile');
@@ -620,7 +638,7 @@ test('real scheduler resumes Building Queue, Instant Free and Scavenging through
     assert.equal(env.context.getBuildQueueOverviewWaitingStatus('1').kind, 'HARD_STOP');
     for (let i = 0; i < 3; i++) { clock.tick(500); await flushMicrotasks(12); }
     assert.deepEqual(requests, { buildGet: 0, buildPost: 0, instantGet: 0,
-        instantMutation: 0, scavGet: 0, scavPost: 0 });
+        instantMutation: 0, scavGet: 0, scavPost: 0, autoFarmPost: 0 });
     assert.equal(scheduler.stats().hardStopped, true);
     assert.equal(scheduler.hasTask('persistent-timeout:build_instant_free_2'), true);
     // Simulate a page reload: timers and scheduler memory disappear, while the persisted
@@ -637,14 +655,15 @@ test('real scheduler resumes Building Queue, Instant Free and Scavenging through
     env.context.PremiumFeaturesBackgroundScheduler = scheduler;
     controller = createController(scheduler);
     scheduler.registerHandler('reconcileBuildQueueVillage', (args, guard) => controller.reconcile(args[0], guard));
+    registerAutoFarmFixture(scheduler);
     scheduler.start();
     assert.equal(scheduler.stats().hardStopped, true, 'reload must not auto-clear protection');
     assert.deepEqual(requests, { buildGet: 0, buildPost: 0, instantGet: 0,
-        instantMutation: 0, scavGet: 0, scavPost: 0 });
+        instantMutation: 0, scavGet: 0, scavPost: 0, autoFarmPost: 0 });
     assert.equal(env.context.PremiumFeaturesBotProtection.resumeAfterHardStop(), true);
     for (let i = 0; i < 18; i++) { clock.tick(500); await flushMicrotasks(20); }
     assert.deepEqual(requests, { buildGet: 1, buildPost: 1, instantGet: 1,
-        instantMutation: 1, scavGet: 1, scavPost: 1 }, 'instant reasons: ' + instantReasons.join(', ') +
+        instantMutation: 1, scavGet: 1, scavPost: 1, autoFarmPost: 1 }, 'instant reasons: ' + instantReasons.join(', ') +
         '; worker: ' + JSON.stringify(instantWorkerResults) + '; updates: ' + JSON.stringify(officialUpdates) +
         '; sets: ' + JSON.stringify(timerSets));
     assert.equal(store.get('1').queue.length, 0);

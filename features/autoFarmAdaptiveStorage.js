@@ -6,6 +6,12 @@
     const LEGACY_NAMESPACE = 'twaf59:';
     const SNAPSHOT_TYPE = 'legacySnapshot';
     const MARKER_TYPE = 'legacyMigration';
+    const HANDOFF_TYPE = 'legacyHandoff';
+    const KNOWN_LEGACY_KEYS = Object.freeze([
+        'settings', 'coordinationV2', 'mapPresenceV2', 'visualScanV2',
+        'templateCompositions', 'adaptiveV2', 'targets', 'dynamicTargets',
+        'cursor', 'networkLedgerV2', 'scheduler', 'lease'
+    ]);
 
     function migrationError(code, message) {
         const error = new Error(message);
@@ -34,7 +40,24 @@
         catch (_) { throw migrationError('AUTOFARM_LEGACY_CORRUPT', 'Invalid legacy JSON: ' + key); }
     }
 
-    function readLegacySnapshot(scope, options = {}) {
+    function stableFingerprint(value) {
+        const stable = input => {
+            if (Array.isArray(input)) return `[${input.map(stable).join(',')}]`;
+            if (input && typeof input === 'object') {
+                return `{${Object.keys(input).sort().map(key => `${JSON.stringify(key)}:${stable(input[key])}`).join(',')}}`;
+            }
+            return JSON.stringify(input);
+        };
+        const text = stable(value);
+        let hash = 2166136261;
+        for (let i = 0; i < text.length; i++) {
+            hash ^= text.charCodeAt(i);
+            hash = Math.imul(hash, 16777619);
+        }
+        return (hash >>> 0).toString(16).padStart(8, '0');
+    }
+
+    function inspectLegacyAuthority(scope, options = {}) {
         const host = options.host || root;
         const storage = options.storage || host.localStorage;
         const now = options.now || Date.now;
@@ -60,32 +83,54 @@
         const settings = parseLegacyJson(entries.settings ?? null, 'settings');
         const oldLease = parseLegacyJson(entries.lease ?? null, 'lease');
         const accountHardStop = parseLegacyJson(hardStopRaw, 'accountHardStop');
-        if (settings?.enabled === true || Number(oldLease?.expiresAt || 0) > now()) {
-            throw migrationError(
-                'AUTOFARM_LEGACY_ACTIVE',
-                'Disable the standalone AutoFarm and wait for its lease to finish before migration'
-            );
-        }
-        return {
+        const runtimeActive = settings?.enabled === true || Number(oldLease?.expiresAt || 0) > now();
+        const snapshot = {
             ...context,
             sourceFormat: 'twaf59-v2.0.14.x',
             capturedAt: now(),
             entries,
             accountHardStopRaw: hardStopRaw,
             accountHardStopActive: accountHardStop?.active === true,
-            entryCount: Object.keys(entries).length
+            entryCount: Object.keys(entries).length,
+            runtimeActive,
+            runtimeEvidence: settings?.enabled === true
+                ? 'LEGACY_SETTING_ENABLED'
+                : (Number(oldLease?.expiresAt || 0) > now() ? 'LEGACY_LEASE_ACTIVE' : ''),
+            legacyFingerprint: stableFingerprint({ entries, accountHardStopRaw: hardStopRaw })
         };
+        return snapshot;
+    }
+
+    function readLegacySnapshot(scope, options = {}) {
+        const snapshot = inspectLegacyAuthority(scope, options);
+        if (snapshot.runtimeActive) {
+            throw migrationError(
+                'AUTOFARM_LEGACY_ACTIVE',
+                'Disable the standalone AutoFarm and wait for its lease to finish before migration'
+            );
+        }
+        return snapshot;
     }
 
     function validateStoredSnapshot(marker, snapshot) {
-        if (!marker || !snapshot || !['SNAPSHOT_CAPTURED', 'IMPORTED'].includes(marker.status) ||
+        const snapshotFingerprint = String(snapshot?.legacyFingerprint || stableFingerprint({
+            entries: snapshot?.entries || {}, accountHardStopRaw: snapshot?.accountHardStopRaw ?? null
+        }));
+        const markerFingerprint = String(marker?.legacyFingerprint || snapshotFingerprint);
+        if (!marker || !snapshot || !['DISCOVERED', 'MIGRATING', 'VERIFIED', 'LEGACY_CLEANED', 'FAILED', 'SNAPSHOT_CAPTURED', 'IMPORTED'].includes(marker.status) ||
             !snapshot.entries || typeof snapshot.entries !== 'object' ||
             Number(marker.entryCount) !== Object.keys(snapshot.entries).length ||
             marker.capturedAt !== snapshot.capturedAt ||
+            markerFingerprint !== snapshotFingerprint ||
             ['world', 'playerId', 'sourceVillageId'].some(key => marker[key] !== snapshot[key])) {
             throw migrationError('AUTOFARM_MIGRATION_INCOMPLETE', 'Legacy AutoFarm snapshot and migration marker disagree');
         }
-        return { status: marker.status, marker, snapshot };
+        const aliases = { SNAPSHOT_CAPTURED: 'DISCOVERED', IMPORTED: 'VERIFIED' };
+        return {
+            status: aliases[marker.status] || marker.status,
+            marker: { ...marker, legacyFingerprint: markerFingerprint },
+            snapshot: { ...snapshot, legacyFingerprint: snapshotFingerprint }
+        };
     }
 
     function createAutoFarmStorage(options = {}) {
@@ -177,6 +222,10 @@
                     if (expectedRevision !== null && expectedRevision !== undefined && revision !== Number(expectedRevision)) {
                         throw migrationError('AUTOFARM_CAS_MISMATCH', `Expected revision ${expectedRevision}, found ${revision}`);
                     }
+                    if (previous && JSON.stringify(previous.value) === JSON.stringify(value)) {
+                        api.setResult({ ...previous, writeStatus: 'UNCHANGED' });
+                        return;
+                    }
                     const next = {
                         ...context,
                         recordType: String(recordType),
@@ -184,9 +233,125 @@
                         updatedAt: now(),
                         value
                     };
-                    api.onRequest(store.put(next), () => api.setResult(next));
+                    api.onRequest(store.put(next), () => api.setResult({ ...next, writeStatus: 'WRITTEN' }));
                 });
             });
+        }
+
+        async function legacyAuthorityStatus(scope) {
+            const context = normalizeScope(scope, host);
+            const snapshot = inspectLegacyAuthority(context, { host, storage, now });
+            if (snapshot.runtimeActive) {
+                return {
+                    status: 'LEGACY_AUTOFARM_DETECTED', mutationAllowed: false,
+                    evidence: snapshot.runtimeEvidence, legacyFingerprint: snapshot.legacyFingerprint
+                };
+            }
+            if (!snapshot.entryCount && snapshot.accountHardStopRaw === null) {
+                return { status: 'NO_LEGACY_AUTHORITY', mutationAllowed: true, legacyFingerprint: snapshot.legacyFingerprint };
+            }
+            const [captured, handoff] = await Promise.all([
+                readCapturedSnapshot(context),
+                readRecord('autofarm_meta', [context.world, context.playerId, context.sourceVillageId, HANDOFF_TYPE])
+            ]);
+            if (captured?.status === 'LEGACY_CLEANED') {
+                const recreatedKnown = KNOWN_LEGACY_KEYS.filter(name => snapshot.entries?.[name] !== undefined);
+                const handedOff = handoff?.value?.confirmed === true &&
+                    String(handoff.value.legacyFingerprint || '') === String(captured.snapshot?.legacyFingerprint || '');
+                if (!recreatedKnown.length && handedOff) {
+                    return {
+                        status: 'TWPF_AUTHORITY', mutationAllowed: true,
+                        legacyFingerprint: captured.snapshot.legacyFingerprint,
+                        handoff: handoff.value, legacyCleaned: true
+                    };
+                }
+                return {
+                    status: 'MIGRATION_BLOCKED', mutationAllowed: false,
+                    reason: 'LEGACY_KNOWN_KEYS_RECREATED', recreatedKnown,
+                    legacyFingerprint: snapshot.legacyFingerprint
+                };
+            }
+            const verified = ['VERIFIED', 'LEGACY_CLEANED'].includes(String(captured?.status || '')) &&
+                String(captured?.snapshot?.legacyFingerprint || '') === String(snapshot.legacyFingerprint || '');
+            if (!verified) {
+                return {
+                    status: 'MIGRATION_BLOCKED', mutationAllowed: false,
+                    reason: 'LEGACY_FINGERPRINT_NOT_VERIFIED', legacyFingerprint: snapshot.legacyFingerprint
+                };
+            }
+            const handedOff = handoff?.value?.confirmed === true &&
+                String(handoff.value.legacyFingerprint || '') === String(snapshot.legacyFingerprint || '');
+            return handedOff
+                ? {
+                    status: 'TWPF_AUTHORITY', mutationAllowed: true,
+                    legacyFingerprint: snapshot.legacyFingerprint, handoff: handoff.value
+                }
+                : {
+                    status: 'LEGACY_HANDOFF_REQUIRED', mutationAllowed: false,
+                    reason: 'EXPLICIT_USER_HANDOFF_REQUIRED', legacyFingerprint: snapshot.legacyFingerprint
+                };
+        }
+
+        async function confirmLegacyHandoff(scope) {
+            const context = normalizeScope(scope, host);
+            const authority = await legacyAuthorityStatus(context);
+            if (authority.status === 'LEGACY_AUTOFARM_DETECTED') {
+                throw migrationError('AUTOFARM_LEGACY_ACTIVE', 'Legacy AutoFarm runtime is still active');
+            }
+            if (authority.status === 'MIGRATION_BLOCKED') {
+                throw migrationError('AUTOFARM_MIGRATION_INCOMPLETE', 'Verify the current legacy fingerprint before handoff');
+            }
+            if (authority.status === 'NO_LEGACY_AUTHORITY') return authority;
+            const previous = await readRecord('autofarm_meta', [context.world, context.playerId, context.sourceVillageId, HANDOFF_TYPE]);
+            await putMetaCas(context, HANDOFF_TYPE, Number(previous?.revision) || 0, {
+                confirmed: true,
+                confirmedAt: now(),
+                legacyFingerprint: authority.legacyFingerprint,
+                statement: 'USER_CONFIRMED_STANDALONE_DISABLED'
+            });
+            return legacyAuthorityStatus(context);
+        }
+
+        async function cleanupVerifiedLegacy(scope) {
+            const context = normalizeScope(scope, host);
+            const authority = await legacyAuthorityStatus(context);
+            if (!authority.mutationAllowed || authority.status !== 'TWPF_AUTHORITY') {
+                throw migrationError('AUTOFARM_LEGACY_HANDOFF_REQUIRED', 'Verified handoff is required before cleanup');
+            }
+            const captured = await readCapturedSnapshot(context);
+            if (captured.status !== 'VERIFIED') return { status: captured.status, removed: [] };
+            const prefix = `${LEGACY_NAMESPACE}${context.world}:p${context.playerId}:v${context.sourceVillageId}:`;
+            const removed = [];
+            for (const name of KNOWN_LEGACY_KEYS) {
+                const expected = captured.snapshot.entries?.[name];
+                if (expected === undefined) continue;
+                const key = prefix + name;
+                if (storage.getItem(key) === expected) {
+                    storage.removeItem(key);
+                    removed.push(name);
+                }
+            }
+            const accountHardStopKey = `${LEGACY_NAMESPACE}${context.world}:p${context.playerId}:accountHardStop`;
+            if (captured.snapshot.accountHardStopRaw !== null &&
+                storage.getItem(accountHardStopKey) === captured.snapshot.accountHardStopRaw) {
+                storage.removeItem(accountHardStopKey);
+                removed.push('accountHardStop');
+            }
+            await transact(['autofarm_meta'], 'readwrite', api => {
+                const store = api.store('autofarm_meta');
+                const key = [context.world, context.playerId, context.sourceVillageId, MARKER_TYPE];
+                api.onRequest(store.get(key), marker => {
+                    if (!marker || !['VERIFIED', 'IMPORTED'].includes(marker.status)) {
+                        throw migrationError('AUTOFARM_MIGRATION_INCOMPLETE', 'Verified marker disappeared before cleanup');
+                    }
+                    api.onRequest(store.put({
+                        ...marker, status: 'LEGACY_CLEANED', cleanedAt: now(),
+                        removedKnownKeys: removed,
+                        revision: Math.max(1, Number(marker.revision) || 0) + 1
+                    }), () => api.setResult({ status: 'LEGACY_CLEANED', removed }));
+                });
+            });
+            return { status: 'LEGACY_CLEANED', removed };
         }
 
         function mutationContext(scope) {
@@ -198,6 +363,7 @@
         function prepareMutation(scope, input, guard) {
             const { context, base } = mutationContext(scope);
             const mutationId = String(input?.mutationId || '');
+            const mutationAttemptAt = Math.max(1, Number(input?.startedAt) || now());
             if (!mutationId || !input?.targetCoord || !input?.targetId || !input?.templateId) {
                 return Promise.reject(migrationError('AUTOFARM_MUTATION_INVALID', 'Mutation identity is incomplete'));
             }
@@ -236,7 +402,7 @@
                                 targetStates[input.targetCoord] = {
                                     ...previousTarget,
                                     sending: true,
-                                    sendingAt: now(),
+                                    sendingAt: mutationAttemptAt,
                                     sendingMutationId: mutationId
                                 };
                                 const targetNext = {
@@ -251,7 +417,8 @@
                                     ...input,
                                     mutationId,
                                     status: 'PREPARED',
-                                    preparedAt: now(),
+                                    startedAt: mutationAttemptAt,
+                                    preparedAt: mutationAttemptAt,
                                     fencingToken: Number(guard?.token) || null
                                 };
                                 api.onRequest(operational.put(targetNext));
@@ -265,17 +432,45 @@
         }
 
         function markMutationTransmitting(scope, mutationId, guard) {
-            const { context } = mutationContext(scope);
-            return transact(['autofarm_mutations'], 'readwrite', api => {
+            const { context, base } = mutationContext(scope);
+            return transact(['autofarm_meta', 'autofarm_mutations'], 'readwrite', api => {
                 const store = api.store('autofarm_mutations');
+                const meta = api.store('autofarm_meta');
                 api.onRequest(store.get(String(mutationId)), record => {
                     guard?.assertActive?.();
                     if (!record || record.status !== 'PREPARED' ||
                         (record.fencingToken !== null && Number(record.fencingToken) !== Number(guard?.token))) {
                         throw migrationError('AUTOFARM_MUTATION_FENCED', 'Prepared mutation no longer belongs to this lease');
                     }
-                    const next = { ...record, ...context, status: 'TRANSMITTING', transmittedAt: now() };
-                    api.onRequest(store.put(next), () => api.setResult(next));
+                    const transmissionBoundaryAt = now();
+                    const next = { ...record, ...context, status: 'TRANSMITTING', transmittedAt: transmissionBoundaryAt };
+                    api.onRequest(meta.get([...base, 'coordination']), coordinationRecord => {
+                        if (!coordinationRecord) throw migrationError('AUTOFARM_COORDINATION_MISSING', 'Coordination state is unavailable');
+                        const value = { ...(coordinationRecord.value || {}) };
+                        const round = { ...(value.executionRound || {}) };
+                        if (round.status !== 'OPEN' || round.pendingMutation) {
+                            throw migrationError('AUTOFARM_MUTATION_FENCED', 'Execution round cannot cross the transmission boundary');
+                        }
+                        round.status = 'UNKNOWN';
+                        round.pendingMutation = {
+                            mutationId: record.mutationId,
+                            startedAt: Number(record.startedAt || record.preparedAt) || transmissionBoundaryAt,
+                            transmissionBoundaryAt
+                        };
+                        value.executionRound = round;
+                        value.state = 'UNKNOWN';
+                        value.reconcileDueAt = transmissionBoundaryAt;
+                        value.executionDueAt = 0;
+                        value.authorizationDueAt = 0;
+                        api.onRequest(meta.put({
+                            ...coordinationRecord,
+                            ...context,
+                            revision: Math.max(0, Number(coordinationRecord.revision) || 0) + 1,
+                            updatedAt: transmissionBoundaryAt,
+                            value
+                        }));
+                        api.onRequest(store.put(next), () => api.setResult(next));
+                    });
                 });
             });
         }
@@ -343,6 +538,30 @@
                                 round.status = round.dispatchLimitRemaining > 0 ? 'OPEN' : 'EXHAUSTED';
                                 round.pendingMutation = null;
                                 value.state = round.status === 'OPEN' ? 'WAITING_EXECUTION' : 'WAITING_WORK';
+                                value.desiredIntent = null;
+                                value.stochasticPlan = null;
+                                value.executionDueAt = 0;
+                                value.authorizationDueAt = 0;
+                                value.reconcileDueAt = 0;
+                                const installedProof = details?.capacityProof || null;
+                                const capacityObservedAt = settledAt;
+                                value.sources = { ...(value.sources || {}) };
+                                value.sources.CAPACITY = installedProof
+                                    ? {
+                                        source: 'CAPACITY', status: 'READY', invalidated: false,
+                                        observedAt: Number(installedProof.observedAt) || capacityObservedAt,
+                                        freshUntil: Number(installedProof.freshUntil) || 0,
+                                        revision: Math.max(1, Number(installedProof.revision) || capacityObservedAt),
+                                        reason: String(installedProof.source || 'POST_CURRENT_UNITS'),
+                                        data: installedProof
+                                    }
+                                    : {
+                                        source: 'CAPACITY', status: 'STALE', invalidated: true,
+                                        observedAt: capacityObservedAt, freshUntil: 0,
+                                        revision: capacityObservedAt,
+                                        reason: 'MUTATION_CONFIRMED_WITHOUT_CURRENT_UNITS',
+                                        data: null
+                                    };
                                 api.onRequest(api.store('autofarm_dispatches').put({
                                     ...context,
                                     dispatchId: String(record.dispatchId || record.mutationId),
@@ -363,11 +582,28 @@
                                 }));
                             } else if (result === 'UNKNOWN') {
                                 round.status = 'UNKNOWN';
-                                round.pendingMutation = { mutationId: record.mutationId, at: settledAt };
+                                round.pendingMutation = {
+                                    mutationId: record.mutationId,
+                                    startedAt: Number(record.startedAt || record.preparedAt) || settledAt,
+                                    transmissionBoundaryAt: Number(record.transmittedAt) || settledAt
+                                };
                                 value.state = 'UNKNOWN';
+                                value.reconcileDueAt = Math.max(settledAt, Number(details?.reconcileDueAt) || settledAt);
                             } else {
                                 round.pendingMutation = null;
                                 value.state = 'WAITING_WORK';
+                                value.reconcileDueAt = 0;
+                                if (details?.capacityProof) {
+                                    value.sources = { ...(value.sources || {}) };
+                                    value.sources.CAPACITY = {
+                                        source: 'CAPACITY', status: 'READY', invalidated: false,
+                                        observedAt: Number(details.capacityProof.observedAt) || settledAt,
+                                        freshUntil: Number(details.capacityProof.freshUntil) || 0,
+                                        revision: Math.max(1, Number(details.capacityProof.revision) || settledAt),
+                                        reason: String(details.capacityProof.source || result),
+                                        data: details.capacityProof
+                                    };
+                                }
                             }
                             value.executionRound = round;
                             api.onRequest(meta.put({
@@ -628,46 +864,78 @@
                 guard.assertActive();
                 const captured = await readCapturedSnapshot(context);
                 if (captured.status === 'NOT_CAPTURED') return { status: 'NOT_CAPTURED' };
-                if (captured.status === 'IMPORTED') return captured;
+                if (['VERIFIED', 'LEGACY_CLEANED'].includes(captured.status)) return captured;
                 const records = legacyRecords(captured.snapshot);
                 const names = [
                     'autofarm_meta', 'autofarm_farms', 'autofarm_dispatches', 'autofarm_reports',
                     'autofarm_events', 'autofarm_operational', 'autofarm_diagnostics'
                 ];
-                await transact(names, 'readwrite', api => {
+                const markerKey = [context.world, context.playerId, context.sourceVillageId, MARKER_TYPE];
+                await transact(['autofarm_meta'], 'readwrite', api => {
                     const meta = api.store('autofarm_meta');
-                    const operational = api.store('autofarm_operational');
-                    const markerKey = [context.world, context.playerId, context.sourceVillageId, MARKER_TYPE];
                     api.onRequest(meta.get(markerKey), marker => {
                         guard.assertActive();
-                        if (!marker || marker.status !== 'SNAPSHOT_CAPTURED') {
+                        if (!marker || !['DISCOVERED', 'SNAPSHOT_CAPTURED', 'MIGRATING', 'FAILED'].includes(marker.status)) {
                             throw migrationError('AUTOFARM_MIGRATION_INCOMPLETE', 'Migration marker is not ready to import');
                         }
-                        for (const [recordType, value] of Object.entries(records.metaValues)) {
-                            api.onRequest(meta.put({ ...context, recordType, revision: 1, updatedAt: now(), value }));
-                        }
-                        for (const [recordType, value] of Object.entries(records.operationalValues)) {
-                            api.onRequest(operational.put({ ...context, recordType, revision: 1, updatedAt: now(), value }));
-                        }
-                        for (const record of records.farms) api.onRequest(api.store('autofarm_farms').put(record));
-                        for (const record of records.dispatches) api.onRequest(api.store('autofarm_dispatches').put(record));
-                        for (const record of records.reports) api.onRequest(api.store('autofarm_reports').put(record));
-                        for (const record of records.events) api.onRequest(api.store('autofarm_events').put(record));
-                        for (const record of records.diagnostics) api.onRequest(api.store('autofarm_diagnostics').put(record));
                         api.onRequest(meta.put({
-                            ...marker,
-                            status: 'IMPORTED',
-                            importedAt: now(),
-                            revision: Math.max(1, Number(marker.revision) || 1) + 1,
-                            importedCounts: Object.fromEntries(
-                                ['farms', 'dispatches', 'reports', 'events', 'diagnostics'].map(name => [name, records[name].length])
-                            )
+                            ...marker, status: 'MIGRATING', migrationStartedAt: now(),
+                            lastError: null,
+                            revision: Math.max(1, Number(marker.revision) || 0) + 1
                         }));
                     });
                 });
+                try {
+                    await transact(names, 'readwrite', api => {
+                        const meta = api.store('autofarm_meta');
+                        const operational = api.store('autofarm_operational');
+                        api.onRequest(meta.get(markerKey), marker => {
+                            guard.assertActive();
+                            if (!marker || marker.status !== 'MIGRATING') {
+                                throw migrationError('AUTOFARM_MIGRATION_INCOMPLETE', 'Migration marker lost MIGRATING authority');
+                            }
+                            for (const [recordType, value] of Object.entries(records.metaValues)) {
+                                api.onRequest(meta.put({ ...context, recordType, revision: 1, updatedAt: now(), value }));
+                            }
+                            for (const [recordType, value] of Object.entries(records.operationalValues)) {
+                                api.onRequest(operational.put({ ...context, recordType, revision: 1, updatedAt: now(), value }));
+                            }
+                            for (const record of records.farms) api.onRequest(api.store('autofarm_farms').put(record));
+                            for (const record of records.dispatches) api.onRequest(api.store('autofarm_dispatches').put(record));
+                            for (const record of records.reports) api.onRequest(api.store('autofarm_reports').put(record));
+                            for (const record of records.events) api.onRequest(api.store('autofarm_events').put(record));
+                            for (const record of records.diagnostics) api.onRequest(api.store('autofarm_diagnostics').put(record));
+                            api.onRequest(meta.put({
+                                ...marker,
+                                status: 'VERIFIED',
+                                importedAt: now(),
+                                verifiedAt: now(),
+                                revision: Math.max(1, Number(marker.revision) || 1) + 1,
+                                importedCounts: Object.fromEntries(
+                                    ['farms', 'dispatches', 'reports', 'events', 'diagnostics'].map(name => [name, records[name].length])
+                                )
+                            }));
+                        });
+                    });
+                } catch (error) {
+                    try {
+                        await transact(['autofarm_meta'], 'readwrite', api => {
+                            const meta = api.store('autofarm_meta');
+                            api.onRequest(meta.get(markerKey), marker => {
+                                if (!marker || marker.status !== 'MIGRATING') return;
+                                api.onRequest(meta.put({
+                                    ...marker, status: 'FAILED', failedAt: now(),
+                                    lastError: { code: String(error?.code || error?.name || 'ERROR'), message: String(error?.message || error) },
+                                    revision: Math.max(1, Number(marker.revision) || 0) + 1
+                                }));
+                            });
+                        });
+                    } catch (_) {}
+                    throw error;
+                }
                 guard.assertActive();
                 const verified = await readCapturedSnapshot(context);
-                if (verified.status !== 'IMPORTED') {
+                if (verified.status !== 'VERIFIED') {
                     throw migrationError('AUTOFARM_MIGRATION_INCOMPLETE', 'Imported marker could not be verified');
                 }
                 return verified;
@@ -690,11 +958,12 @@
                 const marker = {
                     ...context,
                     recordType: MARKER_TYPE,
-                    status: 'SNAPSHOT_CAPTURED',
+                    status: 'DISCOVERED',
                     sourceFormat: snapshot.sourceFormat,
                     capturedAt: snapshot.capturedAt,
                     entryCount: snapshot.entryCount,
                     accountHardStopActive: snapshot.accountHardStopActive,
+                    legacyFingerprint: snapshot.legacyFingerprint,
                     revision: 1
                 };
                 const snapshotRecord = { ...snapshot, recordType: SNAPSHOT_TYPE };
@@ -707,7 +976,10 @@
                             latest.accountHardStopRaw !== snapshot.accountHardStopRaw) {
                             throw migrationError('AUTOFARM_LEGACY_CHANGED', 'Legacy AutoFarm changed during snapshot capture');
                         }
-                        if (existing) {
+                        const recreatedAfterCleanup = existing?.status === 'LEGACY_CLEANED' &&
+                            KNOWN_LEGACY_KEYS.some(name => snapshot.entries?.[name] !== undefined);
+                        if (existing && !recreatedAfterCleanup &&
+                            String(existing.legacyFingerprint || '') === String(snapshot.legacyFingerprint || '')) {
                             api.onRequest(store.get([...base, SNAPSHOT_TYPE]), prior => {
                                 api.setResult(validateStoredSnapshot(existing, prior));
                             });
@@ -715,14 +987,23 @@
                         }
                         // Both writes share one transaction: neither record can become
                         // visible alone. The legacy keys are never removed or rewritten.
+                        const nextMarker = existing
+                            ? {
+                                ...marker,
+                                revision: Math.max(1, Number(existing.revision) || 0) + 1,
+                                rediscoveredBecause: recreatedAfterCleanup
+                                    ? 'KNOWN_LEGACY_KEYS_RECREATED_AFTER_CLEANUP'
+                                    : 'LEGACY_FINGERPRINT_CHANGED'
+                            }
+                            : marker;
                         api.onRequest(store.put(snapshotRecord));
-                        api.onRequest(store.put(marker));
-                        api.setResult({ status: 'SNAPSHOT_CAPTURED', marker });
+                        api.onRequest(store.put(nextMarker));
+                        api.setResult({ status: 'DISCOVERED', marker: nextMarker });
                     });
                 });
                 guard.assertActive();
                 const verified = await readCapturedSnapshot(context);
-                if (!['SNAPSHOT_CAPTURED', 'IMPORTED'].includes(verified.status)) {
+                if (!['DISCOVERED', 'MIGRATING', 'FAILED', 'VERIFIED', 'LEGACY_CLEANED'].includes(verified.status)) {
                     throw migrationError('AUTOFARM_MIGRATION_INCOMPLETE', 'Committed snapshot could not be read back');
                 }
                 return { ...outcome, snapshot: verified.snapshot };
@@ -731,6 +1012,7 @@
 
         return {
             readCapturedSnapshot, migrateLegacySnapshot, materializeLegacySnapshot,
+            legacyAuthorityStatus, confirmLegacyHandoff, cleanupVerifiedLegacy,
             readRecord, readIndex, putRecords, appendDiagnostic, putMetaCas,
             prepareMutation, markMutationTransmitting, settleMutation,
             confirmPendingReport, commitLearnedReport
@@ -739,6 +1021,9 @@
 
     root.PremiumFeaturesAutoFarmStorage = Object.freeze({
         create: createAutoFarmStorage,
-        readLegacySnapshot
+        readLegacySnapshot,
+        inspectLegacyAuthority,
+        stableFingerprint,
+        KNOWN_LEGACY_KEYS
     });
 })(window);

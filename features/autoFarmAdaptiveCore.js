@@ -339,6 +339,11 @@
     stochasticSchedulingMode: 'ADAPTIVE_SPREAD'
   });
 
+  // All model/planner randomness flows through RandomSource. Production uses
+  // crypto where available; deterministic fixtures can inject their own source.
+  const MODEL_RANDOM_SOURCE = createRandomSource(null, 'model-selection');
+  const IDENTITY_RANDOM_SOURCE = createRandomSource(null, 'runtime-identity');
+
   const RUNTIME = {
     busy: false,
     timer: null,
@@ -389,7 +394,7 @@
       if (globalThis.crypto?.randomUUID) return crypto.randomUUID();
     } catch (_) {}
 
-    return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+    return `${Date.now().toString(36)}-${IDENTITY_RANDOM_SOURCE.nextFloat().toString(36).slice(2)}`;
 
   }
 
@@ -899,11 +904,16 @@
   const MAP_AUTHORIZATION_MAX_TTL_MS = 120000;
   const PLAN_PROOF_MARGIN_MS = 5000;
   const COORDINATION_STATES = Object.freeze([
-    'DISABLED', 'WAITING_WORK', 'WAITING_EXECUTION', 'EXECUTING',
-    'UNKNOWN', 'RECONCILING', 'SOFT_PAUSED', 'HARD_STOP'
+    'DISABLED', 'STARTING', 'WAITING_WORK', 'WAITING_EXECUTION',
+    'WAITING_AUTHORIZATION', 'WAITING_CAPACITY', 'WAITING_REPORT',
+    'WAITING_LEASE', 'EXECUTING', 'UNKNOWN', 'RECONCILING',
+    'SOFT_PAUSED', 'STORAGE_ERROR', 'MIGRATION_ERROR',
+    'MIGRATION_BLOCKED', 'LEGACY_AUTOFARM_DETECTED',
+    'LEGACY_HANDOFF_REQUIRED', 'HARD_STOP'
   ]);
   const SCHEDULER_WAKE_KINDS = Object.freeze([
-    'EXECUTION', 'OBSERVATION', 'CAPACITY', 'REPORT', 'RECONCILIATION', 'MAINTENANCE', 'LEASE_RECOVERY'
+    'EXECUTION', 'AUTHORIZATION', 'OBSERVATION', 'CAPACITY', 'REPORT',
+    'RECONCILIATION', 'MAINTENANCE', 'LEASE_RECOVERY'
   ]);
   const SOURCE_NAMES = Object.freeze([
     'MAP', 'ASSISTANT', 'REPORT', 'UNIT', 'TEMPLATE', 'CAPACITY', 'EXECUTION', 'MAINTENANCE'
@@ -974,6 +984,41 @@
     };
   }
 
+  function normalizeDesiredIntent(raw) {
+    const x = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+    return {
+      intentId: String(x.intentId || ''),
+      stochasticDecisionId: String(x.stochasticDecisionId || ''),
+      executionRoundId: String(x.executionRoundId || ''),
+      generation: Math.max(0, Math.trunc(Number(x.generation) || 0)),
+      mode: String(x.mode || 'ADAPTIVE_SPREAD') === 'IMMEDIATE_EFFICIENCY'
+        ? 'IMMEDIATE_EFFICIENCY'
+        : 'ADAPTIVE_SPREAD',
+      createdAt: Math.max(0, Number(x.createdAt) || 0),
+      stochasticPolicyVersion: Math.max(0, Math.trunc(Number(x.stochasticPolicyVersion) || 0)),
+      stochasticAnchorAt: Math.max(0, Number(x.stochasticAnchorAt) || 0),
+      desiredDelayMs: Math.max(0, Number(x.desiredDelayMs) || 0),
+      desiredExecutionAt: Math.max(0, Number(x.desiredExecutionAt) || 0),
+      temporalProfile: String(x.temporalProfile || ''),
+      stochasticSubwindowStart: Math.max(0, Number(x.stochasticSubwindowStart) || 0),
+      stochasticSubwindowEnd: Math.max(0, Number(x.stochasticSubwindowEnd) || 0),
+      coalesceTarget: Math.max(0, Math.trunc(Number(x.coalesceTarget) || 0)),
+      coalesceUntil: Math.max(0, Number(x.coalesceUntil) || 0),
+      candidateRefs: Array.isArray(x.candidateRefs) ? x.candidateRefs.filter(Boolean).slice(0, 100) : [],
+      candidateSetRevision: String(x.candidateSetRevision || ''),
+      modelRevision: Math.max(0, Math.trunc(Number(x.modelRevision) || 0)),
+      configRevision: Math.max(0, Math.trunc(Number(x.configRevision) || 0)),
+      nextMutationNotBeforeAt: Math.max(0, Number(x.nextMutationNotBeforeAt) || 0),
+      randomDrawCount: Math.max(0, Math.trunc(Number(x.randomDrawCount) || 0)),
+      authorizationStartedAt: Math.max(0, Number(x.authorizationStartedAt) || 0),
+      actualExecutionAt: Math.max(0, Number(x.actualExecutionAt) || 0),
+      latenessMs: Math.max(0, Number(x.latenessMs) || 0),
+      reason: String(x.reason || ''),
+      intentCreatedBecause: String(x.intentCreatedBecause || ''),
+      intentInvalidatedBecause: String(x.intentInvalidatedBecause || '')
+    };
+  }
+
   function normalizeCapacityProof(raw) {
     const x = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
     const legacyValue = finiteObservedNumber(x.capacity);
@@ -991,7 +1036,10 @@
       compositionAuthoritative: Boolean(x.compositionAuthoritative),
       currentUnits: x.currentUnits && typeof x.currentUnits === 'object' ? x.currentUnits : null,
       sourceVillageId: String(x.sourceVillageId || ''),
-      derivedFrom: String(x.derivedFrom || '')
+      derivedFrom: String(x.derivedFrom || ''),
+      revision: Math.max(0, Math.trunc(Number(x.revision) || 0)),
+      availableAtHome: Boolean(x.availableAtHome),
+      authority: String(x.authority || '')
     };
   }
 
@@ -1145,7 +1193,10 @@
         composition: plan.composition,
         compositionAuthoritative: true,
         currentUnits: units,
-        sourceVillageId: plan.sourceVillageId
+        sourceVillageId: plan.sourceVillageId,
+        availableAtHome: true,
+        authority: 'AM_FARM_POST_CURRENT_UNITS',
+        revision: Math.max(1, Math.trunc(Number(responseAt) || 0))
       });
     }
     // A mutation confirmada alterou o estado das tropas. Sem current_units
@@ -1193,7 +1244,10 @@
       farmTemplate: plan.farmTemplate,
       composition: plan.composition,
       compositionAuthoritative: plan.compositionAuthoritative,
-      sourceVillageId: String(villageId || plan.sourceVillageId)
+      sourceVillageId: String(villageId || plan.sourceVillageId),
+      availableAtHome: true,
+      authority: 'SERVER_EXPLICIT_NO_UNITS',
+      revision: Math.max(1, Math.trunc(Number(observedAt) || 0))
     });
   }
 
@@ -1252,15 +1306,19 @@
       nextWakeAt: Math.max(0, Number(x.nextWakeAt) || 0),
       wakeKind,
       observationFloorAt: Math.max(0, Number(x.observationFloorAt) || 0),
+      observationDueAt: Math.max(0, Number(x.observationDueAt ?? x.observationFloorAt) || 0),
+      authorizationDueAt: Math.max(0, Number(x.authorizationDueAt) || 0),
       executionDueAt: Math.max(0, Number(x.executionDueAt) || 0),
       maintenanceDueAt: Math.max(0, Number(x.maintenanceDueAt) || 0),
       reportDueAt: Math.max(0, Number(x.reportDueAt) || 0),
       reconcileDueAt: Math.max(0, Number(x.reconcileDueAt) || 0),
+      capacityDueAt: Math.max(0, Number(x.capacityDueAt) || 0),
       leaseRecoveryDueAt: Math.max(0, Number(x.leaseRecoveryDueAt) || 0),
       sources,
       executionRound: x.executionRound ? normalizeExecutionRound(x.executionRound) : null,
       executionPlan: x.executionPlan ? normalizeExecutionPlan(x.executionPlan) : null,
       stochasticPlan: x.stochasticPlan ? normalizeStochasticPlan(x.stochasticPlan) : null,
+      desiredIntent: x.desiredIntent ? normalizeDesiredIntent(x.desiredIntent) : null,
       reason: String(x.reason || ''),
       updatedAt: Math.max(0, Number(x.updatedAt) || 0)
     };
@@ -1356,10 +1414,12 @@
 
   function createRandomSource(fixture = null, namespace = 'generic') {
     const values = Array.isArray(fixture) ? fixture.map(Number) : null;
-    let index = 0;
+    let fixtureIndex = 0;
+    let drawCount = 0;
     const nextFloat = () => {
+      drawCount++;
       if (values) {
-        const value = values[index++ % Math.max(1, values.length)];
+        const value = values[fixtureIndex++ % Math.max(1, values.length)];
         return Math.min(1 - Number.EPSILON, Math.max(0, Number.isFinite(value) ? value : 0));
       }
       try {
@@ -1394,7 +1454,8 @@
         const end = Math.max(Number(a) || 0, Number(b) || 0);
         return start + nextFloat() * Math.max(0, end - start);
       },
-      get draws() { return index; }
+      get draws() { return drawCount; },
+      get drawCount() { return drawCount; }
     };
   }
 
@@ -4882,20 +4943,20 @@
     return ADAPTIVE_REST_BUCKET_HOURS.length - 1;
   }
 
-  function normalRandom() {
+  function normalRandom(randomSource = MODEL_RANDOM_SOURCE) {
     let u = 0;
     let v = 0;
-    while (u === 0) u = Math.random();
-    while (v === 0) v = Math.random();
+    while (u === 0) u = randomSource.nextFloat();
+    while (v === 0) v = randomSource.nextFloat();
     return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
   }
 
-  function gammaRandom(shape) {
+  function gammaRandom(shape, randomSource = MODEL_RANDOM_SOURCE) {
     const k = Number(shape);
     if (!Number.isFinite(k) || k <= 0) return 0;
     if (k < 1) {
-      const u = Math.max(Number.EPSILON, Math.random());
-      return gammaRandom(k + 1) * Math.pow(u, 1 / k);
+      const u = Math.max(Number.EPSILON, randomSource.nextFloat());
+      return gammaRandom(k + 1, randomSource) * Math.pow(u, 1 / k);
     }
     const d = k - 1 / 3;
     const c = 1 / Math.sqrt(9 * d);
@@ -4903,19 +4964,19 @@
       let x;
       let v;
       do {
-        x = normalRandom();
+        x = normalRandom(randomSource);
         v = 1 + c * x;
       } while (v <= 0);
       v = v * v * v;
-      const u = Math.random();
+      const u = randomSource.nextFloat();
       if (u < 1 - 0.0331 * x * x * x * x) return d * v;
       if (Math.log(u) < 0.5 * x * x + d * (1 - v + Math.log(v))) return d * v;
     }
   }
 
-  function betaRandom(alpha, beta) {
-    const x = gammaRandom(Math.max(0.01, Number(alpha) || 1));
-    const y = gammaRandom(Math.max(0.01, Number(beta) || 1));
+  function betaRandom(alpha, beta, randomSource = MODEL_RANDOM_SOURCE) {
+    const x = gammaRandom(Math.max(0.01, Number(alpha) || 1), randomSource);
+    const y = gammaRandom(Math.max(0.01, Number(beta) || 1), randomSource);
     if (!(x > 0) && !(y > 0)) return 0.5;
     return x / Math.max(Number.EPSILON, x + y);
   }
@@ -5523,12 +5584,12 @@
     };
   }
 
-  function adaptivePriority(farm, store, c, now = Date.now(), predictionAt = now) {
+  function adaptivePriority(farm, store, c, now = Date.now(), predictionAt = now, randomSource = MODEL_RANDOM_SOURCE) {
     const arrivalPrediction = predictAdaptiveFarm(farm, Math.max(now, Number(predictionAt) || now), store, c);
     const reason = adaptiveReason(farm, now, c);
     const sampledBelief = reason === 'EXPLOITATION'
       ? farm.beliefGood
-      : betaRandom(farm.alpha, farm.beta);
+      : betaRandom(farm.alpha, farm.beta, randomSource);
     const infoBonus = ['EXPLORATION', 'LEARNING'].includes(reason)
       ? 26 * (1 - farm.certainty)
       : 0;
@@ -5565,14 +5626,14 @@
     };
   }
 
-  function weightedSoftmaxPick(entries, temperature = 8) {
+  function weightedSoftmaxPick(entries, temperature = 8, randomSource = MODEL_RANDOM_SOURCE) {
     if (!entries.length) return null;
     const t = Math.max(0.1, Number(temperature) || 8);
     const maxScore = Math.max(...entries.map(e => Number(e.score) || 0));
     const weights = entries.map(e => Math.exp(((Number(e.score) || 0) - maxScore) / t));
     const total = weights.reduce((a, b) => a + b, 0);
     if (!(total > 0)) return entries[0];
-    let r = Math.random() * total;
+    let r = randomSource.nextFloat() * total;
     for (let i = 0; i < entries.length; i++) {
       r -= weights[i];
       if (r <= 0) return entries[i];
@@ -5591,6 +5652,7 @@
     const contextStats = arrivalContext?.contextStats || adaptiveContextStats(store, c, now);
     const allocation = normalizeAdaptiveAllocationBudget(store?.allocationBudget);
     const policy = adaptiveAllocationQuotas(store, c, now);
+    const selectionRandomSource = arrivalContext?.randomSource || MODEL_RANDOM_SOURCE;
 
     // PassSnapshot: cada farm é reconstruída e prevista uma única vez nesta ordenação.
     // Ranking, logs e decisão final reutilizam adaptiveExecution em vez de percorrer
@@ -5667,7 +5729,7 @@
       while (remaining.length) {
         const window = remaining.slice(0, Math.min(topK, remaining.length));
         const weighted = window.map(x => ({ ...x, score: Number(x.adaptiveScore) || 0 }));
-        const chosenCopy = weightedSoftmaxPick(weighted, c.adaptiveSelectionTemperature);
+        const chosenCopy = weightedSoftmaxPick(weighted, c.adaptiveSelectionTemperature, selectionRandomSource);
         const chosen = window.find(x =>
           x.coord === chosenCopy?.coord &&
           String(x.targetId) === String(chosenCopy?.targetId)
@@ -14284,7 +14346,9 @@
     normalizeCapacityProof, capacityProofContextMatches, capacityProofUsable,
     capacityProofStrength, shouldReplaceCapacityProof, normalizeExecutionRound,
     consumeConfirmedDispatch, reconcileExecutionRoundOutcome, successorDispatchBudget,
-    serverNoUnitsCapacityProof, normalizeExecutionPlan, normalizeCoordinationState,
+    capacityProofAfterConfirmedPost, serverNoUnitsCapacityProof,
+    normalizeExecutionPlan, normalizeCoordinationState,
+    normalizeDesiredIntent,
     coordinationSourceFresh, coordinationSourceFreshForPlanning, mapAuthorizationFreshForPlanning,
     coordinationProofStatus, coordinationProofEnd, localDependencyPlanner,
     createRandomSource, stochasticCoalesceBounds, temporalProfileWeights,
