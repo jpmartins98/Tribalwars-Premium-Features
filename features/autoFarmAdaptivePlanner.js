@@ -182,13 +182,28 @@
 
     function selectUsableCapacityProof(proofs, context = {}, timestamp = Date.now(), marginMs = 0) {
         const usableAt = Number(timestamp) + Math.max(0, Number(marginMs) || 0);
+        const proofShapeUsable = proof => {
+            if (!proof.authoritative || !(proof.observedAt > 0) || proof.freshUntil < usableAt) return false;
+            if (proof.exact) return true;
+            if (proof.source === 'ASSISTANT_MINIMUM_ONE') return proof.value === 1 && proof.availableAtHome === true;
+            // A fresh disabled-button signal may conservatively block mutations while
+            // it is fresh, but it never authorizes a positive dispatch.
+            if (proof.source === 'ASSISTANT_ZERO_SIGNAL') return proof.value === 0;
+            return false;
+        };
         const candidates = (Array.isArray(proofs) ? proofs : [proofs])
             .filter(Boolean)
             .map(value => core().normalizeCapacityProof(value))
             .filter(proof => core().capacityProofContextMatches(proof, context))
-            .filter(proof => proof.authoritative && proof.exact && proof.observedAt > 0 && proof.freshUntil >= usableAt)
+            .filter(proofShapeUsable)
             .filter(proof => !capacityRequiresAtHomeAuthority(proof) || proof.availableAtHome === true);
-        const sourceStrength = { SERVER_NO_UNITS: 5, POST_CURRENT_UNITS: 5, ASSISTANT_CURRENT_UNITS: 4, ASSISTANT_MINIMUM_ONE: 2 };
+        const sourceStrength = {
+            SERVER_NO_UNITS: 5,
+            POST_CURRENT_UNITS: 5,
+            ASSISTANT_CURRENT_UNITS: 4,
+            ASSISTANT_MINIMUM_ONE: 2,
+            ASSISTANT_ZERO_SIGNAL: 1
+        };
         candidates.sort((a, b) =>
             Number(sourceStrength[b.source] || 0) - Number(sourceStrength[a.source] || 0) ||
             Number(b.observedAt) - Number(a.observedAt) || Number(b.freshUntil) - Number(a.freshUntil));

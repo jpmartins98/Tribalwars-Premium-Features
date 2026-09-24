@@ -441,7 +441,8 @@ test('HTTP hard-stop persists its local network guard across reload until manual
     loadCore(restored.context);
     load(restored.context, 'utils/core_bot_protection.js');
     assert.equal(restored.context.PremiumFeaturesBackgroundScheduler.stats().hardStopped, true);
-    assert.equal(restored.context.PremiumFeaturesBotProtection.isActive(), true);
+    assert.equal(restored.context.PremiumFeaturesBotProtection.isActive(), false,
+        'persisted scheduler HARD_STOP must not impersonate currently active Bot Protection after reload');
     assert.equal(restored.context.PremiumFeaturesBotProtection.resumeAfterHardStop(), true);
     assert.equal(restored.context.PremiumFeaturesBotProtection.isActive(), false);
 });

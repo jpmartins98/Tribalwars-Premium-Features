@@ -179,10 +179,23 @@ function run() {
         'total/support/away troops never prove units available at home');
     const atHome = { ...totalOnly, availableAtHome: true, authority: 'AM_FARM_FRESH_CURRENT_UNITS' };
     assert.equal(planner.selectUsableCapacityProof(atHome, proofContext, 1_000_000).value, 2);
+    const minimumOne = {
+        ...proofContext,
+        value: 1, exact: false, authoritative: true,
+        source: 'ASSISTANT_MINIMUM_ONE', observedAt: 999000, freshUntil: 1_045_000,
+        availableAtHome: true, authority: 'AM_FARM_FRESH_ENABLED_BUTTON_MINIMUM_ONE'
+    };
+    const selectedMinimum = planner.selectUsableCapacityProof(minimumOne, proofContext, 1_000_000, 5000);
+    assert.equal(selectedMinimum?.value, 1,
+        'ASSISTANT_MINIMUM_ONE is a usable lower-bound proof even though exact=false');
+    assert.equal(selectedMinimum?.exact, false);
+    const unsafeMinimum = { ...minimumOne, availableAtHome: false };
+    assert.equal(planner.selectUsableCapacityProof(unsafeMinimum, proofContext, 1_000_000), null,
+        'minimum-one without at-home authority cannot authorize a mutation');
     const nearExpiry = { ...atHome, source: 'POST_CURRENT_UNITS', observedAt: 999999, freshUntil: 1_000_500 };
-    const durable = { ...atHome, value: 1, observedAt: 990000, freshUntil: 1_100_000 };
+    const durable = { ...minimumOne, observedAt: 990000, freshUntil: 1_100_000 };
     assert.equal(planner.selectUsableCapacityProof([nearExpiry, durable], proofContext, 1_000_000, 1000).value, 1,
-        'proof selection accounts for the planning margin instead of blindly choosing strongest/newest');
+        'proof selection can choose a durable minimum-one over an exact proof that misses the planning margin');
 
     const round = core.normalizeExecutionRound({
         executionRoundId: 'round-capacity', configuredLimit: 30,

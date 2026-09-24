@@ -160,6 +160,36 @@ async function tampermonkeyBootFixture() {
         assistantFixture({ spear: 25, sword: 15 }), { farmTemplate: 'A' }, '1'
     );
     assert.equal(positive.capacity, 3, 'fresh am_farm current_units is the authoritative at-home fixture');
+
+    const minimumOneFixture = disabled => ({
+        rows: new Map([['501|500', { buttonSupported: true, templateId: '7', disabled }]]),
+        firstDoc: {
+            querySelectorAll(selector) {
+                if (selector === 'script') return [{ textContent:
+                    'var templates={"t_7":{"spear":5,"sword":5}};' +
+                    'var total_units={"spear":250,"sword":250};var support_units={"spear":250,"sword":250};'
+                }];
+                return [];
+            }
+        }
+    });
+    const minimumOne = api._test.chooseTemplateAndCapacity(
+        minimumOneFixture(false), { farmTemplate: 'A' }, '1'
+    );
+    assert.equal(minimumOne.capacity, 1,
+        'fresh enabled Assistant button provides only a minimum-one proof when current_units is absent');
+    assert.equal(minimumOne.proof.source, 'ASSISTANT_MINIMUM_ONE');
+    assert.equal(minimumOne.proof.exact, false);
+    assert.equal(minimumOne.proof.authoritative, true);
+    assert.equal(minimumOne.proof.availableAtHome, true);
+    assert.equal(minimumOne.proof.currentUnits, null,
+        'minimum-one never fabricates an exact troop snapshot');
+    const disabledMinimum = api._test.chooseTemplateAndCapacity(
+        minimumOneFixture(true), { farmTemplate: 'A' }, '1'
+    );
+    assert.equal(disabledMinimum.capacity, 0,
+        'fresh disabled Assistant button is conservative zero, not an experimental POST');
+    assert.equal(disabledMinimum.proof.source, 'ASSISTANT_ZERO_SIGNAL');
     assert.equal(api._test.uiState({ enabled: false }, { state: 'DISABLED' }, '', null), 'OFF');
     assert.equal(api._test.uiState({ enabled: true }, { state: 'UNKNOWN' }, '', null), 'UNKNOWN');
     assert.equal(api._test.uiState({ enabled: true }, { state: 'WAITING_WORK', reportDueAt: Date.now() }, '', null),

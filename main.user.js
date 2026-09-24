@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         Tribalwars: Premium Features [Premium Compat]
-// @version      5.3.14
+// @version      5.3.15
 // @description  Feature-rich enhancement suite for TribalWars. Widgets, map/report tools and optional safety-first automation including AutoFarm Adaptive A/B.
 // @author       killwilll
 // @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/i18n/i18n_utils.js?v=5.3.2
@@ -25,14 +25,14 @@
 // @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/utils/nativeMemo.js?v=5.3.2
 // @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/utils/core_indexeddb.js?v=5.3.9
 // @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/features/autoFarmAdaptiveCore.js?v=5.3.10
-// @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/features/autoFarmAdaptivePlanner.js?v=5.3.10
+// @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/features/autoFarmAdaptivePlanner.js?v=5.3.15
 // @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/features/autoFarmAdaptiveStorage.js?v=5.3.14
 // @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/utils/buildStateStore.js?v=5.3.7
 // @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/utils/resourcesManager.js?v=5.3.2
 // @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/utils/buildingsManager.js?v=5.3.2
 // @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/utils/marketTransports.js?v=5.3.2
 // @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/utils/core_bot_protection.js?v=5.3.12
-// @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/features/autoFarmAdaptive.js?v=5.3.13
+// @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/features/autoFarmAdaptive.js?v=5.3.15
 // @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/utils/core_css.js?v=5.3.5
 // @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/utils/core_darkmode.js?v=5.3.2
 // @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/utils/core_sidebar.js?v=5.3.5

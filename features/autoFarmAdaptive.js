@@ -9,6 +9,7 @@
     const MAP_TTL_MS = 90000;
     const ASSISTANT_TTL_MS = 120000;
     const CAPACITY_TTL_MS = 90000;
+    const CAPACITY_MINIMUM_TTL_MS = 45000;
     const REPORT_RETRY_MS = 5 * 60000;
     const REPORT_GET_BUDGET = 6;
     const runtime = {
@@ -278,9 +279,13 @@
         // When every target in the radius is new, the filtered row map is empty.
         // A fresh page can still identify the selected A/B template unambiguously.
         const letter = String(settings.farmTemplate || 'A').toLowerCase();
+        const pageButtons = [];
         for (const anchor of assistant.firstDoc?.querySelectorAll?.(`#plunder_list a.farm_icon_${letter}`) || []) {
             const parsed = core().parseFarmButton(anchor.closest?.('tr'), settings.farmTemplate);
-            if (parsed?.supported && parsed.templateId) templateIds.add(String(parsed.templateId));
+            if (parsed?.supported && parsed.templateId) {
+                templateIds.add(String(parsed.templateId));
+                pageButtons.push(parsed);
+            }
         }
         const observedTemplateIds = [...templateIds];
         if (observedTemplateIds.length !== 1) return { usable: false, reason: 'TEMPLATE_AMBIGUOUS' };
@@ -289,28 +294,62 @@
         const dom = core().parseDomTemplateComposition(assistant.firstDoc, templateId);
         if (inline && dom && !core().sameComposition(inline, dom)) return { usable: false, reason: 'TEMPLATE_CONFLICT' };
         const composition = core().normalizeComposition(inline || dom);
-        // Only the fresh am_farm `current_units` payload is accepted as proof of
-        // units available at home. Generic totals/support/away counters are never
-        // promoted to mutation authority.
-        const currentUnits = core().parseInlineCurrentUnits(assistant.firstDoc);
-        const capacity = composition && currentUnits ? core().capacityForComposition(composition, currentUnits) : null;
-        if (!composition || !currentUnits || !Number.isFinite(capacity)) {
-            return { usable: false, reason: 'CAPACITY_UNKNOWN', templateId, composition, currentUnits };
+        if (!composition) {
+            return { usable: false, reason: 'CAPACITY_UNKNOWN', templateId, composition: null, currentUnits: null };
         }
+
+        // Prefer exact fresh am_farm current_units. Generic total/support/away counters
+        // are never promoted to mutation authority.
+        const currentUnits = core().parseInlineCurrentUnits(assistant.firstDoc);
+        const exactCapacity = currentUnits ? core().capacityForComposition(composition, currentUnits) : null;
         const observedAt = now();
-        return {
-            usable: true, templateId, composition, currentUnits, capacity,
-            proof: core().normalizeCapacityProof({
-                value: capacity, exact: true, authoritative: true,
-                observedAt, freshUntil: observedAt + CAPACITY_TTL_MS,
-                source: 'ASSISTANT_CURRENT_UNITS', templateId,
-                farmTemplate: settings.farmTemplate, composition,
-                compositionAuthoritative: true, currentUnits, sourceVillageId,
-                availableAtHome: true,
-                authority: 'AM_FARM_FRESH_CURRENT_UNITS',
-                revision: observedAt
-            })
-        };
+        if (currentUnits && Number.isFinite(exactCapacity)) {
+            return {
+                usable: true, templateId, composition, currentUnits, capacity: exactCapacity,
+                proof: core().normalizeCapacityProof({
+                    value: exactCapacity, exact: true, authoritative: true,
+                    observedAt, freshUntil: observedAt + CAPACITY_TTL_MS,
+                    source: 'ASSISTANT_CURRENT_UNITS', templateId,
+                    farmTemplate: settings.farmTemplate, composition,
+                    compositionAuthoritative: true, currentUnits, sourceVillageId,
+                    availableAtHome: true,
+                    authority: 'AM_FARM_FRESH_CURRENT_UNITS',
+                    revision: observedAt
+                })
+            };
+        }
+
+        // A fresh enabled A/B button is a conservative server-rendered proof that
+        // this exact template can be sent at least once from the current village.
+        // It is deliberately NOT an exact troop count and never reads total/support/
+        // away counters. The next confirmed mutation invalidates this proof.
+        const matchingRows = supportedRows.filter(row => String(row.templateId) === String(templateId));
+        const matchingPageButtons = pageButtons.filter(button => String(button.templateId) === String(templateId));
+        const buttonSignals = matchingRows.length
+            ? matchingRows.map(row => ({ disabled: Boolean(row.disabled) }))
+            : matchingPageButtons.map(button => ({ disabled: Boolean(button.disabled) }));
+        if (buttonSignals.length) {
+            const anyEnabled = buttonSignals.some(signal => !signal.disabled);
+            const source = anyEnabled ? 'ASSISTANT_MINIMUM_ONE' : 'ASSISTANT_ZERO_SIGNAL';
+            const capacity = anyEnabled ? 1 : 0;
+            return {
+                usable: true, templateId, composition, currentUnits: null, capacity,
+                proof: core().normalizeCapacityProof({
+                    value: capacity, exact: false, authoritative: true,
+                    observedAt, freshUntil: observedAt + CAPACITY_MINIMUM_TTL_MS,
+                    source, templateId,
+                    farmTemplate: settings.farmTemplate, composition,
+                    compositionAuthoritative: true, currentUnits: null, sourceVillageId,
+                    availableAtHome: true,
+                    authority: anyEnabled
+                        ? 'AM_FARM_FRESH_ENABLED_BUTTON_MINIMUM_ONE'
+                        : 'AM_FARM_FRESH_DISABLED_BUTTON_ZERO',
+                    revision: observedAt
+                })
+            };
+        }
+
+        return { usable: false, reason: 'CAPACITY_UNKNOWN', templateId, composition, currentUnits: null };
     }
 
     function storage() {
