@@ -44,10 +44,28 @@
     function taskKey(scope) { return TASK_PREFIX + scopeKey(scope); }
     function leaseKey(scope) { return 'autofarm:' + scopeKey(scope); }
 
+    // Tampermonkey may expose page globals as lexical bindings without mirroring
+    // them onto the sandbox window. Resolve game_data through all safe bridges.
+    function pageGameData() {
+        try {
+            if (root.game_data && typeof root.game_data === 'object') return root.game_data;
+        } catch (_) {}
+        try {
+            if (typeof game_data !== 'undefined' && game_data && typeof game_data === 'object') return game_data;
+        } catch (_) {}
+        try {
+            if (typeof unsafeWindow !== 'undefined' && unsafeWindow?.game_data && typeof unsafeWindow.game_data === 'object') {
+                return unsafeWindow.game_data;
+            }
+        } catch (_) {}
+        return {};
+    }
+
     function currentScope(sourceVillageId) {
         const world = String(root.location?.host || '');
-        const playerId = String(root.game_data?.player?.id || '');
-        const villageId = String(sourceVillageId || root.game_data?.village?.id || '');
+        const gd = pageGameData();
+        const playerId = String(gd?.player?.id || '');
+        const villageId = String(sourceVillageId || gd?.village?.id || '');
         if (!world || !playerId || !villageId) throw coded('AUTOFARM_SCOPE_MISSING', 'Current account/village is unavailable');
         return { world, playerId, sourceVillageId: villageId };
     }
@@ -69,7 +87,7 @@
     }
 
     function assertActiveVillage(scope) {
-        if (String(root.game_data?.village?.id || '') !== String(scope.sourceVillageId)) {
+        if (String(pageGameData()?.village?.id || '') !== String(scope.sourceVillageId)) {
             throw coded('AUTOFARM_VILLAGE_CHANGED', 'Active village changed before the mutation boundary');
         }
     }
@@ -167,7 +185,7 @@
     }
 
     function villageCoord() {
-        const village = root.game_data?.village || {};
+        const village = pageGameData()?.village || {};
         if (/^\d{3}\|\d{3}$/.test(String(village.coord || ''))) return String(village.coord);
         if (Number.isFinite(Number(village.x)) && Number.isFinite(Number(village.y))) return `${village.x}|${village.y}`;
         return null;
@@ -1798,7 +1816,7 @@
 
     async function runOccurrence(scopeInput, wakeKind, guard) {
         if (hardStopped()) return { status: 'HARD_STOP', gets: 0, posts: 0 };
-        const activeVillageId = String(root.game_data?.village?.id || '');
+        const activeVillageId = String(pageGameData()?.village?.id || '');
         if (activeVillageId && String(scopeInput?.sourceVillageId || '') !== activeVillageId) {
             const parkedScope = currentScope(scopeInput?.sourceVillageId);
             schedule(parkedScope, now() + 5 * 60000, wakeKind || 'OBSERVATION');
