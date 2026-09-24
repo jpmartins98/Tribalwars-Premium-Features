@@ -5,8 +5,12 @@
         return;
     }
 
+    // `active` means current Bot Protection/CAPTCHA detection only.
+    // A persisted scheduler HARD_STOP is a separate safety state: it must keep
+    // automation blocked, but it must not be reported as live Bot Protection or
+    // prevent the TWPF UI/bootstrap from mounting.
     const state = {
-        active: Boolean(window.PremiumFeaturesBackgroundScheduler?.stats?.().hardStopped),
+        active: false,
         observer: null,
         hookTimer: null
     };
