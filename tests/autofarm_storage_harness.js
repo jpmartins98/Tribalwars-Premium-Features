@@ -237,6 +237,30 @@ async function run() {
             'FAILED migration can retry through MIGRATING and verify atomically');
     }
     {
+        // Tampermonkey-like split: `game_data` is visible as a userscript-global
+        // binding but is not mirrored onto the sandbox window/host object.
+        const storage = memoryStorage(seed);
+        const host = { location: { host: world }, localStorage: storage };
+        const context = vm.createContext({
+            window: host,
+            game_data: { player: { id: 7 } },
+            console, Date, Object, Promise
+        });
+        vm.runInContext(source, context, { filename: 'autoFarmAdaptiveStorage.js' });
+        const idb = fakeTransaction();
+        const service = host.PremiumFeaturesAutoFarmStorage.create({
+            host, storage,
+            coordination: { async runWithLease(_key, run) { return run({ assertActive() {} }); } },
+            transact: idb.transact,
+            now: () => 100000
+        });
+        const captured = await service.migrateLegacySnapshot({
+            world, playerId: '7', sourceVillageId: '1'
+        });
+        assert.equal(captured.status, 'DISCOVERED',
+            'lexical game_data must validate the same account scope when host.game_data is absent');
+    }
+    {
         const x = fixture(seed);
         await assert.rejects(x.service.migrateLegacySnapshot({ world: 'other.world', sourceVillageId: '1' }),
             { code: 'AUTOFARM_SCOPE_MISMATCH' });

@@ -19,16 +19,35 @@
         return error;
     }
 
+    // Tampermonkey can expose page globals as lexical bindings without mirroring
+    // them onto the sandbox window object passed as `host`. Migration scope must
+    // validate against the same page account identity used by the controller.
+    function pageGameData(host) {
+        try {
+            if (host?.game_data && typeof host.game_data === 'object') return host.game_data;
+        } catch (_) {}
+        try {
+            if (typeof game_data !== 'undefined' && game_data && typeof game_data === 'object') return game_data;
+        } catch (_) {}
+        try {
+            if (typeof unsafeWindow !== 'undefined' && unsafeWindow?.game_data && typeof unsafeWindow.game_data === 'object') {
+                return unsafeWindow.game_data;
+            }
+        } catch (_) {}
+        return {};
+    }
+
     function normalizeScope(input, host) {
-        const world = String(input?.world || host.location?.host || '');
-        const playerId = String(input?.playerId || host.game_data?.player?.id || '');
+        const currentWorld = String(host?.location?.host || '');
+        const currentPlayerId = String(pageGameData(host)?.player?.id || '');
+        const world = String(input?.world || currentWorld);
+        const playerId = String(input?.playerId || currentPlayerId);
         const sourceVillageId = String(input?.sourceVillageId || '');
-        if (!world || !playerId || !sourceVillageId ||
-            [world, playerId, sourceVillageId].some(value => value === 'undefined' || value === 'null')) {
+        if (!world || !playerId || !sourceVillageId || !currentWorld || !currentPlayerId ||
+            [world, playerId, sourceVillageId, currentWorld, currentPlayerId].some(value => value === 'undefined' || value === 'null')) {
             throw migrationError('AUTOFARM_SCOPE_MISSING', 'AutoFarm migration requires world, player and source village');
         }
-        if (world !== String(host.location?.host || '') ||
-            playerId !== String(host.game_data?.player?.id || '')) {
+        if (world !== currentWorld || playerId !== currentPlayerId) {
             throw migrationError('AUTOFARM_SCOPE_MISMATCH', 'AutoFarm migration scope differs from the current account');
         }
         return { world, playerId, sourceVillageId };
