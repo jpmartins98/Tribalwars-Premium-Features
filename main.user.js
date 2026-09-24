@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         Tribalwars: Premium Features [Premium Compat]
-// @version      5.3.10
+// @version      5.3.11
 // @description  Feature-rich enhancement suite for TribalWars. Widgets, map/report tools and optional safety-first automation including AutoFarm Adaptive A/B.
 // @author       killwilll
 // @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/i18n/i18n_utils.js?v=5.3.2
@@ -32,7 +32,7 @@
 // @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/utils/buildingsManager.js?v=5.3.2
 // @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/utils/marketTransports.js?v=5.3.2
 // @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/utils/core_bot_protection.js?v=5.3.9
-// @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/features/autoFarmAdaptive.js?v=5.3.10
+// @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/features/autoFarmAdaptive.js?v=5.3.11
 // @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/utils/core_css.js?v=5.3.5
 // @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/utils/core_darkmode.js?v=5.3.2
 // @require      https://raw.githubusercontent.com/jpmartins98/Tribalwars-Premium-Features/master/utils/core_sidebar.js?v=5.3.5
@@ -177,7 +177,6 @@
             runtime.installInteractionTracking(document);
             window.PremiumFeaturesCoordination?.start?.();
             window.PremiumFeaturesBackgroundScheduler?.start?.();
-            await window.PremiumFeaturesAutoFarmAdaptive?.init?.();
         });
     }
 
@@ -212,13 +211,44 @@
         });
     }
 
+    let autoFarmInitPromise = null;
+    function beginOptionalAutoFarmInit(reason) {
+        if (autoFarmInitPromise) return autoFarmInitPromise;
+        const controller = window.PremiumFeaturesAutoFarmAdaptive;
+        if (typeof controller?.init !== 'function') return Promise.resolve(null);
+        const entry = hydration.autoFarm || { status: 'PENDING', promise: null, error: null };
+        hydration.autoFarm = entry;
+        entry.status = 'PENDING';
+        entry.error = null;
+        const pending = Promise.resolve().then(function () {
+            return controller.init();
+        }).then(function (value) {
+            entry.status = 'READY';
+            return value;
+        }, function (error) {
+            entry.status = 'FAILED';
+            entry.error = error;
+            recordBoot('BOOT_STAGE_ISOLATED_FAILURE', 'autoFarmInit', {
+                reason: String(error?.message || error), lifecycleReason: reason || 'initial'
+            });
+            console.error('[TW] AutoFarm reconcile failed', error);
+            return null;
+        });
+        autoFarmInitPromise = pending;
+        entry.promise = pending;
+        pending.then(function () {
+            if (autoFarmInitPromise === pending) autoFarmInitPromise = null;
+        });
+        return pending;
+    }
+
     function mountUi(reason) {
         if (document.getElementById('mobileContent')) return;
         const startedAt = monotonicNow();
-        window.PremiumFeaturesAutoFarmAdaptive?.init?.().catch?.(function (error) {
-            console.error('[TW] AutoFarm reconcile failed', error);
-        });
         start();
+        // AutoFarm is optional. Its migration/IndexedDB/handoff lifecycle is
+        // deliberately outside the awaited global UI boot critical path.
+        beginOptionalAutoFarmInit(reason);
         recordBoot('BOOT_START_COMPLETE', 'start', {
             reason: reason || 'initial',
             durationMs: Math.max(0, monotonicNow() - startedAt),
@@ -285,6 +315,7 @@
     window.PremiumFeaturesBootLifecycle = {
         init,
         beginFeatureHydration,
+        beginOptionalAutoFarmInit,
         mountUi,
         mountEarlyUiShell,
         bootNow,

@@ -44,6 +44,94 @@ function context(extra = {}) {
 function load(ctx, file) { vm.runInContext(source(file), ctx, { filename: file }); }
 async function flush(rounds = 20) { for (let index = 0; index < rounds; index++) await Promise.resolve(); }
 
+function mainBootFixture(autoFarmInit) {
+    const once = new Map();
+    const order = [];
+    const errors = [];
+    const diagnostics = [];
+    const document = {
+        readyState: 'loading',
+        location: { href: 'https://example.test/game.php?screen=other' },
+        getElementById: () => null,
+        createElement: () => ({ appendChild() {} })
+    };
+    const ctx = context({
+        console: { log() {}, warn() {}, error(...args) { errors.push(args); } },
+        document,
+        settings_cookies: { general: {}, widgets: [] },
+        $: () => ({ off() { return this; }, on() { return this; } }),
+        PremiumFeaturesRuntimeRegistry: {
+            onceAsync(key, run) {
+                if (!once.has(key)) once.set(key, Promise.resolve().then(run));
+                return once.get(key);
+            },
+            addEventListener() {}, installInteractionTracking() {}, requestReconcile(_reason, run) { run(); }
+        },
+        PremiumFeaturesDiagnostics: { record(entry) { diagnostics.push(entry); } },
+        PremiumFeaturesAutoFarmAdaptive: { init: autoFarmInit },
+        prepareLocalStorageItems() {},
+        hydrateBuildQueueCache() {}, cleanupLegacyNotepadStorage() {}, hydrateNotepadCache() {},
+        hydrateVillageProfileNotesCache() {}, hydrateReservationsCache() {},
+        cleanupLegacyMapDataLocalStorage() {}, hydrateMapDataCache() {},
+        cleanupLegacyRecruitQueueLocalStorage() {}, cleanupLegacyReportsLocalStorage() {},
+        restoreTimeouts() {}, restoreScavengingAutoWakes() {}, prepareBuildQueueStorageDefaults() {},
+        injectScriptSettingsPopUp() { order.push('settings'); },
+        start() { order.push('start', 'navigation', 'widgets'); },
+        PremiumFeaturesCoordination: { start() {} }, PremiumFeaturesBackgroundScheduler: { start() {} }
+    });
+    load(ctx, 'main.user.js');
+    return { ctx, order, errors, diagnostics };
+}
+
+test('A - pending AutoFarm init cannot block global TWPF UI boot', async () => {
+    const blocked = deferred();
+    let calls = 0;
+    const fixture = mainBootFixture(() => { calls++; return blocked.promise; });
+    let coreFinished = false;
+    fixture.ctx.PremiumFeaturesBootLifecycle.init().then(() => { coreFinished = true; });
+    fixture.ctx.PremiumFeaturesBootLifecycle.bootNow();
+    await flush();
+    assert.equal(coreFinished, true, 'core boot must settle while optional AutoFarm remains pending');
+    assert.deepEqual(fixture.order, ['settings', 'start', 'navigation', 'widgets']);
+    assert.equal(calls, 1);
+    assert.equal(fixture.diagnostics.some(entry => entry.status === 'BOOT_UI_MOUNT'), true);
+});
+
+test('B - rejected AutoFarm init is isolated from mounted TWPF UI', async () => {
+    const fixture = mainBootFixture(() => Promise.reject(new Error('autofarm init rejected')));
+    fixture.ctx.PremiumFeaturesBootLifecycle.bootNow();
+    await flush();
+    assert.deepEqual(fixture.order, ['settings', 'start', 'navigation', 'widgets']);
+    assert.equal(fixture.errors.some(args => String(args[0]).includes('AutoFarm')), true);
+    assert.equal(fixture.errors.some(args => String(args[0]).includes('[TW] Boot failed')), false);
+});
+
+test('C - blocked AutoFarm migration affects only its own visible state', async () => {
+    const blocked = deferred();
+    let autoFarmState = 'STARTING';
+    const fixture = mainBootFixture(() => {
+        autoFarmState = 'MIGRATION_BLOCKED';
+        return blocked.promise;
+    });
+    fixture.ctx.PremiumFeaturesBootLifecycle.bootNow();
+    await flush();
+    assert.equal(autoFarmState, 'MIGRATION_BLOCKED');
+    assert.deepEqual(fixture.order, ['settings', 'start', 'navigation', 'widgets']);
+});
+
+test('D - duplicate lifecycle paths share one pending AutoFarm init', async () => {
+    const blocked = deferred();
+    let calls = 0;
+    const fixture = mainBootFixture(() => { calls++; return blocked.promise; });
+    fixture.ctx.PremiumFeaturesBootLifecycle.bootNow();
+    await flush();
+    fixture.ctx.PremiumFeaturesBootLifecycle.mountUi('duplicate-lifecycle');
+    await flush();
+    assert.equal(calls, 1, 'pending optional initialization must be single-flight');
+    blocked.resolve(true);
+    await flush();
+});
+
 test('unrelated slow/rejected hydration cannot block the early UI and init is single-shot', async () => {
     const map = deferred();
     const reservations = deferred();

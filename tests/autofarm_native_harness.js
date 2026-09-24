@@ -82,6 +82,7 @@ async function tampermonkeyBootFixture() {
         async appendDiagnostic() { return { status: 'WRITTEN' }; }
     };
     let registered = null;
+    let registerCount = 0;
     const cancelled = [];
     const document = fakeDocument();
     const context = vm.createContext({
@@ -98,7 +99,7 @@ async function tampermonkeyBootFixture() {
         PremiumFeaturesAutoFarmStorage: { create() { return storageService; } },
         PremiumFeaturesBackgroundScheduler: {
             PRIORITY: { MANUAL: 1, RECONCILIATION: 2, AUTOMATIC: 3 },
-            registerHandler(name, handler) { registered = { name, handler }; },
+            registerHandler(name, handler) { registerCount++; registered = { name, handler }; },
             cancel(key, reason) { cancelled.push({ key, reason }); },
             hasTask() { return false; },
             describe() { return null; },
@@ -119,6 +120,8 @@ async function tampermonkeyBootFixture() {
     const api = context.PremiumFeaturesAutoFarmAdaptive;
     assert.equal(api._test.featureAllowed(), true, 'lexical canonical accessor enables the feature');
     const pending = api.init();
+    const duplicatePending = api.init();
+    assert.strictEqual(duplicatePending, pending, 'concurrent init calls share one lifecycle Promise');
     const panel = document.getElementById('twpf-autofarm-adaptive');
     assert.ok(panel, 'UI shell exists before async storage/migration completes');
     assert.match(panel.querySelector('[data-role="status"]').textContent, /^STARTING/);
@@ -129,6 +132,9 @@ async function tampermonkeyBootFixture() {
     assert.ok(records.has('coordination'), 'native coordination was created');
     assert.equal(records.get('settings').value.enabled, false, 'visibility never silently enables mutations');
     assert.equal(registered.name, 'autofarm-adaptive-v2.0.15');
+    assert.equal(registerCount, 1, 'scheduler handler is registered once');
+    assert.equal(document.body.children.filter(node => node.id === 'twpf-autofarm-adaptive').length, 1,
+        'duplicate init creates one panel');
     assert.equal(cancelled.length, 1, 'disabled native state has no armed mutation task');
 
     const assistantFixture = currentUnits => ({

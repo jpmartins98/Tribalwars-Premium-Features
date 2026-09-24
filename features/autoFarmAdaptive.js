@@ -14,6 +14,7 @@
     const runtime = {
         storage: null,
         registered: false,
+        initPromise: null,
         records: new Map(),
         diagnostics: new Map(),
         diagnosticSeq: 0
@@ -2153,7 +2154,7 @@
         }
     }
 
-    async function init() {
+    async function initialize() {
         const service = scheduler();
         if (!service?.registerHandler) return false;
         if (!runtime.registered) {
@@ -2229,6 +2230,21 @@
         }
         render(scope);
         return true;
+    }
+
+    function init() {
+        if (runtime.initPromise) return runtime.initPromise;
+        // Calling the async initializer directly mounts the STARTING shell
+        // synchronously before its first storage await, while the stored Promise
+        // makes concurrent lifecycle paths single-flight.
+        const pending = initialize();
+        runtime.initPromise = pending;
+        pending.then(function () {
+            if (runtime.initPromise === pending) runtime.initPromise = null;
+        }, function () {
+            if (runtime.initPromise === pending) runtime.initPromise = null;
+        });
+        return pending;
     }
 
     root.PremiumFeaturesAutoFarmAdaptive = Object.freeze({
